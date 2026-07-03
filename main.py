@@ -1,21 +1,26 @@
 import glob
 from functools import partial
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import HouseParametersComputer, HouseParameters, predict_dist_kwh
+from house_parameters import HouseParametersComputer, HouseParametersLinear, linear_regression
 from plot_pred_from_params import plot_curves
 
 HOUSE_ALIAS = "beech"
-N = 10
+N = 20
+
+RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
 
 # Read and prepare hourly CSV
 csv_path = glob.glob(f"data/{HOUSE_ALIAS}_*.csv")[0]
 df = pd.read_csv(csv_path)
 df = df.dropna(subset=["hp_kwh_th", "dist_kwh", "oat_f", "ws_mph"])
 df["hour_start"] = pd.to_datetime(df["hour_start"])
+df = df.sort_values("hour_start").reset_index(drop=True)
 df["day"] = df["hour_start"].dt.normalize()
 
 # Center oat_f at its global mean so alpha is comparable across fits and stable.
@@ -25,12 +30,12 @@ print(f"oat_f centered at {oat_ref:.1f}°F (alpha = predicted energy at that tem
 # Fit on a trailing N-day window ending on each day.
 computer = HouseParametersComputer(
     predictor=partial(
-        predict_dist_kwh, oat_ref=oat_ref
+        linear_regression, oat_ref=oat_ref
     )
 )
 days = np.sort(df["day"].unique())
 fit_days = []
-results: list[HouseParameters] = []
+results: list[HouseParametersLinear] = []
 for i in range(N - 1, len(days)):
     window = days[i-N+1 : i+1]
     window_df = df[df["day"].isin(window)]
@@ -46,6 +51,7 @@ print(
 plot_curves(
     results, fit_days, oat_ref,
     f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
+    savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_yearly_N{N}.png",
 )
 
 # Find largest variation in each parameter across any 7-day span.
@@ -79,6 +85,7 @@ extreme_sorted = sorted(extreme_days)
 plot_curves(
     [result_by_day[d] for d in extreme_sorted], extreme_sorted, oat_ref,
     f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",
+    savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_extremes_N{N}.png",
     use_legend=True,
 )
 

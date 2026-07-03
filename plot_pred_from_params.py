@@ -4,20 +4,24 @@ import pandas as pd
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from house_parameters import HouseParameters
+from house_parameters import HouseParametersLinear
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
 
 
 def plot_curves(
-    house_parameters: list[HouseParameters], 
-    fit_days: list[pd.Timestamp], 
-    oat_ref: float, 
-    title: str, 
+    house_parameters: list[HouseParametersLinear],
+    fit_days: list[pd.Timestamp],
+    oat_ref: float,
+    title: str,
+    savepath=None,
     use_legend: bool = False
 ):
-    """One house_kwh_pred(oat) curve per fit day, in a panel per wind speed, colored by date."""
+    """One house_kwh_pred(oat) curve per fit day, in a panel per wind speed, colored by date.
+
+    Saves the figure to savepath if provided.
+    """
 
     ordinals = np.array([pd.Timestamp(d).toordinal() for d in fit_days])
     norm = Normalize(vmin=ordinals.min(), vmax=ordinals.max())
@@ -26,7 +30,11 @@ def plot_curves(
     fig, axes = plt.subplots(1, len(WIND_SPEEDS_MPH), figsize=(16, 5), sharey=True)
     for ax, ws in zip(axes, WIND_SPEEDS_MPH):
         for p, d, o in zip(house_parameters, fit_days, ordinals):
-            house_kwh_pred = p.alpha + p.beta * (OAT_RANGE_F - oat_ref) + p.gamma * (65 - OAT_RANGE_F) * ws
+            house_kwh_pred = (
+                p.alpha
+                + p.beta * (OAT_RANGE_F - oat_ref)
+                + p.gamma * (65 - OAT_RANGE_F) * ws
+            )
             ax.plot(
                 OAT_RANGE_F, house_kwh_pred, color=cmap(norm(o)),
                 alpha=0.9 if use_legend else 0.5,
@@ -47,3 +55,6 @@ def plot_curves(
         cbar.set_ticklabels([pd.Timestamp.fromordinal(int(o)).strftime("%b %d") for o in tick_ordinals])
 
     fig.suptitle(title)
+
+    if savepath is not None:
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")

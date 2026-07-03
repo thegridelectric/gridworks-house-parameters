@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 
 
-def predict_dist_kwh(df: pd.DataFrame, oat_ref: float = 0.0) -> tuple[np.ndarray, float, float, float]:
+def linear_regression(df: pd.DataFrame, oat_ref: float = 0.0) -> tuple[np.ndarray, float, float, float]:
     """Fit dist_kwh = a + b*(oat_f - oat_ref) + g*(65-oat_f)*ws_mph by MSE.
 
     Centering oat_f at oat_ref makes a the predicted energy at oat_ref (inside
@@ -22,7 +22,7 @@ def predict_dist_kwh(df: pd.DataFrame, oat_ref: float = 0.0) -> tuple[np.ndarray
 
 
 @dataclass
-class HouseParameters:
+class HouseParametersLinear:
     alpha: float
     beta: float
     gamma: float
@@ -30,16 +30,16 @@ class HouseParameters:
 
 class HouseParametersComputer:
     """Fit house heating parameters from a chunk of hourly data"""
-    def __init__(self, predictor=predict_dist_kwh):
+    def __init__(self, predictor=linear_regression):
         self.predictor = predictor
 
     def remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
         return df # TODO
 
-    def fit(self, df: pd.DataFrame) -> HouseParameters:
+    def fit(self, df: pd.DataFrame) -> HouseParametersLinear:
         dist_kwh_pred, a, b, g = self.predictor(df)
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
-        return HouseParameters(
+        return HouseParametersLinear(
             alpha = round(a * energy_ratio, 1),
             beta = round(b * energy_ratio, 2),
             gamma = round(g * energy_ratio, 5),
