@@ -63,6 +63,7 @@ params = pd.DataFrame(
     },
     index=pd.DatetimeIndex(fit_days),
 ).sort_index()
+params.to_csv(RESULTS_DIR / f"{HOUSE_ALIAS}_params_N{N}.csv")
 
 weekly_range = params.rolling("7D").apply(lambda s: s.max() - s.min())
 
