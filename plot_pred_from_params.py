@@ -4,24 +4,21 @@ import pandas as pd
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from house_parameters import HouseParametersLinear
+from house_parameters import HouseEnergyParams
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
 
 
 def plot_curves(
-    house_parameters: list[HouseParametersLinear],
+    house_parameters: list[HouseEnergyParams],
     fit_days: list[pd.Timestamp],
     oat_ref: float,
     title: str,
     savepath=None,
     use_legend: bool = False
 ):
-    """One house_kwh_pred(oat) curve per fit day, in a panel per wind speed, colored by date.
-
-    Saves the figure to savepath if provided.
-    """
+    """One house_kwh_pred(oat) curve per fit day, in a panel per wind speed, colored by date."""
 
     ordinals = np.array([pd.Timestamp(d).toordinal() for d in fit_days])
     norm = Normalize(vmin=ordinals.min(), vmax=ordinals.max())

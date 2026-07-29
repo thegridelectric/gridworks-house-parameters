@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from re import A
 
 import pandas as pd
 import numpy as np
@@ -22,13 +23,13 @@ def linear_regression(df: pd.DataFrame, oat_ref: float = 0.0) -> tuple[np.ndarra
 
 
 @dataclass
-class HouseParametersLinear:
+class HouseEnergyParams:
     alpha: float
     beta: float
     gamma: float
 
 
-class HouseParametersComputer:
+class HouseEnergyParamsComputer:
     """Fit house heating parameters from a chunk of hourly data"""
     def __init__(self, predictor=linear_regression):
         self.predictor = predictor
@@ -36,10 +37,10 @@ class HouseParametersComputer:
     def remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
         return df # TODO
 
-    def fit(self, df: pd.DataFrame) -> HouseParametersLinear:
+    def fit(self, df: pd.DataFrame) -> HouseEnergyParams:
         dist_kwh_pred, a, b, g = self.predictor(df)
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
-        return HouseParametersLinear(
+        return HouseEnergyParams(
             alpha = round(a * energy_ratio, 1),
             beta = round(b * energy_ratio, 2),
             gamma = round(g * energy_ratio, 5),

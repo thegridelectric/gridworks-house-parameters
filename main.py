@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import HouseParametersComputer, HouseParametersLinear, linear_regression
+from house_parameters import HouseEnergyParamsComputer, HouseEnergyParams, linear_regression
 from plot_pred_from_params import plot_curves
 
 HOUSE_ALIAS = "beech"
@@ -28,14 +28,14 @@ oat_ref = float(df["oat_f"].mean())
 print(f"oat_f centered at {oat_ref:.1f}°F (alpha = predicted energy at that temperature)")
 
 # Fit on a trailing N-day window ending on each day.
-computer = HouseParametersComputer(
+computer = HouseEnergyParamsComputer(
     predictor=partial(
         linear_regression, oat_ref=oat_ref
     )
 )
 days = np.sort(df["day"].unique())
 fit_days = []
-results: list[HouseParametersLinear] = []
+results: list[HouseEnergyParams] = []
 for i in range(N - 1, len(days)):
     window = days[i-N+1 : i+1]
     window_df = df[df["day"].isin(window)]
