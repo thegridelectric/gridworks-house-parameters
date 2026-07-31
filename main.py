@@ -60,6 +60,10 @@ params = pd.DataFrame(
         "alpha": [r.alpha for r in results],
         "beta": [r.beta for r in results],
         "gamma": [r.gamma for r in results],
+        "std_error_alpha": [r.std_error_alpha for r in results],
+        "std_error_beta": [r.std_error_beta for r in results],
+        "std_error_gamma": [r.std_error_gamma for r in results],
+        "r_squared": [r.r_squared for r in results],
     },
     index=pd.DatetimeIndex(fit_days),
 ).sort_index()

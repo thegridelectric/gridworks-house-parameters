@@ -35,7 +35,7 @@ def evaluate(N):
     for i in range(N - 1, len(days) - 1):
         window = days[i - N + 1 : i + 1]
         window_df = df[df["day"].isin(window)]
-        dist_pred, a, b, g = linear_regression(window_df, oat_ref=oat_ref)
+        dist_pred, a, b, g, *_ = linear_regression(window_df, oat_ref=oat_ref)
         energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
         alphas.append(a * energy_ratio)
         fit_days.append(days[i])
