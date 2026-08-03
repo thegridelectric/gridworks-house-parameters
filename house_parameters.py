@@ -55,8 +55,8 @@ class HouseEnergyParamsComputer:
             alpha = round(a * energy_ratio, 1),
             beta = round(b * energy_ratio, 2),
             gamma = round(g * energy_ratio, 5),
-            std_error_alpha = round(std_error_alpha * energy_ratio, 1),
-            std_error_beta = round(std_error_beta * energy_ratio, 2),
+            std_error_alpha = round(std_error_alpha * energy_ratio, 5),
+            std_error_beta = round(std_error_beta * energy_ratio, 5),
             std_error_gamma = round(std_error_gamma * energy_ratio, 5),
             r_squared = round(r_squared, 2),
         )
