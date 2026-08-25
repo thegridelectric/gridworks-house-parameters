@@ -6,7 +6,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import HouseEnergyParamsComputer, HouseEnergyParams, linear_regression
+from house_parameters import (
+    CENTERED, FEATURES, HouseEnergyParams, HouseEnergyParamsComputer,
+    linear_regression, prepare_hourly,
+)
 from plot_pred_from_params import plot_curves
 
 HOUSE_ALIAS = "beech"
@@ -15,22 +18,32 @@ N = 20
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Read and prepare hourly CSV
-csv_path = glob.glob(f"data/{HOUSE_ALIAS}_*.csv")[0]
-df = pd.read_csv(csv_path)
-df = df.dropna(subset=["hp_kwh_th", "dist_kwh", "oat_f", "ws_mph"])
-df["hour_start"] = pd.to_datetime(df["hour_start"])
-df = df.sort_values("hour_start").reset_index(drop=True)
-df["day"] = df["hour_start"].dt.normalize()
+# Read the 5-minute record. Unlike the hourly export it carries room
+# temperatures and thermostat setpoints, which is what this model needs: how
+# far each room sits below its switching threshold is the single strongest
+# predictor of the next hour's heat.
+df_5min = pd.read_csv("data.csv", parse_dates=["timestamp"])
 
-# Center oat_f at its global mean so alpha is comparable across fits and stable.
-oat_ref = float(df["oat_f"].mean())
-print(f"oat_f centered at {oat_ref:.1f}°F (alpha = predicted energy at that temperature)")
+# hp_kwh_th only exists in the hourly export; it is used to express the fitted
+# parameters as heat-pump thermal energy rather than distribution energy.
+hp = pd.read_csv(glob.glob(f"data/{HOUSE_ALIAS}_*.csv")[0],
+                 usecols=["hour_start", "hp_kwh_th"], parse_dates=["hour_start"])
+hp = hp.drop_duplicates("hour_start").set_index("hour_start")["hp_kwh_th"]
+
+df = prepare_hourly(df_5min, hp_kwh_th=hp)
+print(f"{len(df)} usable hourly windows "
+      f"from {df.hour_start.min().date()} to {df.hour_start.max().date()}")
+
+# Center the continuous features at their global means so the intercept is the
+# predicted energy at typical conditions (inside the data cloud) instead of at
+# all-zero, which decorrelates it from the slopes and stabilises it across fits.
+refs = {f: float(df[f].mean()) for f in CENTERED}
+print("centered at: " + ", ".join(f"{k}={v:.2f}" for k, v in refs.items()))
 
 # Fit on a trailing N-day window ending on each day.
 computer = HouseEnergyParamsComputer(
     predictor=partial(
-        linear_regression, oat_ref=oat_ref
+        linear_regression, refs=refs
     )
 )
 days = np.sort(df["day"].unique())
@@ -49,7 +62,7 @@ print(
 
 # Plot all fit days, colored by date
 plot_curves(
-    results, fit_days, oat_ref,
+    results, fit_days, refs, df,
     f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_yearly_N{N}.png",
 )
@@ -57,12 +70,10 @@ plot_curves(
 # Find largest variation in each parameter across any 7-day span.
 params = pd.DataFrame(
     {
-        "alpha": [r.alpha for r in results],
-        "beta": [r.beta for r in results],
-        "gamma": [r.gamma for r in results],
-        "std_error_alpha": [r.std_error_alpha for r in results],
-        "std_error_beta": [r.std_error_beta for r in results],
-        "std_error_gamma": [r.std_error_gamma for r in results],
+        **{name: [r.coefficients[name] for r in results]
+           for name in ["intercept", *FEATURES]},
+        **{f"std_error_{name}": [r.std_errors[name] for r in results]
+           for name in ["intercept", *FEATURES]},
         "r_squared": [r.r_squared for r in results],
     },
     index=pd.DatetimeIndex(fit_days),
@@ -73,7 +84,7 @@ weekly_range = params.rolling("7D").apply(lambda s: s.max() - s.min())
 
 print("\nLargest variation within a single week:")
 extreme_days = set()
-for col in ["alpha", "beta", "gamma"]:
+for col in ["intercept", "gap1", "dT"]:
     end_day = weekly_range[col].idxmax()
     week = params.loc[end_day - pd.Timedelta("6D"):end_day]
     low_day = week[col].idxmin()
@@ -82,13 +93,16 @@ for col in ["alpha", "beta", "gamma"]:
     print(f"  {col}: {weekly_range[col].max():.5g} (week ending {end_day.date()})")
     for day in (low_day, high_day):
         p = params.loc[day]
-        print(f"    {day.date()}: alpha={p.alpha:.1f}, beta={p.beta:.2f}, gamma={p.gamma:.5f}")
+        print(f"    {day.date()}: " + ", ".join(
+            f"{c}={p[c]:.4g}" for c in ["intercept", "dT", "gap1", "gap2"]))
+
+print(f"\nMean R^2 across windows: {params.r_squared.mean():.3f}")
 
 # Plot only the extreme-week days
 result_by_day = {pd.Timestamp(d): r for d, r in zip(fit_days, results)}
 extreme_sorted = sorted(extreme_days)
 plot_curves(
-    [result_by_day[d] for d in extreme_sorted], extreme_sorted, oat_ref,
+    [result_by_day[d] for d in extreme_sorted], extreme_sorted, refs, df,
     f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_extremes_N{N}.png",
     use_legend=True,
