@@ -15,9 +15,11 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 df_5min = pd.read_csv("data.csv", parse_dates=["timestamp"])
 hp = pd.read_csv(glob.glob(f"data/{HOUSE_ALIAS}_*.csv")[0],
-                 usecols=["hour_start", "hp_kwh_th"], parse_dates=["hour_start"])
-hp = hp.drop_duplicates("hour_start").set_index("hour_start")["hp_kwh_th"]
-df = prepare_hourly(df_5min, hp_kwh_th=hp)
+                 usecols=["hour_start", "hp_kwh_th", "ws_mph"],
+                 parse_dates=["hour_start"])
+hp = hp.drop_duplicates("hour_start").set_index("hour_start")
+df = prepare_hourly(df_5min, hp_kwh_th=hp["hp_kwh_th"],
+                    ws_mph=hp["ws_mph"])
 
 refs = {f: float(df[f].mean()) for f in CENTERED}
 days = np.sort(df["day"].unique())

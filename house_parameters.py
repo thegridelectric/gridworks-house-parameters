@@ -53,12 +53,19 @@ def setpoint_thresholds(df: pd.DataFrame) -> dict[int, tuple[float, float]]:
 
 
 def prepare_hourly(df: pd.DataFrame, hp_kwh_th: pd.Series | None = None,
+                   ws_mph: pd.Series | None = None,
                    horizon: int = HORIZON) -> pd.DataFrame:
     """Turn the 5-minute record into one row per hour boundary.
 
     Each row holds what is known when the forecast is made plus the energy the
     loop actually drew over the following hour. Weather over that hour is taken
     as perfectly forecast, which is how the model would be used.
+
+    Wind comes from the hourly export's ws_mph, not from data.csv's `v`. The
+    two are not the same quantity: `v` correlates only 0.68 with ws_mph, sits
+    at exactly zero a quarter of the time and never exceeds 3, so it is neither
+    mph nor m/s of the same measurement. Using mph keeps the units unambiguous
+    and keeps the plotted curves inside the range actually observed.
     """
     df = df.sort_values("timestamp").reset_index(drop=True)
     thresholds = setpoint_thresholds(df)
@@ -68,13 +75,19 @@ def prepare_hourly(df: pd.DataFrame, hp_kwh_th: pd.Series | None = None,
     v = df["v"].to_numpy()
     ghi = df["GHI"].to_numpy()
     t1, t2 = df["T_i1"].to_numpy(), df["T_i2"].to_numpy()
+    if ws_mph is not None:
+        wind_mph = (df["timestamp"].map(ws_mph.reindex(
+            df["timestamp"].dt.floor("h")).set_axis(df["timestamp"]))
+            .ffill().bfill().to_numpy())
+    else:
+        wind_mph = np.zeros(len(df))
     s1, s2 = df["T_i1_set"].to_numpy(), df["T_i2_set"].to_numpy()
 
     # a window is only usable if the whole hour, and the hour before it, are
     # contiguous 5-minute data with no missing weather
     step = df["timestamp"].diff().dt.total_seconds().to_numpy()
     ok = np.r_[True, np.abs(step[1:] - 300.0) < 1.0]
-    ok &= np.isfinite(t_o) & np.isfinite(v) & np.isfinite(ghi)
+    ok &= np.isfinite(t_o) & np.isfinite(ghi) & np.isfinite(wind_mph)
 
     rows = []
     for g in range(horizon, len(df) - horizon, horizon):
@@ -91,7 +104,7 @@ def prepare_hourly(df: pd.DataFrame, hp_kwh_th: pd.Series | None = None,
             "dist_kwh": q[nxt].sum() * 300.0 / 3.6e6,
             "T_i": t_i,
             "dT": d_t,
-            "wind": d_t * v[nxt].mean(),
+            "wind": d_t * wind_mph[nxt].mean(),
             "GHI": ghi[nxt].mean(),
             "gap1": (a1 * s1[g] + b1) - t1[g],
             "gap2": (a2 * s2[g] + b2) - t2[g],

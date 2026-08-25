@@ -8,7 +8,6 @@ from house_parameters import CENTERED, FEATURES, HouseEnergyParams
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
-MPH_TO_MS = 1.0 / 2.237
 
 
 def operating_point(df: pd.DataFrame, oat_f: np.ndarray, ws_mph: float) -> dict:
@@ -25,7 +24,7 @@ def operating_point(df: pd.DataFrame, oat_f: np.ndarray, ws_mph: float) -> dict:
     d_t = np.maximum(df["T_i"].median() - oat_c, 0.0)
     return {
         "dT": d_t,
-        "wind": d_t * ws_mph * MPH_TO_MS,
+        "wind": d_t * ws_mph,
         "GHI": np.zeros_like(oat_c),
         "gap1": np.zeros_like(oat_c),
         "gap2": np.zeros_like(oat_c),
