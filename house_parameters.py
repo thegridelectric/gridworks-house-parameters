@@ -72,7 +72,6 @@ def prepare_hourly(df: pd.DataFrame, hp_kwh_th: pd.Series | None = None,
 
     q = (df["Q_dist1_only"] + df["Q_dist2_only"] + df["Q_dist_together"]).to_numpy()
     t_o = df["T_o"].to_numpy()
-    v = df["v"].to_numpy()
     ghi = df["GHI"].to_numpy()
     t1, t2 = df["T_i1"].to_numpy(), df["T_i2"].to_numpy()
     if ws_mph is not None:
