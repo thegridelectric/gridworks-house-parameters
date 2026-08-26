@@ -34,14 +34,18 @@ print("(the intercept is the predicted energy at those typical conditions)")
 computer = HouseEnergyParamsComputer(centers=centers, scale_to_hp_kwh=SCALE_TO_HP_KWH)
 days = np.sort(df["day"].unique())
 fit_days = []
+fit_oat_f = []
 results: list[HouseEnergyParams] = []
-oos_hours = []
+oos_oat_f = []
 oos_pred = []
 oos_actual = []
 for i in range(N - 1, len(days)):
     window = days[i-N+1 : i+1]
     window_df = df[df["day"].isin(window)]
     fit_days.append(days[i])
+    # Mean outdoor temperature over the fit window: the weather the parameters
+    # were learned in, and what the plots color by.
+    fit_oat_f.append(float(window_df["oat_f"].mean()))
     params = computer.fit(window_df)
     results.append(params)
 
@@ -49,7 +53,7 @@ for i in range(N - 1, len(days)):
     # figure below shows what the fit is actually worth going forward.
     if i + 1 < len(days):
         next_df = df[df["day"] == days[i + 1]]
-        oos_hours.extend(next_df["hour_start"])
+        oos_oat_f.extend(next_df["oat_f"])
         oos_pred.extend(predict(params, next_df, centers))
         oos_actual.extend(next_df["dist_kwh"])
 
@@ -71,7 +75,7 @@ print(
 # setpoint, no sun, envelope in equilibrium, and sustained operation, which is what
 # the median prev stands for. See plot_curves' docstring.
 plot_curves(
-    results, fit_days, centers,
+    results, fit_days, fit_oat_f, centers,
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
     prev_median=float(df["prev"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
@@ -79,7 +83,7 @@ plot_curves(
 )
 
 plot_pred_vs_actual(
-    oos_pred, oos_actual, oos_hours,
+    oos_pred, oos_actual, oos_oat_f,
     f"{HOUSE_ALIAS.capitalize()}: next-day predicted vs actual (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_pred_vs_actual_N{N}.png",
 )
@@ -117,9 +121,11 @@ for col in ["intercept", "dT", "gap1", "gap2"]:
 
 # Plot only the extreme-week days
 result_by_day = {pd.Timestamp(d): r for d, r in zip(fit_days, results)}
+oat_by_day = {pd.Timestamp(d): o for d, o in zip(fit_days, fit_oat_f)}
 extreme_sorted = sorted(extreme_days)
 plot_curves(
-    [result_by_day[d] for d in extreme_sorted], extreme_sorted, centers,
+    [result_by_day[d] for d in extreme_sorted], extreme_sorted,
+    [oat_by_day[d] for d in extreme_sorted], centers,
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
     prev_median=float(df["prev"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",
