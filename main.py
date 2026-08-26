@@ -5,18 +5,19 @@ import numpy as np
 import pandas as pd
 
 from house_parameters import (
-    FEATURES,
+    COEF_NAMES,
     HouseEnergyParams,
     HouseEnergyParamsComputer,
     feature_centers,
     load_hourly_features,
     predict,
 )
-from plot_pred_from_params import plot_curves, plot_pred_vs_actual
+from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred_vs_actual
 
 HOUSE_ALIAS = "beech"
 N = 20
 SCALE_TO_HP_KWH = True   # False -> coefficients stay in distribution-kWh
+USE_CENTERING = False    # True -> B0 is demand at typical conditions, not at all-zeros
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -26,9 +27,12 @@ RESULTS_DIR.mkdir(exist_ok=True)
 df = load_hourly_features(HOUSE_ALIAS)
 print(f"{len(df)} usable hours from {df['hour_start'].min()} to {df['hour_start'].max()}")
 
-centers = feature_centers(df)
-print("Centered at: " + ", ".join(f"{k}={v:.3g}" for k, v in centers.items()))
-print("(the intercept is the predicted energy at those typical conditions)")
+centers = feature_centers(df) if USE_CENTERING else {}
+if centers:
+    print("Centered at: " + ", ".join(f"{k}={v:.3g}" for k, v in centers.items()))
+    print("(B0 is the predicted energy at those typical conditions)")
+else:
+    print("Features are not centered (B0 is demand at all features = 0)")
 
 # Fit on a trailing N-day window ending on each day.
 computer = HouseEnergyParamsComputer(centers=centers, scale_to_hp_kwh=SCALE_TO_HP_KWH)
@@ -64,20 +68,25 @@ print(
 
 oos_pred = np.array(oos_pred)
 oos_actual = np.array(oos_actual)
+oos_oat_f = np.array(oos_oat_f)
+keep = oos_actual <= MAX_PLAUSIBLE_DIST_KWH
+n_dropped = int((~keep).sum())
+oos_pred, oos_actual, oos_oat_f = oos_pred[keep], oos_actual[keep], oos_oat_f[keep]
 errors = oos_pred - oos_actual
 print(
-    f"Next-day out-of-sample over {len(oos_actual)} hours: "
+    f"Next-day out-of-sample over {len(oos_actual)} hours"
+    f" ({n_dropped} hours with dist_kwh > {MAX_PLAUSIBLE_DIST_KWH:g} dropped): "
     f"MSE={float((errors**2).mean()):.3f}, RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
     f"MAE={float(np.abs(errors).mean()):.3f} kWh"
 )
 
 # Plot all fit days, colored by date. The curves need an operating point: rooms at
 # setpoint, no sun, envelope in equilibrium, and sustained operation, which is what
-# the median prev stands for. See plot_curves' docstring.
+# the median previous_dist_kwh stands for. See plot_curves' docstring.
 plot_curves(
     results, fit_days, fit_oat_f, centers,
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
-    prev_median=float(df["prev"].median()),
+    previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_yearly_N{N}.png",
 )
@@ -89,10 +98,9 @@ plot_pred_vs_actual(
 )
 
 # Find largest variation in each parameter across any 7-day span.
-columns = ["intercept"] + FEATURES
 params = pd.DataFrame(
-    {name: [getattr(r, name) for r in results] for name in columns}
-    | {f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results] for name in columns}
+    {name: [getattr(r, name) for r in results] for name in COEF_NAMES}
+    | {f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results] for name in COEF_NAMES}
     | {
         "r_squared": [r.r_squared for r in results],
         "energy_ratio": [r.energy_ratio for r in results],
@@ -105,7 +113,7 @@ weekly_range = params.rolling("7D").apply(lambda s: s.max() - s.min())
 
 print("\nLargest variation within a single week:")
 extreme_days = set()
-for col in ["intercept", "dT", "gap1", "gap2"]:
+for col in ["B0", "B1", "B6", "B7"]:
     end_day = weekly_range[col].idxmax()
     week = params.loc[end_day - pd.Timedelta("6D"):end_day]
     low_day = week[col].idxmin()
@@ -115,8 +123,8 @@ for col in ["intercept", "dT", "gap1", "gap2"]:
     for day in (low_day, high_day):
         p = params.loc[day]
         print(
-            f"    {day.date()}: intercept={p.intercept:.2f}, dT={p.dT:.4f}, "
-            f"gap1={p.gap1:.3f}, gap2={p.gap2:.3f}"
+            f"    {day.date()}: B0={p.B0:.2f}, B1={p.B1:.4f}, "
+            f"B6={p.B6:.3f}, B7={p.B7:.3f}"
         )
 
 # Plot only the extreme-week days
@@ -127,7 +135,7 @@ plot_curves(
     [result_by_day[d] for d in extreme_sorted], extreme_sorted,
     [oat_by_day[d] for d in extreme_sorted], centers,
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
-    prev_median=float(df["prev"].median()),
+    previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_extremes_N{N}.png",
     use_legend=True,

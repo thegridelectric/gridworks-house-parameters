@@ -9,12 +9,13 @@ from house_parameters import design_matrix, feature_centers, linear_regression, 
 HOUSE_ALIAS = "beech"
 N_VALUES = list(range(5,26))
 SCALE_TO_HP_KWH = True   # False -> the tracked intercept stays in distribution-kWh
+USE_CENTERING = False    # match main.py; intercept variation is larger without centering
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 df = load_hourly_features(HOUSE_ALIAS)
-centers = feature_centers(df)
+centers = feature_centers(df) if USE_CENTERING else {}
 days = np.sort(df["day"].unique())
 
 

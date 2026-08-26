@@ -8,6 +8,9 @@ from house_parameters import FEATURES, HouseEnergyParams, design_matrix
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
+# Hours above this are treated as bad meter/export values and dropped from the
+# predicted-vs-actual figure (not from the fit).
+MAX_PLAUSIBLE_DIST_KWH = 12.0
 
 
 def _oat_colors(oat_f) -> tuple[np.ndarray, Normalize, object]:
@@ -35,7 +38,7 @@ def plot_curves(
     fit_oat_f: list[float],
     centers: dict[str, float],
     t_i_avg: float,
-    prev_median: float,
+    previous_dist_kwh_median: float,
     title: str,
     savepath=None,
     use_legend: bool = False
@@ -49,12 +52,13 @@ def plot_curves(
     curve against outdoor temperature exists at all. These curves are therefore
     NOT unconditional predictions: they hold at one operating point, namely
 
-        gap1 = gap2 = 0     both rooms exactly at their setpoint
-        prev = its median   sustained operation, not a cold start
-        to_6h = oat_f       envelope in equilibrium with the current weather
-        ghi = 0             no sun
-        T_i1/T_i2 average   pinned at t_i_avg, the median over the dataset,
-                            which is what turns oat into dT and wind
+        set_minus_temp_zone1/2 = 0   both rooms exactly at their setpoint
+        previous_dist_kwh = median   sustained operation, not a cold start
+        OAT_avg_6h = oat_f           envelope in equilibrium with the current weather
+        solar_w_m2 = 0               no sun
+        T_i1/T_i2 average            pinned at t_i_avg, the median over the dataset,
+                                     which is what turns oat into deltaT and
+                                     windspeed_times_deltaT
 
     Wind speed is already mph in the data, so the panels need no conversion.
     """
@@ -62,15 +66,15 @@ def plot_curves(
 
     fig, axes = plt.subplots(1, len(WIND_SPEEDS_MPH), figsize=(16, 5), sharey=True)
     for ax, ws in zip(axes, WIND_SPEEDS_MPH):
-        dT = np.maximum(t_i_avg - OAT_RANGE_F, 0.0)
+        deltaT = np.maximum(t_i_avg - OAT_RANGE_F, 0.0)
         operating_point = pd.DataFrame({
-            "dT": dT,
-            "wind": dT * ws,
-            "ghi": np.zeros_like(OAT_RANGE_F),
-            "gap1": np.zeros_like(OAT_RANGE_F),
-            "gap2": np.zeros_like(OAT_RANGE_F),
-            "prev": np.full_like(OAT_RANGE_F, prev_median),
-            "to_6h": OAT_RANGE_F,
+            "deltaT": deltaT,
+            "windspeed_times_deltaT": deltaT * ws,
+            "solar_w_m2": np.zeros_like(OAT_RANGE_F),
+            "set_minus_temp_zone1": np.zeros_like(OAT_RANGE_F),
+            "set_minus_temp_zone2": np.zeros_like(OAT_RANGE_F),
+            "previous_dist_kwh": np.full_like(OAT_RANGE_F, previous_dist_kwh_median),
+            "OAT_avg_6h": OAT_RANGE_F,
         }, columns=FEATURES)
         X = design_matrix(operating_point, centers)
 
@@ -109,9 +113,14 @@ def plot_pred_vs_actual(
     Points are colored by that hour's outdoor temperature, on the same cold-to-warm
     scale as plot_curves, so a temperature-dependent bias shows up as a color
     gradient off the 1:1 line.
+
+    Actual dist_kwh above MAX_PLAUSIBLE_DIST_KWH is dropped as a bad reading.
     """
     predicted = np.asarray(predicted)
     actual = np.asarray(actual)
+    oat_f = np.asarray(oat_f)
+    keep = actual <= MAX_PLAUSIBLE_DIST_KWH
+    predicted, actual, oat_f = predicted[keep], actual[keep], oat_f[keep]
     errors = predicted - actual
 
     oat_values, norm, cmap = _oat_colors(oat_f)

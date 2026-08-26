@@ -4,22 +4,44 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-# Model features, in the order they enter the design matrix after the intercept.
-FEATURES = ["dT", "wind", "ghi", "gap1", "gap2", "prev", "to_6h"]
+# Model features, in B1..B7 order. B0 is the intercept.
+#   B1 deltaT
+#   B2 windspeed_times_deltaT
+#   B3 solar_w_m2
+#   B4 previous_dist_kwh
+#   B5 OAT_avg_6h
+#   B6 set_minus_temp_zone1
+#   B7 set_minus_temp_zone2
+FEATURES = [
+    "deltaT",
+    "windspeed_times_deltaT",
+    "solar_w_m2",
+    "previous_dist_kwh",
+    "OAT_avg_6h",
+    "set_minus_temp_zone1",
+    "set_minus_temp_zone2",
+]
+COEF_NAMES = [f"B{i}" for i in range(1 + len(FEATURES))]
 
-# gap1/gap2 are already meaningful at zero (room exactly at its setpoint), so they
-# stay uncentered. The rest are centered at their global mean, so the intercept is
-# the predicted energy at typical conditions instead of at an all-zeros point the
-# house never sees. That decorrelates it from the slopes and keeps it stable across
-# rolling fits, the same reason main centers oat_f.
-CENTERED_FEATURES = ["dT", "wind", "ghi", "prev", "to_6h"]
+# set_minus_temp_zone1/2 are already meaningful at zero (room exactly at its
+# setpoint), so they stay uncentered. The rest are centered at their global mean,
+# so B0 is the predicted energy at typical conditions instead of at an all-zeros
+# point the house never sees. That decorrelates it from the slopes and keeps it
+# stable across rolling fits. Off when USE_CENTERING is False.
+CENTERED_FEATURES = [
+    "deltaT",
+    "windspeed_times_deltaT",
+    "solar_w_m2",
+    "previous_dist_kwh",
+    "OAT_avg_6h",
+]
 
 REQUIRED_COLUMNS = [
     "oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th",
     "T_i1_start", "T_i1_set_start", "T_i2_start", "T_i2_set_start",
 ]
 
-# Hours of outdoor-temperature history behind the to_6h feature.
+# Hours of outdoor-temperature history behind the OAT_avg_6h feature.
 LOOKBACK_HOURS = 6
 
 
@@ -29,10 +51,10 @@ def load_hourly_features(house_alias: str) -> pd.DataFrame:
     Every temperature in the file is Fahrenheit and stays that way; wind is
     already mph. No unit conversion anywhere.
 
-    prev and to_6h look backwards, so an hour is only usable when its history is
-    really there: the first LOOKBACK_HOURS rows of the file, and any hour whose
-    preceding 6 hours are not contiguous in hour_start, are dropped rather than
-    quietly averaged over the wrong hours.
+    previous_dist_kwh and OAT_avg_6h look backwards, so an hour is only usable
+    when its history is really there: the first LOOKBACK_HOURS rows of the file,
+    and any hour whose preceding 6 hours are not contiguous in hour_start, are
+    dropped rather than quietly averaged over the wrong hours.
     """
     # Glob the params export specifically. The older {house}_electricity_use_*.csv
     # lives in the same folder, so a looser glob would match both and pick one
@@ -43,17 +65,17 @@ def load_hourly_features(house_alias: str) -> pd.DataFrame:
     df = df.sort_values("hour_start").reset_index(drop=True)
 
     t_i_avg = 0.5 * (df["T_i1_start"] + df["T_i2_start"])
-    df["dT"] = (t_i_avg - df["oat_f"]).clip(lower=0)
-    df["wind"] = df["dT"] * df["ws_mph"]
-    df["ghi"] = df["solar_w_m2"]
+    df["deltaT"] = (t_i_avg - df["oat_f"]).clip(lower=0)
+    df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
+    # solar_w_m2 is already a column in the export; no derived copy needed.
     # Plain setpoint minus room temperature: calibrating the setpoint onto the
     # room-sensor scale performs identically (the calibration slope is ~0.95 and
     # its offset is absorbed by the intercept), and splitting the gap into
     # below/above-setpoint terms is 30% worse under a rolling window.
-    df["gap1"] = df["T_i1_set_start"] - df["T_i1_start"]
-    df["gap2"] = df["T_i2_set_start"] - df["T_i2_start"]
-    df["prev"] = df["dist_kwh"].shift(1)
-    df["to_6h"] = df["oat_f"].rolling(LOOKBACK_HOURS).mean().shift(1)
+    df["set_minus_temp_zone1"] = df["T_i1_set_start"] - df["T_i1_start"]
+    df["set_minus_temp_zone2"] = df["T_i2_set_start"] - df["T_i2_start"]
+    df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
+    df["OAT_avg_6h"] = df["oat_f"].rolling(LOOKBACK_HOURS).mean().shift(1)
 
     # The 6 hours before h must be the 6 rows before it in the file.
     history_span = df["hour_start"] - df["hour_start"].shift(LOOKBACK_HOURS)
@@ -65,7 +87,11 @@ def load_hourly_features(house_alias: str) -> pd.DataFrame:
 
 
 def feature_centers(df: pd.DataFrame) -> dict[str, float]:
-    """Global means used to center the features, shared by every rolling fit."""
+    """Global means used to center the features, shared by every rolling fit.
+
+    Pass the empty dict instead (USE_CENTERING=False) to leave features raw.
+    Predictions are identical either way; only B0's meaning changes.
+    """
     return {name: float(df[name].mean()) for name in CENTERED_FEATURES}
 
 
@@ -79,10 +105,10 @@ def design_matrix(df: pd.DataFrame, centers: dict[str, float]) -> np.ndarray:
 def linear_regression(
     df: pd.DataFrame, centers: dict[str, float]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Fit dist_kwh = intercept + sum(coef * centered feature) by MSE.
+    """Fit dist_kwh = B0 + B1*deltaT + ... by MSE.
 
-    Returns (fitted values, coefficients, standard errors, R-squared), with the
-    intercept first in both coefficient arrays.
+    Returns (fitted values, coefficients, standard errors, R-squared), with B0
+    first in both coefficient arrays.
     """
     X = design_matrix(df, centers)
     dist_kwh = df["dist_kwh"].to_numpy()
@@ -100,30 +126,30 @@ def linear_regression(
 
 @dataclass
 class HouseEnergyParams:
-    intercept: float
-    dT: float
-    wind: float
-    ghi: float
-    gap1: float
-    gap2: float
-    prev: float
-    to_6h: float
-    std_error_intercept: float
-    std_error_dT: float
-    std_error_wind: float
-    std_error_ghi: float
-    std_error_gap1: float
-    std_error_gap2: float
-    std_error_prev: float
-    std_error_to_6h: float
+    B0: float
+    B1: float
+    B2: float
+    B3: float
+    B4: float
+    B5: float
+    B6: float
+    B7: float
+    std_error_B0: float
+    std_error_B1: float
+    std_error_B2: float
+    std_error_B3: float
+    std_error_B4: float
+    std_error_B5: float
+    std_error_B6: float
+    std_error_B7: float
     r_squared: float
     # hp_kwh_th / dist_kwh the coefficients were multiplied by, so the unit they
     # are expressed in stays recoverable. 1.0 when SCALE_TO_HP_KWH is off.
     energy_ratio: float
 
     def coefficients(self) -> np.ndarray:
-        """[intercept, *FEATURES], in the unit the fit was scaled to."""
-        return np.array([self.intercept] + [getattr(self, name) for name in FEATURES])
+        """[B0, B1, ..., B7], in the unit the fit was scaled to."""
+        return np.array([getattr(self, name) for name in COEF_NAMES])
 
     def dist_kwh_coefficients(self) -> np.ndarray:
         """The same coefficients back in distribution-kWh, the unit of dist_kwh."""
@@ -162,8 +188,9 @@ class HouseEnergyParamsComputer:
             # Restate the parameters as heat-pump thermal energy instead of energy
             # into the distribution loop.
             energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
-        # Six decimals: enough for the small ghi and wind coefficients to survive
-        # rounding, so predictions rebuilt from the saved parameters match the fit.
+        # Six decimals: enough for the small solar_w_m2 and
+        # windspeed_times_deltaT coefficients to survive rounding, so predictions
+        # rebuilt from the saved parameters match the fit.
         return HouseEnergyParams(
             *[round(c * energy_ratio, 6) for c in coefficients],
             *[round(e * energy_ratio, 6) for e in std_errors],
