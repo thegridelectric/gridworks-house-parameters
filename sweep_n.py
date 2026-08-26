@@ -1,66 +1,62 @@
-import glob
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import linear_regression
+from house_parameters import design_matrix, feature_centers, linear_regression, load_hourly_features
 
 HOUSE_ALIAS = "beech"
 N_VALUES = list(range(5,26))
+SCALE_TO_HP_KWH = True   # False -> the tracked intercept stays in distribution-kWh
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-csv_path = glob.glob(f"data/{HOUSE_ALIAS}_*.csv")[0]
-df = pd.read_csv(csv_path)
-df = df.dropna(subset=["hp_kwh_th", "dist_kwh", "oat_f", "ws_mph"])
-df["hour_start"] = pd.to_datetime(df["hour_start"])
-df = df.sort_values("hour_start").reset_index(drop=True)
-df["day"] = df["hour_start"].dt.normalize()
-
-oat_ref = float(df["oat_f"].mean())
+df = load_hourly_features(HOUSE_ALIAS)
+centers = feature_centers(df)
 days = np.sort(df["day"].unique())
 
 
 def evaluate(N):
     """For a trailing N-day window ending on each day, predict the following
-    day's dist_kwh (out of sample) and track alpha. Returns
-    (next-day dist_kwh MSE, average largest weekly alpha variation)."""
+    day's dist_kwh (out of sample) and track the intercept. Returns
+    (next-day dist_kwh MSE, average largest weekly intercept variation)."""
     fit_days = []
-    alphas = []
+    intercepts = []
     sse = 0.0
     n_points = 0
     for i in range(N - 1, len(days) - 1):
         window = days[i - N + 1 : i + 1]
         window_df = df[df["day"].isin(window)]
-        dist_pred, a, b, g, *_ = linear_regression(window_df, oat_ref=oat_ref)
-        energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
-        alphas.append(a * energy_ratio)
+        dist_pred, coefficients, *_ = linear_regression(window_df, centers)
+        energy_ratio = 1.0
+        if SCALE_TO_HP_KWH:
+            energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
+        intercepts.append(coefficients[0] * energy_ratio)
         fit_days.append(days[i])
 
-        # Predict the following day's dist_kwh with the window's fit.
+        # Predict the following day's dist_kwh with the window's fit. Coefficients
+        # stay unscaled here: dist_kwh is the target, not heat-pump thermal energy.
+        # Clipped at zero, which negative predictions otherwise cost ~11% of MSE.
         next_df = df[df["day"] == days[i + 1]]
-        oat = next_df["oat_f"].to_numpy()
-        ws = next_df["ws_mph"].to_numpy()
-        dist_hat = a + b * (oat - oat_ref) + g * (65 - oat) * ws
+        dist_hat = np.maximum(design_matrix(next_df, centers) @ coefficients, 0.0)
         sse += float(np.sum((dist_hat - next_df["dist_kwh"].to_numpy()) ** 2))
         n_points += len(next_df)
 
     mse = sse / n_points
-    alpha = pd.Series(alphas, index=pd.DatetimeIndex(fit_days)).sort_index()
-    weekly_alpha_range = alpha.rolling("7D").apply(lambda s: s.max() - s.min())
-    return mse, float(weekly_alpha_range.mean())
+    intercept = pd.Series(intercepts, index=pd.DatetimeIndex(fit_days)).sort_index()
+    weekly_intercept_range = intercept.rolling("7D").apply(lambda s: s.max() - s.min())
+    return mse, float(weekly_intercept_range.mean())
 
 
 mses = []
-alpha_vars = []
+intercept_vars = []
 for N in N_VALUES:
-    mse, alpha_var = evaluate(N)
+    mse, intercept_var = evaluate(N)
     mses.append(mse)
-    alpha_vars.append(alpha_var)
-    print(f"N={N:2d}: next-day dist_kwh MSE={mse:.4f}, avg weekly alpha variation={alpha_var:.3f}")
+    intercept_vars.append(intercept_var)
+    print(f"N={N:2d}: next-day dist_kwh MSE={mse:.4f}, avg weekly intercept variation={intercept_var:.3f}")
 
 fig, ax1 = plt.subplots(figsize=(9, 5))
 ax1.set_xlabel("N (trailing days in fit window)")
@@ -70,8 +66,8 @@ ax1.tick_params(axis="y", labelcolor="tab:blue")
 ax1.set_xticks(N_VALUES)
 
 ax2 = ax1.twinx()
-ax2.set_ylabel("Avg largest weekly alpha variation", color="tab:red")
-ax2.plot(N_VALUES, alpha_vars, "s--", color="tab:red", label="alpha variation")
+ax2.set_ylabel("Avg largest weekly intercept variation", color="tab:red")
+ax2.plot(N_VALUES, intercept_vars, "s--", color="tab:red", label="intercept variation")
 ax2.tick_params(axis="y", labelcolor="tab:red")
 
 fig.suptitle(f"{HOUSE_ALIAS.capitalize()}: effect of lookback window N")
