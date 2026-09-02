@@ -9,12 +9,14 @@ from house_parameters import (
     HouseEnergyParams,
     HouseEnergyParamsComputer,
     feature_centers,
+    fit_alpha_beta_gamma,
     load_hourly_features,
     predict,
+    predict_alpha_beta_gamma,
 )
 from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred_vs_actual
 
-HOUSE_ALIAS = "beech"
+HOUSE_ALIAS = "maple_after"
 N = 20
 SCALE_TO_HP_KWH = True   # False -> coefficients stay in distribution-kWh
 USE_CENTERING = False    # True -> B0 is demand at typical conditions, not at all-zeros
@@ -42,6 +44,7 @@ fit_oat_f = []
 results: list[HouseEnergyParams] = []
 oos_oat_f = []
 oos_pred = []
+oos_pred_abg = []
 oos_actual = []
 for i in range(N - 1, len(days)):
     window = days[i-N+1 : i+1]
@@ -52,6 +55,7 @@ for i in range(N - 1, len(days)):
     fit_oat_f.append(float(window_df["oat_f"].mean()))
     params = computer.fit(window_df)
     results.append(params)
+    abg = fit_alpha_beta_gamma(window_df)
 
     # Score the day after the window: never in-sample, so the predicted-vs-actual
     # figure below shows what the fit is actually worth going forward.
@@ -59,6 +63,7 @@ for i in range(N - 1, len(days)):
         next_df = df[df["day"] == days[i + 1]]
         oos_oat_f.extend(next_df["oat_f"])
         oos_pred.extend(predict(params, next_df, centers))
+        oos_pred_abg.extend(predict_alpha_beta_gamma(abg, next_df))
         oos_actual.extend(next_df["dist_kwh"])
 
 print(
@@ -67,17 +72,24 @@ print(
 )
 
 oos_pred = np.array(oos_pred)
+oos_pred_abg = np.array(oos_pred_abg)
 oos_actual = np.array(oos_actual)
 oos_oat_f = np.array(oos_oat_f)
 keep = oos_actual <= MAX_PLAUSIBLE_DIST_KWH
 n_dropped = int((~keep).sum())
-oos_pred, oos_actual, oos_oat_f = oos_pred[keep], oos_actual[keep], oos_oat_f[keep]
+oos_pred, oos_pred_abg, oos_actual, oos_oat_f = (
+    oos_pred[keep], oos_pred_abg[keep], oos_actual[keep], oos_oat_f[keep]
+)
 errors = oos_pred - oos_actual
+errors_abg = oos_pred_abg - oos_actual
+mae_abg = float(np.abs(errors_abg).mean())
+rmse_abg = float(np.sqrt((errors_abg**2).mean()))
 print(
     f"Next-day out-of-sample over {len(oos_actual)} hours"
     f" ({n_dropped} hours with dist_kwh > {MAX_PLAUSIBLE_DIST_KWH:g} dropped): "
     f"MSE={float((errors**2).mean()):.3f}, RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
-    f"MAE={float(np.abs(errors).mean()):.3f} kWh"
+    f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
+    f"MAE αβγ={mae_abg:.3f} kWh, RMSE αβγ={rmse_abg:.3f} kWh"
 )
 
 # Plot all fit days, colored by date. The curves need an operating point: rooms at
@@ -95,6 +107,8 @@ plot_pred_vs_actual(
     oos_pred, oos_actual, oos_oat_f,
     f"{HOUSE_ALIAS.capitalize()}: next-day predicted vs actual (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_pred_vs_actual_N{N}.png",
+    baseline_mae=mae_abg,
+    baseline_rmse=rmse_abg,
 )
 
 # Find largest variation in each parameter across any 7-day span.

@@ -11,16 +11,18 @@ OAT_RANGE_F = np.linspace(-10, 40, 200)
 # Hours above this are treated as bad meter/export values and dropped from the
 # predicted-vs-actual figure (not from the fit).
 MAX_PLAUSIBLE_DIST_KWH = 12.0
+OAT_COLOR_F = (-13.0, 70.0)
 
 
 def _oat_colors(oat_f) -> tuple[np.ndarray, Normalize, object]:
-    """Cold-to-warm over the outdoor temperature range, shared by every figure.
+    """Cold-to-warm over a fixed outdoor temperature scale, shared by every figure.
 
-    Coloring by oat_f rather than by date puts fits made in comparable weather in
-    comparable colors, whenever in the season they happened.
+    The same -13 to 70°F range is used on every plot so colors are comparable
+    across houses and figure types.
     """
     oat_f = np.asarray(oat_f, dtype=float)
-    return oat_f, Normalize(vmin=oat_f.min(), vmax=oat_f.max()), plt.cm.coolwarm
+    vmin, vmax = OAT_COLOR_F
+    return oat_f, Normalize(vmin=vmin, vmax=vmax), plt.cm.coolwarm
 
 
 def _oat_colorbar(fig, axes, norm, cmap):
@@ -107,6 +109,8 @@ def plot_pred_vs_actual(
     oat_f: np.ndarray,
     title: str,
     savepath=None,
+    baseline_mae: float | None = None,
+    baseline_rmse: float | None = None,
 ):
     """Out-of-sample next-day predictions against what the house actually used.
 
@@ -129,22 +133,39 @@ def plot_pred_vs_actual(
 
     ax = axes[0]
     ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
-    limits = [0, float(max(actual.max(), predicted.max())) * 1.02]
-    ax.plot(limits, limits, "k--", linewidth=1, label="1:1")
+    limits = [0, MAX_PLAUSIBLE_DIST_KWH]
+    ax.plot(limits, limits, "k--", linewidth=1)
     ax.set_xlim(limits)
     ax.set_ylim(limits)
     ax.set_xlabel("Actual dist_kwh (kWh)")
     ax.set_ylabel("Predicted dist_kwh (kWh)")
-    ax.set_title("Next-day out-of-sample predictions")
-    ax.legend(loc="upper left")
+    mae = float(np.abs(errors).mean())
+    rmse = float(np.sqrt((errors**2).mean()))
+
+    scatter_title = "Next-day out-of-sample predictions"
+    if baseline_mae is not None and baseline_rmse is not None:
+        def _vs_abg(new, old, name):
+            pct = (old - new) / old * 100.0
+            word = "better" if pct >= 0 else "worse"
+            return f"{name} {abs(pct):.0f}% {word}"
+        scatter_title += (
+            "\n"
+            + _vs_abg(rmse, baseline_rmse, "RMSE")
+            + ", "
+            + _vs_abg(mae, baseline_mae, "MAE")
+            + " than αβγ"
+        )
+    ax.set_title(scatter_title)
 
     stats = (
-        f"n = {len(actual)}\n"
-        f"MAE  = {np.abs(errors).mean():.3f} kWh\n"
-        f"RMSE = {np.sqrt((errors**2).mean()):.3f} kWh\n"
-        f"bias = {errors.mean():+.3f} kWh\n"
-        f"corr = {np.corrcoef(actual, predicted)[0, 1]:.3f}"
+        f"MAE  = {mae:.3f} kWh\n"
     )
+    if baseline_mae is not None:
+        stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
+    stats += f"RMSE = {rmse:.3f} kWh\n"
+    if baseline_rmse is not None:
+        stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
+    stats = stats.rstrip()
     ax.text(
         0.97, 0.03, stats, transform=ax.transAxes, ha="right", va="bottom",
         family="monospace", fontsize=9,
@@ -152,8 +173,9 @@ def plot_pred_vs_actual(
     )
 
     ax = axes[1]
-    ax.hist(errors, bins=60, color="tab:blue", alpha=0.8)
+    ax.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
     ax.axvline(0, color="k", linestyle="--", linewidth=1)
+    ax.set_xlim(-6, 6)
     ax.set_xlabel("Prediction error (predicted - actual, kWh)")
     ax.set_ylabel("Hours")
     ax.set_title("Error distribution")

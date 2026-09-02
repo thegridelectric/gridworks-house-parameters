@@ -102,6 +102,29 @@ def design_matrix(df: pd.DataFrame, centers: dict[str, float]) -> np.ndarray:
     return np.column_stack(columns)
 
 
+def alpha_beta_gamma_design_matrix(df: pd.DataFrame) -> np.ndarray:
+    """Main-branch model: 1, oat_f, (65 - oat_f) * ws_mph."""
+    oat_f = df["oat_f"].to_numpy()
+    return np.column_stack([
+        np.ones(len(df)),
+        oat_f,
+        (65.0 - oat_f) * df["ws_mph"].to_numpy(),
+    ])
+
+
+def fit_alpha_beta_gamma(df: pd.DataFrame) -> np.ndarray:
+    """Unscaled [alpha, beta, gamma] for dist_kwh, same model as main."""
+    coef, *_ = np.linalg.lstsq(
+        alpha_beta_gamma_design_matrix(df), df["dist_kwh"].to_numpy(), rcond=None
+    )
+    return coef
+
+
+def predict_alpha_beta_gamma(coef: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+    """Predicted dist_kwh from alpha/beta/gamma, clipped at zero like predict()."""
+    return np.maximum(alpha_beta_gamma_design_matrix(df) @ coef, 0.0)
+
+
 def linear_regression(
     df: pd.DataFrame, centers: dict[str, float]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
@@ -116,9 +139,12 @@ def linear_regression(
     coefficients, *_ = np.linalg.lstsq(X, dist_kwh, rcond=None)
     dist_kwh_pred = X @ coefficients
     residuals = dist_kwh - dist_kwh_pred
-    n, p = len(dist_kwh), X.shape[1]
-    sigma2 = float(np.sum(residuals**2) / (n - p))
-    std_errors = np.sqrt(np.diag(sigma2 * np.linalg.inv(X.T @ X)))
+    n = len(dist_kwh)
+    # pinv: a zone at setpoint for the whole window makes that gap column
+    # constant, so X'X is singular (elm's zone 2 is like this most of the year).
+    rank = int(np.linalg.matrix_rank(X))
+    sigma2 = float(np.sum(residuals**2) / max(n - rank, 1))
+    std_errors = np.sqrt(np.diag(sigma2 * np.linalg.pinv(X.T @ X)))
     ss_tot = float(np.sum((dist_kwh - dist_kwh.mean()) ** 2))
     r_squared = 1.0 - float(np.sum(residuals**2)) / ss_tot
     return dist_kwh_pred, coefficients, std_errors, r_squared
