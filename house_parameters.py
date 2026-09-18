@@ -77,37 +77,40 @@ class HouseEnergyParamsComputer:
         df["day"] = df["hour_start"].dt.normalize()
 
         # Find the number of zones
-        zones = sorted(
+        self.zones = sorted(
             int(n) for c in df.columns
             if (n := str(c).removeprefix("T_i").removesuffix("_start")).isdigit()
         )
-        if not zones:
+        if not self.zones:
             raise ValueError("No T_i{z}_start columns found in export")
 
         # Calculate some of the features
-        inside_temp_avg = df[[f"T_i{z}_start" for z in zones]].mean(axis=1)
+        inside_temp_avg = df[[f"T_i{z}_start" for z in self.zones]].mean(axis=1)
         df["deltaT"] = (inside_temp_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
-        for z in zones:
+        for z in self.zones:
             df[f"set_minus_temp_zone{z}"] = df[f"T_i{z}_set_start"] - df[f"T_i{z}_start"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
 
         # Keep only rows with a history span of 6 hours, necessary for the OAT_avg_6h feature
         history_span = df["hour_start"] - df["hour_start"].shift(6)
-        df = df[history_span == pd.Timedelta(hours=6)]
+        self.df = df[history_span == pd.Timedelta(hours=6)]
 
-        feature_names = tuple(
-            FEATURES_WITHOUT_ZONES + [f"set_minus_temp_zone{z}" for z in zones]
+        self.feature_names = tuple(
+            FEATURES_WITHOUT_ZONES + [f"set_minus_temp_zone{z}" for z in self.zones]
         )
         required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
-            col for z in zones for col in (f"T_i{z}_start", f"T_i{z}_set_start")
+            col for z in self.zones for col in (f"T_i{z}_start", f"T_i{z}_set_start")
         ]
-        df = df.dropna(subset=required + list(feature_names)).reset_index(drop=True)
+        self.df = self.df.dropna(subset=required + list(self.feature_names)).reset_index(drop=True)
 
-        self.df = df
-        self.zones = zones
-        self.feature_names = feature_names
+        # Find the range of outdoor temperatures (for the plot)
+        oat_min = float(self.df["oat_f"].min())
+        oat_max = float(self.df["oat_f"].max())
+        if oat_min >= oat_max:
+            oat_max = oat_min + 1.0
+        self.oat_color_range_f = (oat_min, oat_max)
 
     def remove_outliers(self) -> None:
         pass
@@ -156,8 +159,6 @@ class HouseEnergyParamsComputer:
         return np.maximum(X @ params.coefficients(), 0.0)
 
     def trailing_n_day_fits(self, n: int) -> None:
-        from plotter import plot_pred_vs_actual
-
         RESULTS_DIR.mkdir(exist_ok=True)
         
         days = np.sort(self.df["day"].unique())
@@ -206,7 +207,7 @@ class HouseEnergyParamsComputer:
             f"MAE αβγ={mae_abg:.3f} kWh, RMSE αβγ={rmse_abg:.3f} kWh"
         )
 
-        plot_pred_vs_actual(
+        self.plot_pred_vs_actual(
             oos_pred, oos_actual_scaled, oos_oat_f,
             f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
             savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}.png",
@@ -286,3 +287,90 @@ class HouseEnergyParamsComputer:
             RESULTS_DIR / f"{self.house_alias}_sweep_N.png", dpi=150, bbox_inches="tight"
         )
         plt.show()
+
+    def _oat_colors(self, oat_f):
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+
+        oat_f = np.asarray(oat_f, dtype=float)
+        vmin, vmax = self.oat_color_range_f
+        return oat_f, Normalize(vmin=vmin, vmax=vmax), plt.cm.coolwarm
+
+    def plot_pred_vs_actual(
+        self,
+        predicted: np.ndarray,
+        actual: np.ndarray,
+        oat_f: np.ndarray,
+        title: str,
+        savepath: Path | None = None,
+        baseline_mae: float | None = None,
+        baseline_rmse: float | None = None,
+    ) -> None:
+        import matplotlib.pyplot as plt
+        from matplotlib.cm import ScalarMappable
+
+        predicted = np.asarray(predicted)
+        actual = np.asarray(actual)
+        oat_f = np.asarray(oat_f)
+        errors = predicted - actual
+
+        oat_values, norm, cmap = self._oat_colors(oat_f)
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        ax = axes[0]
+        ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
+        hi = float(max(actual.max(), predicted.max()) * 1.05)
+        limits = [0, hi]
+        ax.plot(limits, limits, "k--", linewidth=1)
+        ax.set_xlim(limits)
+        ax.set_ylim(limits)
+        ax.set_xlabel("Actual scaled dist_kwh (kWh)")
+        ax.set_ylabel("Predicted scaled dist_kwh (kWh)")
+        mae = float(np.abs(errors).mean())
+        rmse = float(np.sqrt((errors**2).mean()))
+
+        scatter_title = "Next-day out-of-sample predictions"
+        if baseline_mae is not None and baseline_rmse is not None:
+            rmse_pct = (baseline_rmse - rmse) / baseline_rmse * 100.0
+            mae_pct = (baseline_mae - mae) / baseline_mae * 100.0
+            scatter_title += (
+                "\n"
+                + f"RMSE {abs(rmse_pct):.0f}% {'better' if rmse_pct >= 0 else 'worse'}"
+                + ", "
+                + f"MAE {abs(mae_pct):.0f}% {'better' if mae_pct >= 0 else 'worse'}"
+                + " than αβγ"
+            )
+        ax.set_title(scatter_title)
+
+        stats = f"MAE  = {mae:.3f} kWh\n"
+        if baseline_mae is not None:
+            stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
+        stats += f"RMSE = {rmse:.3f} kWh\n"
+        if baseline_rmse is not None:
+            stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
+        stats = stats.rstrip()
+        ax.text(
+            0.97, 0.03, stats, transform=ax.transAxes, ha="right", va="bottom",
+            family="monospace", fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+        ax = axes[1]
+        ax.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
+        ax.axvline(0, color="k", linestyle="--", linewidth=1)
+        ax.set_xlim(-6, 6)
+        ax.set_xlabel("Prediction error (scaled kWh)")
+        ax.set_ylabel("Hours")
+        ax.set_title("Error distribution")
+
+        sm = ScalarMappable(norm=norm, cmap=cmap)
+        cbar = fig.colorbar(sm, ax=list(axes), fraction=0.03, pad=0.02)
+        ticks = np.linspace(norm.vmin, norm.vmax, 6)
+        cbar.set_ticks(ticks)
+        cbar.set_ticklabels([f"{t:.0f}°F" for t in ticks])
+
+        fig.suptitle(title)
+
+        if savepath is not None:
+            fig.savefig(savepath, dpi=150, bbox_inches="tight")
