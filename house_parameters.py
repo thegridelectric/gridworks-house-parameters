@@ -135,7 +135,11 @@ class HouseEnergyParamsComputer:
         n = len(dist_kwh)
         rank = int(np.linalg.matrix_rank(X))
         sigma2 = float(np.sum(residuals**2) / max(n - rank, 1))
-        std_errors = np.sqrt(np.diag(sigma2 * np.linalg.pinv(X.T @ X)))
+        n_params = X.shape[1]
+        if rank < n_params:
+            std_errors = np.full(n_params, np.nan)
+        else:
+            std_errors = np.sqrt(np.diag(sigma2 * np.linalg.inv(X.T @ X)))
         ss_tot = float(np.sum((y - y.mean()) ** 2))
         r_squared = 1.0 - float(np.sum(residuals**2)) / ss_tot
 
