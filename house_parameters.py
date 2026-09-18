@@ -221,7 +221,7 @@ class HouseEnergyParamsComputer:
             title=f"{self.house_alias.capitalize()}: house energy prediction over the year (trailing {n}-day fits)",
             savepath=RESULTS_DIR / f"{self.house_alias}_yearly_N{n}.png",
         )
-        
+
         plot_pred_vs_actual(
             oos_pred, oos_actual_scaled, oos_oat_f,
             f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
@@ -244,3 +244,61 @@ class HouseEnergyParamsComputer:
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
         params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}.csv")
+
+    def sweep_n(self, min_n: int, max_n: int) -> None:
+        import matplotlib.pyplot as plt
+
+        RESULTS_DIR.mkdir(exist_ok=True)
+        days = np.sort(self.df["day"].unique())
+        mses: list[float] = []
+        intercept_vars: list[float] = []
+
+        n_values = list(range(min_n, max_n+1))
+        
+        for n in n_values:
+            fit_days = []
+            intercepts = []
+            sse = 0.0
+            n_points = 0
+            for i in range(n - 1, len(days) - 1):
+                window = days[i - n + 1 : i + 1]
+                window_df = self.df[self.df["day"].isin(window)]
+                params = self.fit(window_df)
+                intercepts.append(params.B0)
+                fit_days.append(days[i])
+
+                next_df = self.df[self.df["day"] == days[i + 1]]
+                scaled_hat = self.predict(params, next_df)
+                actual_scaled = next_df["dist_kwh"].to_numpy() * params.energy_ratio
+                sse += float(np.sum((scaled_hat - actual_scaled) ** 2))
+                n_points += len(next_df)
+
+            mse = sse / n_points
+            intercept = pd.Series(intercepts, index=pd.DatetimeIndex(fit_days)).sort_index()
+            weekly_intercept_range = intercept.rolling("7D").apply(lambda s: s.max() - s.min())
+            intercept_var = float(weekly_intercept_range.mean())
+            mses.append(mse)
+            intercept_vars.append(intercept_var)
+            print(
+                f"N={n:2d}: next-day scaled MSE={mse:.4f}, "
+                f"avg weekly intercept variation={intercept_var:.3f}"
+            )
+
+        fig, ax1 = plt.subplots(figsize=(9, 5))
+        ax1.set_xlabel("N (trailing days in fit window)")
+        ax1.set_ylabel("Next-day scaled energy MSE", color="tab:blue")
+        ax1.plot(n_values, mses, "o-", color="tab:blue", label="MSE")
+        ax1.tick_params(axis="y", labelcolor="tab:blue")
+        ax1.set_xticks(n_values)
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Avg largest weekly intercept variation", color="tab:red")
+        ax2.plot(n_values, intercept_vars, "s--", color="tab:red", label="intercept variation")
+        ax2.tick_params(axis="y", labelcolor="tab:red")
+
+        fig.suptitle(f"{self.house_alias.capitalize()}: effect of lookback window N")
+        fig.tight_layout()
+        fig.savefig(
+            RESULTS_DIR / f"{self.house_alias}_sweep_N.png", dpi=150, bbox_inches="tight"
+        )
+        plt.show()
