@@ -4,16 +4,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import design_matrix, linear_regression, load_hourly_features
+from house_parameters import HouseEnergyParamsComputer
 
 HOUSE_ALIAS = "beech"
-N_VALUES = list(range(5,26))
+N_VALUES = list(range(5, 26))
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-df = load_hourly_features(HOUSE_ALIAS)
-days = np.sort(df["day"].unique())
+computer = HouseEnergyParamsComputer(HOUSE_ALIAS)
+days = np.sort(computer.df["day"].unique())
 
 
 def evaluate(N):
@@ -26,14 +26,14 @@ def evaluate(N):
     n_points = 0
     for i in range(N - 1, len(days) - 1):
         window = days[i - N + 1 : i + 1]
-        window_df = df[df["day"].isin(window)]
-        _, coefficients, _, _, energy_ratio = linear_regression(window_df)
-        intercepts.append(coefficients[0])
+        window_df = computer.df[computer.df["day"].isin(window)]
+        params = computer.fit(window_df)
+        intercepts.append(params.B0)
         fit_days.append(days[i])
 
-        next_df = df[df["day"] == days[i + 1]]
-        scaled_hat = np.maximum(design_matrix(next_df) @ coefficients, 0.0)
-        actual_scaled = next_df["dist_kwh"].to_numpy() * energy_ratio
+        next_df = computer.df[computer.df["day"] == days[i + 1]]
+        scaled_hat = computer.predict(params, next_df)
+        actual_scaled = next_df["dist_kwh"].to_numpy() * params.energy_ratio
         sse += float(np.sum((scaled_hat - actual_scaled) ** 2))
         n_points += len(next_df)
 

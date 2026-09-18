@@ -4,14 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import (
-    HouseEnergyParams,
-    HouseEnergyParamsComputer,
-    fit_alpha_beta_gamma,
-    load_hourly_features,
-    predict,
-    predict_alpha_beta_gamma,
-)
+from house_parameters import HouseEnergyParams, HouseEnergyParamsComputer
 from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred_vs_actual
 
 HOUSE_ALIAS = "maple_after"
@@ -20,10 +13,9 @@ N = 20
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Read the hourly CSV and build model features. Hours whose 6-hour history is
-# missing or non-contiguous are dropped there, so the count below is what is left.
-df = load_hourly_features(HOUSE_ALIAS)
-zones = df.attrs["zone_numbers"]
+computer = HouseEnergyParamsComputer(HOUSE_ALIAS)
+df = computer.df
+zones = computer.zones
 print(
     f"{len(df)} usable hours from {df['hour_start'].min()} to {df['hour_start'].max()} "
     f"({len(zones)} zones)"
@@ -31,7 +23,6 @@ print(
 t_i_avg_median = float(df[[f"T_i{z}_start" for z in zones]].mean(axis=1).median())
 
 # Fit on a trailing N-day window ending on each day.
-computer = HouseEnergyParamsComputer()
 days = np.sort(df["day"].unique())
 fit_days = []
 fit_oat_f = []
@@ -50,7 +41,7 @@ for i in range(N - 1, len(days)):
     fit_oat_f.append(float(window_df["oat_f"].mean()))
     params = computer.fit(window_df)
     results.append(params)
-    abg, _ = fit_alpha_beta_gamma(window_df)
+    abg_params = computer.fit(window_df, baseline=True)
 
     # Score the day after the window: never in-sample, so the predicted-vs-actual
     # figure below shows what the fit is actually worth going forward.
@@ -58,8 +49,8 @@ for i in range(N - 1, len(days)):
         next_df = df[df["day"] == days[i + 1]]
         oos_oat_f.extend(next_df["oat_f"])
         ratio = params.energy_ratio
-        oos_pred.extend(predict(params, next_df))
-        oos_pred_abg.extend(predict_alpha_beta_gamma(abg, next_df))
+        oos_pred.extend(computer.predict(params, next_df))
+        oos_pred_abg.extend(computer.predict(abg_params, next_df))
         oos_actual_scaled.extend(next_df["dist_kwh"] * ratio)
         oos_dist_kwh.extend(next_df["dist_kwh"])
 
@@ -94,7 +85,7 @@ print(
 # setpoint, no sun, envelope in equilibrium, and sustained operation, which is what
 # the median previous_dist_kwh stands for. See plot_curves' docstring.
 plot_curves(
-    results, fit_days, fit_oat_f,
+    computer, results, fit_days, fit_oat_f,
     t_i_avg=t_i_avg_median,
     previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
@@ -144,6 +135,7 @@ result_by_day = {pd.Timestamp(d): r for d, r in zip(fit_days, results)}
 oat_by_day = {pd.Timestamp(d): o for d, o in zip(fit_days, fit_oat_f)}
 extreme_sorted = sorted(extreme_days)
 plot_curves(
+    computer,
     [result_by_day[d] for d in extreme_sorted], extreme_sorted,
     [oat_by_day[d] for d in extreme_sorted],
     t_i_avg=t_i_avg_median,

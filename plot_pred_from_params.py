@@ -4,7 +4,7 @@ import pandas as pd
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from house_parameters import HouseEnergyParams, design_matrix
+from house_parameters import HouseEnergyParams, HouseEnergyParamsComputer
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
@@ -35,6 +35,7 @@ def _oat_colorbar(fig, axes, norm, cmap):
 
 
 def plot_curves(
+    computer: HouseEnergyParamsComputer,
     house_parameters: list[HouseEnergyParams],
     fit_days: list[pd.Timestamp],
     fit_oat_f: list[float],
@@ -80,7 +81,7 @@ def plot_curves(
             if name.startswith("set_minus_temp_zone"):
                 operating_point[name] = np.zeros_like(OAT_RANGE_F)
         op_df = pd.DataFrame(operating_point, columns=feature_names)
-        X = design_matrix(op_df, feature_names)
+        X = computer.design_matrix(op_df, feature_names=feature_names)
 
         for p, d, o in zip(house_parameters, fit_days, oat_values):
             house_kwh_pred = X @ p.coefficients()
