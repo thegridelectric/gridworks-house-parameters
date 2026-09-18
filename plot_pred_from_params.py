@@ -38,7 +38,6 @@ def plot_curves(
     house_parameters: list[HouseEnergyParams],
     fit_days: list[pd.Timestamp],
     fit_oat_f: list[float],
-    centers: dict[str, float],
     t_i_avg: float,
     previous_dist_kwh_median: float,
     title: str,
@@ -78,7 +77,7 @@ def plot_curves(
             "previous_dist_kwh": np.full_like(OAT_RANGE_F, previous_dist_kwh_median),
             "OAT_avg_6h": OAT_RANGE_F,
         }, columns=FEATURES)
-        X = design_matrix(operating_point, centers)
+        X = design_matrix(operating_point)
 
         for p, d, o in zip(house_parameters, fit_days, oat_values):
             house_kwh_pred = X @ p.coefficients()

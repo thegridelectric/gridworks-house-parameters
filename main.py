@@ -8,7 +8,6 @@ from house_parameters import (
     COEF_NAMES,
     HouseEnergyParams,
     HouseEnergyParamsComputer,
-    feature_centers,
     fit_alpha_beta_gamma,
     load_hourly_features,
     predict,
@@ -18,8 +17,6 @@ from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred
 
 HOUSE_ALIAS = "maple_after"
 N = 20
-SCALE_TO_HP_KWH = True   # False -> coefficients stay in distribution-kWh
-USE_CENTERING = False    # True -> B0 is demand at typical conditions, not at all-zeros
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -29,15 +26,8 @@ RESULTS_DIR.mkdir(exist_ok=True)
 df = load_hourly_features(HOUSE_ALIAS)
 print(f"{len(df)} usable hours from {df['hour_start'].min()} to {df['hour_start'].max()}")
 
-centers = feature_centers(df) if USE_CENTERING else {}
-if centers:
-    print("Centered at: " + ", ".join(f"{k}={v:.3g}" for k, v in centers.items()))
-    print("(B0 is the predicted energy at those typical conditions)")
-else:
-    print("Features are not centered (B0 is demand at all features = 0)")
-
 # Fit on a trailing N-day window ending on each day.
-computer = HouseEnergyParamsComputer(centers=centers, scale_to_hp_kwh=SCALE_TO_HP_KWH)
+computer = HouseEnergyParamsComputer()
 days = np.sort(df["day"].unique())
 fit_days = []
 fit_oat_f = []
@@ -62,7 +52,7 @@ for i in range(N - 1, len(days)):
     if i + 1 < len(days):
         next_df = df[df["day"] == days[i + 1]]
         oos_oat_f.extend(next_df["oat_f"])
-        oos_pred.extend(predict(params, next_df, centers))
+        oos_pred.extend(predict(params, next_df))
         oos_pred_abg.extend(predict_alpha_beta_gamma(abg, next_df))
         oos_actual.extend(next_df["dist_kwh"])
 
@@ -96,7 +86,7 @@ print(
 # setpoint, no sun, envelope in equilibrium, and sustained operation, which is what
 # the median previous_dist_kwh stands for. See plot_curves' docstring.
 plot_curves(
-    results, fit_days, fit_oat_f, centers,
+    results, fit_days, fit_oat_f,
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
     previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
@@ -147,7 +137,7 @@ oat_by_day = {pd.Timestamp(d): o for d, o in zip(fit_days, fit_oat_f)}
 extreme_sorted = sorted(extreme_days)
 plot_curves(
     [result_by_day[d] for d in extreme_sorted], extreme_sorted,
-    [oat_by_day[d] for d in extreme_sorted], centers,
+    [oat_by_day[d] for d in extreme_sorted],
     t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
     previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",

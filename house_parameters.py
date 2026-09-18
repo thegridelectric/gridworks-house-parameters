@@ -23,19 +23,6 @@ FEATURES = [
 ]
 COEF_NAMES = [f"B{i}" for i in range(1 + len(FEATURES))]
 
-# set_minus_temp_zone1/2 are already meaningful at zero (room exactly at its
-# setpoint), so they stay uncentered. The rest are centered at their global mean,
-# so B0 is the predicted energy at typical conditions instead of at an all-zeros
-# point the house never sees. That decorrelates it from the slopes and keeps it
-# stable across rolling fits. Off when USE_CENTERING is False.
-CENTERED_FEATURES = [
-    "deltaT",
-    "windspeed_times_deltaT",
-    "solar_w_m2",
-    "previous_dist_kwh",
-    "OAT_avg_6h",
-]
-
 REQUIRED_COLUMNS = [
     "oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th",
     "T_i1_start", "T_i1_set_start", "T_i2_start", "T_i2_set_start",
@@ -86,19 +73,10 @@ def load_hourly_features(house_alias: str) -> pd.DataFrame:
     return df
 
 
-def feature_centers(df: pd.DataFrame) -> dict[str, float]:
-    """Global means used to center the features, shared by every rolling fit.
-
-    Pass the empty dict instead (USE_CENTERING=False) to leave features raw.
-    Predictions are identical either way; only B0's meaning changes.
-    """
-    return {name: float(df[name].mean()) for name in CENTERED_FEATURES}
-
-
-def design_matrix(df: pd.DataFrame, centers: dict[str, float]) -> np.ndarray:
+def design_matrix(df: pd.DataFrame) -> np.ndarray:
     columns = [np.ones(len(df))]
     for name in FEATURES:
-        columns.append(df[name].to_numpy() - centers.get(name, 0.0))
+        columns.append(df[name].to_numpy())
     return np.column_stack(columns)
 
 
@@ -126,14 +104,14 @@ def predict_alpha_beta_gamma(coef: np.ndarray, df: pd.DataFrame) -> np.ndarray:
 
 
 def linear_regression(
-    df: pd.DataFrame, centers: dict[str, float]
+    df: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Fit dist_kwh = B0 + B1*deltaT + ... by MSE.
 
     Returns (fitted values, coefficients, standard errors, R-squared), with B0
     first in both coefficient arrays.
     """
-    X = design_matrix(df, centers)
+    X = design_matrix(df)
     dist_kwh = df["dist_kwh"].to_numpy()
 
     coefficients, *_ = np.linalg.lstsq(X, dist_kwh, rcond=None)
@@ -169,8 +147,7 @@ class HouseEnergyParams:
     std_error_B6: float
     std_error_B7: float
     r_squared: float
-    # hp_kwh_th / dist_kwh the coefficients were multiplied by, so the unit they
-    # are expressed in stays recoverable. 1.0 when SCALE_TO_HP_KWH is off.
+    # hp_kwh_th / dist_kwh the coefficients were multiplied by
     energy_ratio: float
 
     def coefficients(self) -> np.ndarray:
@@ -182,38 +159,29 @@ class HouseEnergyParams:
         return self.coefficients() / self.energy_ratio
 
 
-def predict(params: HouseEnergyParams, df: pd.DataFrame, centers: dict[str, float]) -> np.ndarray:
+def predict(params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
     """Predicted dist_kwh, clipped at zero.
 
     About 3% of raw predictions come out negative, as low as -5 kWh, which no
     distribution loop can deliver. Clipping is not cosmetic: it is worth 11% on
     next-day MSE (0.756 -> 0.672).
     """
-    return np.maximum(design_matrix(df, centers) @ params.dist_kwh_coefficients(), 0.0)
+    return np.maximum(design_matrix(df) @ params.dist_kwh_coefficients(), 0.0)
 
 
 class HouseEnergyParamsComputer:
     """Fit house heating parameters from a chunk of hourly data"""
-    def __init__(
-        self,
-        centers: dict[str, float],
-        scale_to_hp_kwh: bool = True,
-        predictor=linear_regression,
-    ):
-        self.centers = centers
-        self.scale_to_hp_kwh = scale_to_hp_kwh
+    def __init__(self, predictor=linear_regression):
         self.predictor = predictor
 
     def remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
         return df # TODO
 
     def fit(self, df: pd.DataFrame) -> HouseEnergyParams:
-        dist_kwh_pred, coefficients, std_errors, r_squared = self.predictor(df, self.centers)
-        energy_ratio = 1.0
-        if self.scale_to_hp_kwh:
-            # Restate the parameters as heat-pump thermal energy instead of energy
-            # into the distribution loop.
-            energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
+        dist_kwh_pred, coefficients, std_errors, r_squared = self.predictor(df)
+        # Restate the parameters as heat-pump thermal energy instead of energy
+        # into the distribution loop.
+        energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
         # Six decimals: enough for the small solar_w_m2 and
         # windspeed_times_deltaT coefficients to survive rounding, so predictions
         # rebuilt from the saved parameters match the fit.

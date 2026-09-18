@@ -4,18 +4,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from house_parameters import design_matrix, feature_centers, linear_regression, load_hourly_features
+from house_parameters import design_matrix, linear_regression, load_hourly_features
 
 HOUSE_ALIAS = "beech"
 N_VALUES = list(range(5,26))
-SCALE_TO_HP_KWH = True   # False -> the tracked intercept stays in distribution-kWh
-USE_CENTERING = False    # match main.py; intercept variation is larger without centering
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 df = load_hourly_features(HOUSE_ALIAS)
-centers = feature_centers(df) if USE_CENTERING else {}
 days = np.sort(df["day"].unique())
 
 
@@ -30,10 +27,8 @@ def evaluate(N):
     for i in range(N - 1, len(days) - 1):
         window = days[i - N + 1 : i + 1]
         window_df = df[df["day"].isin(window)]
-        dist_pred, coefficients, *_ = linear_regression(window_df, centers)
-        energy_ratio = 1.0
-        if SCALE_TO_HP_KWH:
-            energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
+        dist_pred, coefficients, *_ = linear_regression(window_df)
+        energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
         intercepts.append(coefficients[0] * energy_ratio)
         fit_days.append(days[i])
 
@@ -41,7 +36,7 @@ def evaluate(N):
         # stay unscaled here: dist_kwh is the target, not heat-pump thermal energy.
         # Clipped at zero, which negative predictions otherwise cost ~11% of MSE.
         next_df = df[df["day"] == days[i + 1]]
-        dist_hat = np.maximum(design_matrix(next_df, centers) @ coefficients, 0.0)
+        dist_hat = np.maximum(design_matrix(next_df) @ coefficients, 0.0)
         sse += float(np.sum((dist_hat - next_df["dist_kwh"].to_numpy()) ** 2))
         n_points += len(next_df)
 
