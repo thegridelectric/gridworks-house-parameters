@@ -223,12 +223,12 @@ class HouseEnergyParamsComputer:
 
         days = np.sort(self.df["day"].unique())
         rmses: list[float] = []
-        intercept_vars: list[float] = []
+        b1_weekly_ranges: list[float] = []
         n_values = list(range(min_n, max_n + 1))
 
         for n in n_values:
             fit_days = []
-            intercepts = []
+            b1_values = []
             oos_pred = []
             oos_actual = []
 
@@ -238,7 +238,7 @@ class HouseEnergyParamsComputer:
                 window_df = self.df[self.df["day"].isin(window)]
                 fit_days.append(days[i])
                 params = self.fit(window_df)
-                intercepts.append(params.B0)
+                b1_values.append(params.B1)
 
                 # Make an out-of-sample (oos) prediction for the next day
                 next_df = self.df[self.df["day"] == days[i + 1]]
@@ -249,14 +249,14 @@ class HouseEnergyParamsComputer:
 
             errors = np.array(oos_pred) - np.array(oos_actual)
             rmse = float(np.sqrt((errors**2).mean()))
-            intercept = pd.Series(intercepts, index=pd.DatetimeIndex(fit_days)).sort_index()
-            weekly_intercept_range = intercept.rolling("7D").apply(lambda s: s.max() - s.min())
-            intercept_var = float(weekly_intercept_range.mean())
+            b1 = pd.Series(b1_values, index=pd.DatetimeIndex(fit_days)).sort_index()
+            weekly_b1_range = b1.rolling("7D").apply(lambda s: s.max() - s.min())
+            b1_weekly_range = float(weekly_b1_range.mean())
             rmses.append(rmse)
-            intercept_vars.append(intercept_var)
+            b1_weekly_ranges.append(b1_weekly_range)
             print(
                 f"N={n:2d}: next-day RMSE={rmse:.4f} kWh, "
-                f"avg weekly intercept variation={intercept_var:.3f}"
+                f"avg weekly B1 (deltaT) range={b1_weekly_range:.5g}"
             )
 
         fig, ax1 = plt.subplots(figsize=(9, 5))
@@ -267,8 +267,8 @@ class HouseEnergyParamsComputer:
         ax1.set_xticks(n_values)
 
         ax2 = ax1.twinx()
-        ax2.set_ylabel("Avg largest weekly intercept variation", color="tab:red")
-        ax2.plot(n_values, intercept_vars, "s--", color="tab:red", label="intercept variation")
+        ax2.set_ylabel("Avg largest weekly B1 (deltaT) range", color="tab:red")
+        ax2.plot(n_values, b1_weekly_ranges, "s--", color="tab:red", label="B1 weekly range")
         ax2.tick_params(axis="y", labelcolor="tab:red")
 
         fig.suptitle(f"{self.house_alias.capitalize()}: effect of lookback window N")
