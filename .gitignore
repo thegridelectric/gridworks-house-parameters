@@ -4,6 +4,4 @@ __pycache__/
 .env
 .DS_Store
 data/
-
-# Generated outputs (directory name contains "results")
 **/results*/
