@@ -112,13 +112,12 @@ class HouseEnergyParamsComputer:
     def remove_outliers(self) -> None:
         pass
 
-    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, feature_names: list[str] | None = None) -> np.ndarray:
+    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False) -> np.ndarray:
         if baseline:
             oat_f = df["oat_f"].to_numpy()
             return np.column_stack([np.ones(len(df)), oat_f, (65.0 - oat_f) * df["ws_mph"].to_numpy()])
-        names = feature_names or list(self.feature_names)
         columns = [np.ones(len(df))]
-        for name in names:
+        for name in self.feature_names:
             columns.append(df[name].to_numpy())
         return np.column_stack(columns)
 
@@ -157,13 +156,12 @@ class HouseEnergyParamsComputer:
         return np.maximum(X @ params.coefficients(), 0.0)
 
     def trailing_n_day_fits(self, n: int) -> None:
-        from plotter import plot_curves, plot_pred_vs_actual
+        from plotter import plot_pred_vs_actual
 
         RESULTS_DIR.mkdir(exist_ok=True)
         
         days = np.sort(self.df["day"].unique())
         fit_days = []
-        fit_oat_f = []
         results: list[HouseEnergyParams] = []
         oos_oat_f = []
         oos_pred = []
@@ -174,7 +172,6 @@ class HouseEnergyParamsComputer:
             window = days[i - n + 1 : i + 1]
             window_df = self.df[self.df["day"].isin(window)]
             fit_days.append(days[i])
-            fit_oat_f.append(float(window_df["oat_f"].mean()))
             params = self.fit(window_df)
             results.append(params)
             abg_params = self.fit(window_df, baseline=True)
@@ -207,14 +204,6 @@ class HouseEnergyParamsComputer:
             f"RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
             f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
             f"MAE αβγ={mae_abg:.3f} kWh, RMSE αβγ={rmse_abg:.3f} kWh"
-        )
-
-        plot_curves(
-            self, results, fit_days, fit_oat_f,
-            t_i_avg=float(self.df[[f"T_i{z}_start" for z in self.zones]].mean(axis=1).median()),
-            previous_dist_kwh_median=float(self.df["previous_dist_kwh"].median()),
-            title=f"{self.house_alias.capitalize()}: house energy prediction over the year (trailing {n}-day fits)",
-            savepath=RESULTS_DIR / f"{self.house_alias}_yearly_N{n}.png",
         )
 
         plot_pred_vs_actual(

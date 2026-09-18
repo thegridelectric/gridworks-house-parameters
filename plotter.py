@@ -1,13 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from house_parameters import HouseEnergyParams, HouseEnergyParamsComputer
-
-WIND_SPEEDS_MPH = [0, 10, 20]
-OAT_RANGE_F = np.linspace(-10, 40, 200)
 OAT_COLOR_F = (-13.0, 70.0)
 
 
@@ -30,79 +25,6 @@ def _oat_colorbar(fig, axes, norm, cmap):
     cbar.set_ticklabels([f"{t:.0f}°F" for t in ticks])
     return cbar
 
-
-def plot_curves(
-    computer: HouseEnergyParamsComputer,
-    house_parameters: list[HouseEnergyParams],
-    fit_days: list[pd.Timestamp],
-    fit_oat_f: list[float],
-    t_i_avg: float,
-    previous_dist_kwh_median: float,
-    title: str,
-    savepath=None,
-    use_legend: bool = False
-):
-    """One house_kwh_pred(oat) curve per fit day, in a panel per wind speed.
-
-    Curves are colored by fit_oat_f, the mean outdoor temperature over the window
-    the fit was made on, so the color says what weather shaped the parameters.
-
-    Most features have to be pinned before a curve against outdoor temperature
-    exists at all. These curves are therefore NOT unconditional predictions:
-    they hold at one operating point, namely
-
-        set_minus_temp_zone* = 0     every zone exactly at its setpoint
-        previous_dist_kwh = median   sustained operation, not a cold start
-        OAT_avg_6h = oat_f           envelope in equilibrium with the current weather
-        solar_w_m2 = 0               no sun
-        interior average             pinned at t_i_avg, the median over the dataset,
-                                     which is what turns oat into deltaT and
-                                     windspeed_times_deltaT
-
-    Wind speed is already mph in the data, so the panels need no conversion.
-    """
-    oat_values, norm, cmap = _oat_colors(fit_oat_f)
-    feature_names = list(house_parameters[0].feature_names)
-
-    fig, axes = plt.subplots(1, len(WIND_SPEEDS_MPH), figsize=(16, 5), sharey=True)
-    for ax, ws in zip(axes, WIND_SPEEDS_MPH):
-        deltaT = np.maximum(t_i_avg - OAT_RANGE_F, 0.0)
-        operating_point = {
-            "deltaT": deltaT,
-            "windspeed_times_deltaT": deltaT * ws,
-            "solar_w_m2": np.zeros_like(OAT_RANGE_F),
-            "previous_dist_kwh": np.full_like(OAT_RANGE_F, previous_dist_kwh_median),
-            "OAT_avg_6h": OAT_RANGE_F,
-        }
-        for name in feature_names:
-            if name.startswith("set_minus_temp_zone"):
-                operating_point[name] = np.zeros_like(OAT_RANGE_F)
-        op_df = pd.DataFrame(operating_point, columns=feature_names)
-        X = computer.design_matrix(op_df, feature_names=feature_names)
-
-        for p, d, o in zip(house_parameters, fit_days, oat_values):
-            house_kwh_pred = X @ p.coefficients()
-            ax.plot(
-                OAT_RANGE_F, house_kwh_pred, color=cmap(norm(o)),
-                alpha=0.9 if use_legend else 0.5,
-                linewidth=1.5 if use_legend else 0.8,
-                label=f"{pd.Timestamp(d).strftime('%b %d')} ({o:.0f}°F)" if use_legend else None
-            )
-        ax.set_title(f"Wind speed: {ws} mph")
-        ax.set_xlabel("Outside air temperature (°F)")
-    axes[0].set_ylabel("House energy (scaled dist kWh)")
-
-    if use_legend:
-        axes[-1].legend(title="Fit day (window mean OAT)")
-    else:
-        _oat_colorbar(fig, axes, norm, cmap)
-
-    fig.suptitle(title)
-
-    if savepath is not None:
-        fig.savefig(savepath, dpi=150, bbox_inches="tight")
-
-
 def plot_pred_vs_actual(
     predicted: np.ndarray,
     actual: np.ndarray,
@@ -114,9 +36,8 @@ def plot_pred_vs_actual(
 ):
     """Out-of-sample next-day predictions against what the house actually used.
 
-    Points are colored by that hour's outdoor temperature, on the same cold-to-warm
-    scale as plot_curves, so a temperature-dependent bias shows up as a color
-    gradient off the 1:1 line.
+    Points are colored by that hour's outdoor temperature on a fixed cold-to-warm
+    scale so a temperature-dependent bias shows up as a color gradient off the 1:1 line.
 
     Values are scaled energy (dist_kwh × energy_ratio from each fit window).
     """
