@@ -35,7 +35,7 @@ Baseline model (alpha-beta-gamma) features:
 
 FEATURES_BASELINE = [
     "oat_f",
-    "windspeed_times_fixed_deltaT",
+    "windspeed_times_65_minus_oat",
 ]
 
 
