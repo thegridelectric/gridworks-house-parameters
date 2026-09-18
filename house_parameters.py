@@ -1,8 +1,11 @@
 import glob
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+RESULTS_DIR = Path("results")
 
 """
 Model features in B1.. order. B0 is the intercept. Zone terms follow the base five.
@@ -148,3 +151,96 @@ class HouseEnergyParamsComputer:
     def predict(self, params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
         X = self.design_matrix(df, baseline=params.baseline)
         return np.maximum(X @ params.coefficients(), 0.0)
+
+    def trailing_n_day_fits(self, n: int) -> None:
+        from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred_vs_actual
+
+        RESULTS_DIR.mkdir(exist_ok=True)
+        
+        days = np.sort(self.df["day"].unique())
+        fit_days = []
+        fit_oat_f = []
+        results: list[HouseEnergyParams] = []
+        oos_oat_f = []
+        oos_pred = []
+        oos_pred_abg = []
+        oos_actual_scaled = []
+        oos_dist_kwh = []
+
+        for i in range(n - 1, len(days)):
+            window = days[i - n + 1 : i + 1]
+            window_df = self.df[self.df["day"].isin(window)]
+            fit_days.append(days[i])
+            fit_oat_f.append(float(window_df["oat_f"].mean()))
+            params = self.fit(window_df)
+            results.append(params)
+            abg_params = self.fit(window_df, baseline=True)
+
+            if i + 1 < len(days):
+                next_df = self.df[self.df["day"] == days[i + 1]]
+                oos_oat_f.extend(next_df["oat_f"])
+                ratio = params.energy_ratio
+                oos_pred.extend(self.predict(params, next_df))
+                oos_pred_abg.extend(self.predict(abg_params, next_df))
+                oos_actual_scaled.extend(next_df["dist_kwh"] * ratio)
+                oos_dist_kwh.extend(next_df["dist_kwh"])
+
+        print(
+            f"Fitted {len(results)} trailing {n}-day windows "
+            f"from {pd.Timestamp(fit_days[0]).date()} to {pd.Timestamp(fit_days[-1]).date()}"
+        )
+
+        oos_pred = np.array(oos_pred)
+        oos_pred_abg = np.array(oos_pred_abg)
+        oos_actual_scaled = np.array(oos_actual_scaled)
+        oos_dist_kwh = np.array(oos_dist_kwh)
+        oos_oat_f = np.array(oos_oat_f)
+        keep = oos_dist_kwh <= MAX_PLAUSIBLE_DIST_KWH
+        n_dropped = int((~keep).sum())
+        oos_pred, oos_pred_abg, oos_actual_scaled, oos_oat_f = (
+            oos_pred[keep], oos_pred_abg[keep], oos_actual_scaled[keep], oos_oat_f[keep]
+        )
+        errors = oos_pred - oos_actual_scaled
+        errors_abg = oos_pred_abg - oos_actual_scaled
+        mae_abg = float(np.abs(errors_abg).mean())
+        rmse_abg = float(np.sqrt((errors_abg**2).mean()))
+
+        print(
+            f"Next-day out-of-sample (scaled kWh) over {len(oos_actual_scaled)} hours"
+            f" ({n_dropped} hours with dist_kwh > {MAX_PLAUSIBLE_DIST_KWH:g} dropped): "
+            f"MSE={float((errors**2).mean()):.3f}, "
+            f"RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
+            f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
+            f"MAE αβγ={mae_abg:.3f} kWh, RMSE αβγ={rmse_abg:.3f} kWh"
+        )
+
+        plot_curves(
+            self, results, fit_days, fit_oat_f,
+            t_i_avg=float(self.df[[f"T_i{z}_start" for z in self.zones]].mean(axis=1).median()),
+            previous_dist_kwh_median=float(self.df["previous_dist_kwh"].median()),
+            title=f"{self.house_alias.capitalize()}: house energy prediction over the year (trailing {n}-day fits)",
+            savepath=RESULTS_DIR / f"{self.house_alias}_yearly_N{n}.png",
+        )
+        
+        plot_pred_vs_actual(
+            oos_pred, oos_actual_scaled, oos_oat_f,
+            f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
+            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}.png",
+            baseline_mae=mae_abg,
+            baseline_rmse=rmse_abg,
+        )
+
+        coef_names = list(results[0].coef_names)
+        params_table = pd.DataFrame(
+            {name: [getattr(r, name) for r in results] for name in coef_names}
+            | {
+                f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results]
+                for name in coef_names
+            }
+            | {
+                "r_squared": [r.r_squared for r in results],
+                "energy_ratio": [r.energy_ratio for r in results],
+            },
+            index=pd.DatetimeIndex(fit_days),
+        ).sort_index()
+        params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}.csv")
