@@ -7,17 +7,6 @@ import pandas as pd
 
 RESULTS_DIR = Path("results")
 
-"""
-Model features in B1.. order. B0 is the intercept. Zone terms follow the base five.
-  B0
-  B1 deltaT
-  B2 windspeed_times_deltaT
-  B3 solar_w_m2
-  B4 previous_dist_kwh
-  B5 OAT_avg_6h
-  B6+ set_minus_temp_zone{z} for each zone z in the export
-"""
-
 FEATURES_WITHOUT_ZONES = [
     "deltaT",
     "windspeed_times_deltaT",
@@ -25,13 +14,6 @@ FEATURES_WITHOUT_ZONES = [
     "previous_dist_kwh",
     "OAT_avg_6h",
 ]
-
-"""
-Baseline model (alpha-beta-gamma) features:
-  B0
-  B1 oat_f
-  B2 ws_mph * (65-oat_f)
-"""
 
 FEATURES_BASELINE = [
     "oat_f",
@@ -92,6 +74,7 @@ class HouseEnergyParamsComputer:
             df[f"set_minus_temp_zone{z}"] = df[f"T_i{z}_set_start"] - df[f"T_i{z}_start"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
+        df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
 
         # Keep only rows with a history span of 6 hours, necessary for the OAT_avg_6h feature
         history_span = df["hour_start"] - df["hour_start"].shift(6)
@@ -100,6 +83,9 @@ class HouseEnergyParamsComputer:
         self.feature_names = tuple(
             FEATURES_WITHOUT_ZONES + [f"set_minus_temp_zone{z}" for z in self.zones]
         )
+        self.feature_names_baseline = tuple(FEATURES_BASELINE)
+
+        # Filter out rows with missing critical data
         required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
             col for z in self.zones for col in (f"T_i{z}_start", f"T_i{z}_set_start")
         ]
@@ -116,17 +102,14 @@ class HouseEnergyParamsComputer:
         pass
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False) -> np.ndarray:
-        if baseline:
-            oat_f = df["oat_f"].to_numpy()
-            return np.column_stack([np.ones(len(df)), oat_f, (65.0 - oat_f) * df["ws_mph"].to_numpy()])
-        columns = [np.ones(len(df))]
-        for name in self.feature_names:
-            columns.append(df[name].to_numpy())
-        return np.column_stack(columns)
+        feature_names = self.feature_names_baseline if baseline else self.feature_names
+        return np.column_stack(
+            [np.ones(len(df))] + [df[name].to_numpy() for name in feature_names]
+        )
 
     def fit(self, df: pd.DataFrame, *, baseline: bool = False) -> HouseEnergyParams:
         X = self.design_matrix(df, baseline=baseline)
-        feature_names = (FEATURES_BASELINE if baseline else self.feature_names)
+        feature_names = (self.feature_names_baseline if baseline else self.feature_names)
 
         dist_kwh = df["dist_kwh"].to_numpy()
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
@@ -134,9 +117,8 @@ class HouseEnergyParamsComputer:
 
         coefficients, *_ = np.linalg.lstsq(X, y, rcond=None)
         residuals = y - X @ coefficients
-        n = len(dist_kwh)
         rank = int(np.linalg.matrix_rank(X))
-        sigma2 = float(np.sum(residuals**2) / max(n - rank, 1))
+        sigma2 = float(np.sum(residuals**2) / max(len(dist_kwh) - rank, 1))
         n_params = X.shape[1]
         if rank < n_params:
             std_errors = np.full(n_params, np.nan)
@@ -150,7 +132,7 @@ class HouseEnergyParamsComputer:
             values=tuple(round(float(c), 6) for c in coefficients),
             std_errors=tuple(round(float(e), 6) for e in std_errors),
             r_squared=round(r_squared, 3),
-            energy_ratio=round(energy_ratio, 6),
+            energy_ratio=round(energy_ratio, 3),
             baseline=baseline,
         )
 
@@ -166,24 +148,27 @@ class HouseEnergyParamsComputer:
         results: list[HouseEnergyParams] = []
         oos_oat_f = []
         oos_pred = []
-        oos_pred_abg = []
-        oos_actual_scaled = []
+        oos_pred_baseline = []
+        oos_actual = []
 
         for i in range(n - 1, len(days)):
+            # Fit the model to the previous n days
             window = days[i - n + 1 : i + 1]
             window_df = self.df[self.df["day"].isin(window)]
             fit_days.append(days[i])
             params = self.fit(window_df)
+            params_baseline = self.fit(window_df, baseline=True)
             results.append(params)
-            abg_params = self.fit(window_df, baseline=True)
 
+            # Make an out-of-sample (oos) prediction for the next day
             if i + 1 < len(days):
                 next_df = self.df[self.df["day"] == days[i + 1]]
+                pred = self.predict(params, next_df)
+                pred_baseline = self.predict(params_baseline, next_df)
+                oos_pred.extend(pred)
+                oos_pred_baseline.extend(pred_baseline)
+                oos_actual.extend(next_df["dist_kwh"] * params.energy_ratio)
                 oos_oat_f.extend(next_df["oat_f"])
-                ratio = params.energy_ratio
-                oos_pred.extend(self.predict(params, next_df))
-                oos_pred_abg.extend(self.predict(abg_params, next_df))
-                oos_actual_scaled.extend(next_df["dist_kwh"] * ratio)
 
         print(
             f"Fitted {len(results)} trailing {n}-day windows "
@@ -191,30 +176,17 @@ class HouseEnergyParamsComputer:
         )
 
         oos_pred = np.array(oos_pred)
-        oos_pred_abg = np.array(oos_pred_abg)
-        oos_actual_scaled = np.array(oos_actual_scaled)
+        oos_pred_baseline = np.array(oos_pred_baseline)
+        oos_actual = np.array(oos_actual)
         oos_oat_f = np.array(oos_oat_f)
-        errors = oos_pred - oos_actual_scaled
-        errors_abg = oos_pred_abg - oos_actual_scaled
-        mae_abg = float(np.abs(errors_abg).mean())
-        rmse_abg = float(np.sqrt((errors_abg**2).mean()))
+        errors = oos_pred - oos_actual
+        errors_baseline = oos_pred_baseline - oos_actual
+        mae = float(np.abs(errors).mean())
+        rmse = float(np.sqrt((errors**2).mean()))
+        mae_baseline = float(np.abs(errors_baseline).mean())
+        rmse_baseline = float(np.sqrt((errors_baseline**2).mean()))
 
-        print(
-            f"Next-day out-of-sample (scaled kWh) over {len(oos_actual_scaled)} hours: "
-            f"MSE={float((errors**2).mean()):.3f}, "
-            f"RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
-            f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
-            f"MAE αβγ={mae_abg:.3f} kWh, RMSE αβγ={rmse_abg:.3f} kWh"
-        )
-
-        self.plot_pred_vs_actual(
-            oos_pred, oos_actual_scaled, oos_oat_f,
-            f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
-            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}.png",
-            baseline_mae=mae_abg,
-            baseline_rmse=rmse_abg,
-        )
-
+        # Save the parameters to a CSV file
         coef_names = list(results[0].coef_names)
         params_table = pd.DataFrame(
             {name: [getattr(r, name) for r in results] for name in coef_names}
@@ -230,49 +202,67 @@ class HouseEnergyParamsComputer:
         ).sort_index()
         params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}.csv")
 
+        print(
+            f"Next-day out-of-sample over {len(oos_actual)} hours:\n"
+            f"MAE = {mae:.1f} kWh (baseline {mae_baseline:.1f} kWh)\n"
+            f"RMSE = {rmse:.1f} kWh (baseline {rmse_baseline:.1f} kWh)"
+        )
+
+        self.plot_pred_vs_actual(
+            oos_pred, oos_actual, oos_oat_f,
+            f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
+            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}.png",
+            baseline_mae=mae_baseline,
+            baseline_rmse=rmse_baseline,
+        )
+
     def sweep_n(self, min_n: int, max_n: int) -> None:
         import matplotlib.pyplot as plt
 
         RESULTS_DIR.mkdir(exist_ok=True)
-        days = np.sort(self.df["day"].unique())
-        mses: list[float] = []
-        intercept_vars: list[float] = []
 
-        n_values = list(range(min_n, max_n+1))
+        days = np.sort(self.df["day"].unique())
+        rmses: list[float] = []
+        intercept_vars: list[float] = []
+        n_values = list(range(min_n, max_n + 1))
 
         for n in n_values:
             fit_days = []
             intercepts = []
-            sse = 0.0
-            n_points = 0
+            oos_pred = []
+            oos_actual = []
+
             for i in range(n - 1, len(days) - 1):
+                # Fit the model to the previous n days
                 window = days[i - n + 1 : i + 1]
                 window_df = self.df[self.df["day"].isin(window)]
+                fit_days.append(days[i])
                 params = self.fit(window_df)
                 intercepts.append(params.B0)
-                fit_days.append(days[i])
 
+                # Make an out-of-sample (oos) prediction for the next day
                 next_df = self.df[self.df["day"] == days[i + 1]]
-                scaled_hat = self.predict(params, next_df)
-                actual_scaled = next_df["dist_kwh"].to_numpy() * params.energy_ratio
-                sse += float(np.sum((scaled_hat - actual_scaled) ** 2))
-                n_points += len(next_df)
+                pred = self.predict(params, next_df)
+                actual = next_df["dist_kwh"] * params.energy_ratio
+                oos_pred.extend(pred)
+                oos_actual.extend(actual)
 
-            mse = sse / n_points
+            errors = np.array(oos_pred) - np.array(oos_actual)
+            rmse = float(np.sqrt((errors**2).mean()))
             intercept = pd.Series(intercepts, index=pd.DatetimeIndex(fit_days)).sort_index()
             weekly_intercept_range = intercept.rolling("7D").apply(lambda s: s.max() - s.min())
             intercept_var = float(weekly_intercept_range.mean())
-            mses.append(mse)
+            rmses.append(rmse)
             intercept_vars.append(intercept_var)
             print(
-                f"N={n:2d}: next-day scaled MSE={mse:.4f}, "
+                f"N={n:2d}: next-day RMSE={rmse:.4f} kWh, "
                 f"avg weekly intercept variation={intercept_var:.3f}"
             )
 
         fig, ax1 = plt.subplots(figsize=(9, 5))
         ax1.set_xlabel("N (trailing days in fit window)")
-        ax1.set_ylabel("Next-day scaled energy MSE", color="tab:blue")
-        ax1.plot(n_values, mses, "o-", color="tab:blue", label="MSE")
+        ax1.set_ylabel("Next-day RMSE (kWh)", color="tab:blue")
+        ax1.plot(n_values, rmses, "o-", color="tab:blue", label="RMSE")
         ax1.tick_params(axis="y", labelcolor="tab:blue")
         ax1.set_xticks(n_values)
 

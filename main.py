@@ -10,7 +10,7 @@ HOUSE_ALIASES = [
 ]
 
 for house in HOUSE_ALIASES:
-    print(f"\nStarting analysis for {house}...")
+    print(f"\n[{house.capitalize()}]")
     h = HouseEnergyParamsComputer(house)
     h.trailing_n_day_fits(n=20)
     # h.sweep_n(min_n=5, max_n=25)
