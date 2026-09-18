@@ -8,9 +8,6 @@ from house_parameters import HouseEnergyParams, HouseEnergyParamsComputer
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
-# Hours above this are treated as bad meter/export values and dropped from the
-# predicted-vs-actual figure (not from the fit).
-MAX_PLAUSIBLE_DIST_KWH = 12.0
 OAT_COLOR_F = (-13.0, 70.0)
 
 
@@ -121,7 +118,7 @@ def plot_pred_vs_actual(
     scale as plot_curves, so a temperature-dependent bias shows up as a color
     gradient off the 1:1 line.
 
-    Points should already be filtered on raw dist_kwh; values are scaled energy.
+    Values are scaled energy (dist_kwh × energy_ratio from each fit window).
     """
     predicted = np.asarray(predicted)
     actual = np.asarray(actual)
@@ -134,7 +131,7 @@ def plot_pred_vs_actual(
 
     ax = axes[0]
     ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
-    hi = float(max(MAX_PLAUSIBLE_DIST_KWH, actual.max(), predicted.max()) * 1.05)
+    hi = float(max(actual.max(), predicted.max()) * 1.05)
     limits = [0, hi]
     ax.plot(limits, limits, "k--", linewidth=1)
     ax.set_xlim(limits)

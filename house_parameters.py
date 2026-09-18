@@ -153,7 +153,7 @@ class HouseEnergyParamsComputer:
         return np.maximum(X @ params.coefficients(), 0.0)
 
     def trailing_n_day_fits(self, n: int) -> None:
-        from plot_pred_from_params import MAX_PLAUSIBLE_DIST_KWH, plot_curves, plot_pred_vs_actual
+        from plotter import plot_curves, plot_pred_vs_actual
 
         RESULTS_DIR.mkdir(exist_ok=True)
         
@@ -165,7 +165,6 @@ class HouseEnergyParamsComputer:
         oos_pred = []
         oos_pred_abg = []
         oos_actual_scaled = []
-        oos_dist_kwh = []
 
         for i in range(n - 1, len(days)):
             window = days[i - n + 1 : i + 1]
@@ -183,7 +182,6 @@ class HouseEnergyParamsComputer:
                 oos_pred.extend(self.predict(params, next_df))
                 oos_pred_abg.extend(self.predict(abg_params, next_df))
                 oos_actual_scaled.extend(next_df["dist_kwh"] * ratio)
-                oos_dist_kwh.extend(next_df["dist_kwh"])
 
         print(
             f"Fitted {len(results)} trailing {n}-day windows "
@@ -193,21 +191,14 @@ class HouseEnergyParamsComputer:
         oos_pred = np.array(oos_pred)
         oos_pred_abg = np.array(oos_pred_abg)
         oos_actual_scaled = np.array(oos_actual_scaled)
-        oos_dist_kwh = np.array(oos_dist_kwh)
         oos_oat_f = np.array(oos_oat_f)
-        keep = oos_dist_kwh <= MAX_PLAUSIBLE_DIST_KWH
-        n_dropped = int((~keep).sum())
-        oos_pred, oos_pred_abg, oos_actual_scaled, oos_oat_f = (
-            oos_pred[keep], oos_pred_abg[keep], oos_actual_scaled[keep], oos_oat_f[keep]
-        )
         errors = oos_pred - oos_actual_scaled
         errors_abg = oos_pred_abg - oos_actual_scaled
         mae_abg = float(np.abs(errors_abg).mean())
         rmse_abg = float(np.sqrt((errors_abg**2).mean()))
 
         print(
-            f"Next-day out-of-sample (scaled kWh) over {len(oos_actual_scaled)} hours"
-            f" ({n_dropped} hours with dist_kwh > {MAX_PLAUSIBLE_DIST_KWH:g} dropped): "
+            f"Next-day out-of-sample (scaled kWh) over {len(oos_actual_scaled)} hours: "
             f"MSE={float((errors**2).mean()):.3f}, "
             f"RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
             f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
@@ -254,7 +245,7 @@ class HouseEnergyParamsComputer:
         intercept_vars: list[float] = []
 
         n_values = list(range(min_n, max_n+1))
-        
+
         for n in n_values:
             fit_days = []
             intercepts = []
