@@ -4,13 +4,16 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-# Model features in B1.. order. B0 is the intercept. Zone terms follow the base five.
-#   B1 deltaT
-#   B2 windspeed_times_deltaT
-#   B3 solar_w_m2
-#   B4 previous_dist_kwh
-#   B5 OAT_avg_6h
-#   B6+ set_minus_temp_zone{z} for each zone z in the export
+"""
+Model features in B1.. order. B0 is the intercept. Zone terms follow the base five.
+  B1 deltaT
+  B2 windspeed_times_deltaT
+  B3 solar_w_m2
+  B4 previous_dist_kwh
+  B5 OAT_avg_6h
+  B6+ set_minus_temp_zone{z} for each zone z in the export
+"""
+
 BASE_FEATURES = [
     "deltaT",
     "windspeed_times_deltaT",
@@ -87,42 +90,35 @@ def alpha_beta_gamma_design_matrix(df: pd.DataFrame) -> np.ndarray:
     ])
 
 
-def fit_alpha_beta_gamma(df: pd.DataFrame) -> np.ndarray:
-    """Unscaled [alpha, beta, gamma] for dist_kwh, same model as main."""
-    coef, *_ = np.linalg.lstsq(
-        alpha_beta_gamma_design_matrix(df), df["dist_kwh"].to_numpy(), rcond=None
-    )
-    return coef
+def fit_alpha_beta_gamma(df: pd.DataFrame) -> tuple[np.ndarray, float]:
+    energy_ratio = float(df["hp_kwh_th"].sum()) / float(df["dist_kwh"].sum())
+    y = df["dist_kwh"].to_numpy() * energy_ratio
+    coef, *_ = np.linalg.lstsq(alpha_beta_gamma_design_matrix(df), y, rcond=None)
+    return coef, energy_ratio
 
 
 def predict_alpha_beta_gamma(coef: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """Predicted dist_kwh from alpha/beta/gamma, clipped at zero like predict()."""
     return np.maximum(alpha_beta_gamma_design_matrix(df) @ coef, 0.0)
 
 
-def linear_regression(
-    df: pd.DataFrame,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Fit dist_kwh = B0 + B1*deltaT + ... by MSE.
-
-    Returns (fitted values, coefficients, standard errors, R-squared), with B0
-    first in both coefficient arrays.
-    """
+def linear_regression(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     X = design_matrix(df)
     dist_kwh = df["dist_kwh"].to_numpy()
+    energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
+    scaled_dist_kwh = dist_kwh * energy_ratio
 
-    coefficients, *_ = np.linalg.lstsq(X, dist_kwh, rcond=None)
-    dist_kwh_pred = X @ coefficients
-    residuals = dist_kwh - dist_kwh_pred
+    coefficients, *_ = np.linalg.lstsq(X, scaled_dist_kwh, rcond=None)
+    scaled_pred = X @ coefficients
+    residuals = scaled_dist_kwh - scaled_pred
     n = len(dist_kwh)
     # pinv: a zone at setpoint for the whole window makes that gap column
     # constant, so X'X is singular (elm's zone 2 is like this most of the year).
     rank = int(np.linalg.matrix_rank(X))
     sigma2 = float(np.sum(residuals**2) / max(n - rank, 1))
     std_errors = np.sqrt(np.diag(sigma2 * np.linalg.pinv(X.T @ X)))
-    ss_tot = float(np.sum((dist_kwh - dist_kwh.mean()) ** 2))
+    ss_tot = float(np.sum((scaled_dist_kwh - scaled_dist_kwh.mean()) ** 2))
     r_squared = 1.0 - float(np.sum(residuals**2)) / ss_tot
-    return dist_kwh_pred, coefficients, std_errors, r_squared
+    return scaled_pred, coefficients, std_errors, r_squared, energy_ratio
 
 
 @dataclass
@@ -131,7 +127,6 @@ class HouseEnergyParams:
     values: tuple[float, ...]
     std_errors: tuple[float, ...]
     r_squared: float
-    # hp_kwh_th / dist_kwh the coefficients were multiplied by
     energy_ratio: float
 
     @property
@@ -139,12 +134,7 @@ class HouseEnergyParams:
         return tuple(f"B{i}" for i in range(len(self.values)))
 
     def coefficients(self) -> np.ndarray:
-        """[B0, B1, ...], in the unit the fit was scaled to."""
         return np.array(self.values, dtype=float)
-
-    def dist_kwh_coefficients(self) -> np.ndarray:
-        """The same coefficients back in distribution-kWh, the unit of dist_kwh."""
-        return self.coefficients() / self.energy_ratio
 
     def __getattr__(self, name: str):
         if name.startswith("std_error_B") and name[len("std_error_B"):].isdigit():
@@ -155,14 +145,8 @@ class HouseEnergyParams:
 
 
 def predict(params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
-    """Predicted dist_kwh, clipped at zero.
-
-    About 3% of raw predictions come out negative, as low as -5 kWh, which no
-    distribution loop can deliver. Clipping is not cosmetic: it is worth 11% on
-    next-day MSE (0.756 -> 0.672).
-    """
     features = list(params.feature_names)
-    return np.maximum(design_matrix(df, features) @ params.dist_kwh_coefficients(), 0.0)
+    return np.maximum(design_matrix(df, features) @ params.coefficients(), 0.0)
 
 
 class HouseEnergyParamsComputer:
@@ -177,17 +161,14 @@ class HouseEnergyParamsComputer:
         feature_names = tuple(
             BASE_FEATURES + [f"set_minus_temp_zone{z}" for z in zone_numbers(df.columns)]
         )
-        dist_kwh_pred, coefficients, std_errors, r_squared = self.predictor(df)
-        # Restate the parameters as heat-pump thermal energy instead of energy
-        # into the distribution loop.
-        energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh_pred.sum())
+        _, coefficients, std_errors, r_squared, energy_ratio = self.predictor(df)
         # Six decimals: enough for the small solar_w_m2 and
         # windspeed_times_deltaT coefficients to survive rounding, so predictions
         # rebuilt from the saved parameters match the fit.
         return HouseEnergyParams(
             feature_names=feature_names,
-            values=tuple(round(c * energy_ratio, 6) for c in coefficients),
-            std_errors=tuple(round(e * energy_ratio, 6) for e in std_errors),
+            values=tuple(round(c, 6) for c in coefficients),
+            std_errors=tuple(round(e, 6) for e in std_errors),
             r_squared=round(r_squared, 3),
             energy_ratio=round(energy_ratio, 6),
         )

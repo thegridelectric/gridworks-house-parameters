@@ -39,7 +39,8 @@ results: list[HouseEnergyParams] = []
 oos_oat_f = []
 oos_pred = []
 oos_pred_abg = []
-oos_actual = []
+oos_actual_scaled = []
+oos_dist_kwh = []
 for i in range(N - 1, len(days)):
     window = days[i-N+1 : i+1]
     window_df = df[df["day"].isin(window)]
@@ -49,16 +50,18 @@ for i in range(N - 1, len(days)):
     fit_oat_f.append(float(window_df["oat_f"].mean()))
     params = computer.fit(window_df)
     results.append(params)
-    abg = fit_alpha_beta_gamma(window_df)
+    abg, _ = fit_alpha_beta_gamma(window_df)
 
     # Score the day after the window: never in-sample, so the predicted-vs-actual
     # figure below shows what the fit is actually worth going forward.
     if i + 1 < len(days):
         next_df = df[df["day"] == days[i + 1]]
         oos_oat_f.extend(next_df["oat_f"])
+        ratio = params.energy_ratio
         oos_pred.extend(predict(params, next_df))
         oos_pred_abg.extend(predict_alpha_beta_gamma(abg, next_df))
-        oos_actual.extend(next_df["dist_kwh"])
+        oos_actual_scaled.extend(next_df["dist_kwh"] * ratio)
+        oos_dist_kwh.extend(next_df["dist_kwh"])
 
 print(
     f"Fitted {len(results)} trailing {N}-day windows "
@@ -67,19 +70,20 @@ print(
 
 oos_pred = np.array(oos_pred)
 oos_pred_abg = np.array(oos_pred_abg)
-oos_actual = np.array(oos_actual)
+oos_actual_scaled = np.array(oos_actual_scaled)
+oos_dist_kwh = np.array(oos_dist_kwh)
 oos_oat_f = np.array(oos_oat_f)
-keep = oos_actual <= MAX_PLAUSIBLE_DIST_KWH
+keep = oos_dist_kwh <= MAX_PLAUSIBLE_DIST_KWH
 n_dropped = int((~keep).sum())
-oos_pred, oos_pred_abg, oos_actual, oos_oat_f = (
-    oos_pred[keep], oos_pred_abg[keep], oos_actual[keep], oos_oat_f[keep]
+oos_pred, oos_pred_abg, oos_actual_scaled, oos_oat_f = (
+    oos_pred[keep], oos_pred_abg[keep], oos_actual_scaled[keep], oos_oat_f[keep]
 )
-errors = oos_pred - oos_actual
-errors_abg = oos_pred_abg - oos_actual
+errors = oos_pred - oos_actual_scaled
+errors_abg = oos_pred_abg - oos_actual_scaled
 mae_abg = float(np.abs(errors_abg).mean())
 rmse_abg = float(np.sqrt((errors_abg**2).mean()))
 print(
-    f"Next-day out-of-sample over {len(oos_actual)} hours"
+    f"Next-day out-of-sample (scaled kWh) over {len(oos_actual_scaled)} hours"
     f" ({n_dropped} hours with dist_kwh > {MAX_PLAUSIBLE_DIST_KWH:g} dropped): "
     f"MSE={float((errors**2).mean()):.3f}, RMSE={float(np.sqrt((errors**2).mean())):.3f}, "
     f"MAE={float(np.abs(errors).mean()):.3f} kWh, "
@@ -98,7 +102,7 @@ plot_curves(
 )
 
 plot_pred_vs_actual(
-    oos_pred, oos_actual, oos_oat_f,
+    oos_pred, oos_actual_scaled, oos_oat_f,
     f"{HOUSE_ALIAS.capitalize()}: next-day predicted vs actual (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_pred_vs_actual_N{N}.png",
     baseline_mae=mae_abg,

@@ -18,8 +18,8 @@ days = np.sort(df["day"].unique())
 
 def evaluate(N):
     """For a trailing N-day window ending on each day, predict the following
-    day's dist_kwh (out of sample) and track the intercept. Returns
-    (next-day dist_kwh MSE, average largest weekly intercept variation)."""
+    day's scaled energy (out of sample) and track the intercept. Returns
+    (next-day scaled MSE, average largest weekly intercept variation)."""
     fit_days = []
     intercepts = []
     sse = 0.0
@@ -27,17 +27,14 @@ def evaluate(N):
     for i in range(N - 1, len(days) - 1):
         window = days[i - N + 1 : i + 1]
         window_df = df[df["day"].isin(window)]
-        dist_pred, coefficients, *_ = linear_regression(window_df)
-        energy_ratio = float(window_df["hp_kwh_th"].sum()) / float(dist_pred.sum())
-        intercepts.append(coefficients[0] * energy_ratio)
+        _, coefficients, _, _, energy_ratio = linear_regression(window_df)
+        intercepts.append(coefficients[0])
         fit_days.append(days[i])
 
-        # Predict the following day's dist_kwh with the window's fit. Coefficients
-        # stay unscaled here: dist_kwh is the target, not heat-pump thermal energy.
-        # Clipped at zero, which negative predictions otherwise cost ~11% of MSE.
         next_df = df[df["day"] == days[i + 1]]
-        dist_hat = np.maximum(design_matrix(next_df) @ coefficients, 0.0)
-        sse += float(np.sum((dist_hat - next_df["dist_kwh"].to_numpy()) ** 2))
+        scaled_hat = np.maximum(design_matrix(next_df) @ coefficients, 0.0)
+        actual_scaled = next_df["dist_kwh"].to_numpy() * energy_ratio
+        sse += float(np.sum((scaled_hat - actual_scaled) ** 2))
         n_points += len(next_df)
 
     mse = sse / n_points
@@ -52,11 +49,11 @@ for N in N_VALUES:
     mse, intercept_var = evaluate(N)
     mses.append(mse)
     intercept_vars.append(intercept_var)
-    print(f"N={N:2d}: next-day dist_kwh MSE={mse:.4f}, avg weekly intercept variation={intercept_var:.3f}")
+    print(f"N={N:2d}: next-day scaled MSE={mse:.4f}, avg weekly intercept variation={intercept_var:.3f}")
 
 fig, ax1 = plt.subplots(figsize=(9, 5))
 ax1.set_xlabel("N (trailing days in fit window)")
-ax1.set_ylabel("Next-day dist_kwh MSE", color="tab:blue")
+ax1.set_ylabel("Next-day scaled energy MSE", color="tab:blue")
 ax1.plot(N_VALUES, mses, "o-", color="tab:blue", label="MSE")
 ax1.tick_params(axis="y", labelcolor="tab:blue")
 ax1.set_xticks(N_VALUES)

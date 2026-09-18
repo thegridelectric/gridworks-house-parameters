@@ -92,7 +92,7 @@ def plot_curves(
             )
         ax.set_title(f"Wind speed: {ws} mph")
         ax.set_xlabel("Outside air temperature (°F)")
-    axes[0].set_ylabel("House energy (kWh)")
+    axes[0].set_ylabel("House energy (scaled dist kWh)")
 
     if use_legend:
         axes[-1].legend(title="Fit day (window mean OAT)")
@@ -120,13 +120,11 @@ def plot_pred_vs_actual(
     scale as plot_curves, so a temperature-dependent bias shows up as a color
     gradient off the 1:1 line.
 
-    Actual dist_kwh above MAX_PLAUSIBLE_DIST_KWH is dropped as a bad reading.
+    Points should already be filtered on raw dist_kwh; values are scaled energy.
     """
     predicted = np.asarray(predicted)
     actual = np.asarray(actual)
     oat_f = np.asarray(oat_f)
-    keep = actual <= MAX_PLAUSIBLE_DIST_KWH
-    predicted, actual, oat_f = predicted[keep], actual[keep], oat_f[keep]
     errors = predicted - actual
 
     oat_values, norm, cmap = _oat_colors(oat_f)
@@ -135,12 +133,13 @@ def plot_pred_vs_actual(
 
     ax = axes[0]
     ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
-    limits = [0, MAX_PLAUSIBLE_DIST_KWH]
+    hi = float(max(MAX_PLAUSIBLE_DIST_KWH, actual.max(), predicted.max()) * 1.05)
+    limits = [0, hi]
     ax.plot(limits, limits, "k--", linewidth=1)
     ax.set_xlim(limits)
     ax.set_ylim(limits)
-    ax.set_xlabel("Actual dist_kwh (kWh)")
-    ax.set_ylabel("Predicted dist_kwh (kWh)")
+    ax.set_xlabel("Actual scaled dist_kwh (kWh)")
+    ax.set_ylabel("Predicted scaled dist_kwh (kWh)")
     mae = float(np.abs(errors).mean())
     rmse = float(np.sqrt((errors**2).mean()))
 
@@ -178,7 +177,7 @@ def plot_pred_vs_actual(
     ax.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
     ax.axvline(0, color="k", linestyle="--", linewidth=1)
     ax.set_xlim(-6, 6)
-    ax.set_xlabel("Prediction error (predicted - actual, kWh)")
+    ax.set_xlabel("Prediction error (scaled kWh)")
     ax.set_ylabel("Hours")
     ax.set_title("Error distribution")
 
