@@ -4,84 +4,81 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-# Model features, in B1..B7 order. B0 is the intercept.
+# Model features in B1.. order. B0 is the intercept. Zone terms follow the base five.
 #   B1 deltaT
 #   B2 windspeed_times_deltaT
 #   B3 solar_w_m2
 #   B4 previous_dist_kwh
 #   B5 OAT_avg_6h
-#   B6 set_minus_temp_zone1
-#   B7 set_minus_temp_zone2
-FEATURES = [
+#   B6+ set_minus_temp_zone{z} for each zone z in the export
+BASE_FEATURES = [
     "deltaT",
     "windspeed_times_deltaT",
     "solar_w_m2",
     "previous_dist_kwh",
     "OAT_avg_6h",
-    "set_minus_temp_zone1",
-    "set_minus_temp_zone2",
-]
-COEF_NAMES = [f"B{i}" for i in range(1 + len(FEATURES))]
-
-REQUIRED_COLUMNS = [
-    "oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th",
-    "T_i1_start", "T_i1_set_start", "T_i2_start", "T_i2_set_start",
 ]
 
-# Hours of outdoor-temperature history behind the OAT_avg_6h feature.
-LOOKBACK_HOURS = 6
+BASE_REQUIRED_COLUMNS = [
+    "oat_f", 
+    "ws_mph",
+    "solar_w_m2",
+    "dist_kwh",
+    "hp_kwh_th",
+]
+
+
+def zone_numbers(columns) -> list[int]:
+    return sorted(
+        int(n) for c in columns
+        if (n := str(c).removeprefix("T_i").removesuffix("_start")).isdigit()
+    )
 
 
 def load_hourly_features(house_alias: str) -> pd.DataFrame:
-    """Read one house's hourly export and build the seven model features.
-
-    Every temperature in the file is Fahrenheit and stays that way; wind is
-    already mph. No unit conversion anywhere.
-
-    previous_dist_kwh and OAT_avg_6h look backwards, so an hour is only usable
-    when its history is really there: the first LOOKBACK_HOURS rows of the file,
-    and any hour whose preceding 6 hours are not contiguous in hour_start, are
-    dropped rather than quietly averaged over the wrong hours.
-    """
-    # Glob the params export specifically. The older {house}_electricity_use_*.csv
-    # lives in the same folder, so a looser glob would match both and pick one
-    # arbitrarily.
     csv_path = glob.glob(f"data/{house_alias}_house_params_data.csv")[0]
     df = pd.read_csv(csv_path)
+
     df["hour_start"] = pd.to_datetime(df["hour_start"])
     df = df.sort_values("hour_start").reset_index(drop=True)
-
-    t_i_avg = 0.5 * (df["T_i1_start"] + df["T_i2_start"])
-    df["deltaT"] = (t_i_avg - df["oat_f"]).clip(lower=0)
-    df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
-    # solar_w_m2 is already a column in the export; no derived copy needed.
-    # Plain setpoint minus room temperature: calibrating the setpoint onto the
-    # room-sensor scale performs identically (the calibration slope is ~0.95 and
-    # its offset is absorbed by the intercept), and splitting the gap into
-    # below/above-setpoint terms is 30% worse under a rolling window.
-    df["set_minus_temp_zone1"] = df["T_i1_set_start"] - df["T_i1_start"]
-    df["set_minus_temp_zone2"] = df["T_i2_set_start"] - df["T_i2_start"]
-    df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
-    df["OAT_avg_6h"] = df["oat_f"].rolling(LOOKBACK_HOURS).mean().shift(1)
-
-    # The 6 hours before h must be the 6 rows before it in the file.
-    history_span = df["hour_start"] - df["hour_start"].shift(LOOKBACK_HOURS)
-    df = df[history_span == pd.Timedelta(hours=LOOKBACK_HOURS)]
-
-    df = df.dropna(subset=REQUIRED_COLUMNS + FEATURES).reset_index(drop=True)
     df["day"] = df["hour_start"].dt.normalize()
+
+    zones = zone_numbers(df.columns)
+    if not zones:
+        raise ValueError("No T_i{z}_start columns found in export")
+    
+    inside_temp_avg = df[[f"T_i{z}_start" for z in zones]].mean(axis=1)
+    df["deltaT"] = (inside_temp_avg - df["oat_f"]).clip(lower=0)
+    df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
+    for z in zones:
+        df[f"set_minus_temp_zone{z}"] = df[f"T_i{z}_set_start"] - df[f"T_i{z}_start"]
+    df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
+    df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
+
+    # Making sure the 6 rows before every row are contiguous for the OAT_avg_6h feature
+    history_span = df["hour_start"] - df["hour_start"].shift(6)
+    df = df[history_span == pd.Timedelta(hours=6)]
+
+    # Dealing with missing values
+    features = BASE_FEATURES + [f"set_minus_temp_zone{z}" for z in zones]
+    required = BASE_REQUIRED_COLUMNS + [col for z in zones for col in (f"T_i{z}_start", f"T_i{z}_set_start")]
+    df = df.dropna(subset=required+features).reset_index(drop=True)
+
+    df.attrs["zone_numbers"] = zones
     return df
 
 
-def design_matrix(df: pd.DataFrame) -> np.ndarray:
+def design_matrix(df: pd.DataFrame, feature_names: list[str] | None = None) -> np.ndarray:
+    names = feature_names or (
+        BASE_FEATURES + [f"set_minus_temp_zone{z}" for z in zone_numbers(df.columns)]
+    )
     columns = [np.ones(len(df))]
-    for name in FEATURES:
+    for name in names:
         columns.append(df[name].to_numpy())
     return np.column_stack(columns)
 
 
 def alpha_beta_gamma_design_matrix(df: pd.DataFrame) -> np.ndarray:
-    """Main-branch model: 1, oat_f, (65 - oat_f) * ws_mph."""
     oat_f = df["oat_f"].to_numpy()
     return np.column_stack([
         np.ones(len(df)),
@@ -130,33 +127,31 @@ def linear_regression(
 
 @dataclass
 class HouseEnergyParams:
-    B0: float
-    B1: float
-    B2: float
-    B3: float
-    B4: float
-    B5: float
-    B6: float
-    B7: float
-    std_error_B0: float
-    std_error_B1: float
-    std_error_B2: float
-    std_error_B3: float
-    std_error_B4: float
-    std_error_B5: float
-    std_error_B6: float
-    std_error_B7: float
+    feature_names: tuple[str, ...]
+    values: tuple[float, ...]
+    std_errors: tuple[float, ...]
     r_squared: float
     # hp_kwh_th / dist_kwh the coefficients were multiplied by
     energy_ratio: float
 
+    @property
+    def coef_names(self) -> tuple[str, ...]:
+        return tuple(f"B{i}" for i in range(len(self.values)))
+
     def coefficients(self) -> np.ndarray:
-        """[B0, B1, ..., B7], in the unit the fit was scaled to."""
-        return np.array([getattr(self, name) for name in COEF_NAMES])
+        """[B0, B1, ...], in the unit the fit was scaled to."""
+        return np.array(self.values, dtype=float)
 
     def dist_kwh_coefficients(self) -> np.ndarray:
         """The same coefficients back in distribution-kWh, the unit of dist_kwh."""
         return self.coefficients() / self.energy_ratio
+
+    def __getattr__(self, name: str):
+        if name.startswith("std_error_B") and name[len("std_error_B"):].isdigit():
+            return self.std_errors[int(name[len("std_error_B"):])]
+        if name.startswith("B") and len(name) > 1 and name[1:].isdigit():
+            return self.values[int(name[1:])]
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
 
 def predict(params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
@@ -166,7 +161,8 @@ def predict(params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
     distribution loop can deliver. Clipping is not cosmetic: it is worth 11% on
     next-day MSE (0.756 -> 0.672).
     """
-    return np.maximum(design_matrix(df) @ params.dist_kwh_coefficients(), 0.0)
+    features = list(params.feature_names)
+    return np.maximum(design_matrix(df, features) @ params.dist_kwh_coefficients(), 0.0)
 
 
 class HouseEnergyParamsComputer:
@@ -178,6 +174,9 @@ class HouseEnergyParamsComputer:
         return df # TODO
 
     def fit(self, df: pd.DataFrame) -> HouseEnergyParams:
+        feature_names = tuple(
+            BASE_FEATURES + [f"set_minus_temp_zone{z}" for z in zone_numbers(df.columns)]
+        )
         dist_kwh_pred, coefficients, std_errors, r_squared = self.predictor(df)
         # Restate the parameters as heat-pump thermal energy instead of energy
         # into the distribution loop.
@@ -186,8 +185,9 @@ class HouseEnergyParamsComputer:
         # windspeed_times_deltaT coefficients to survive rounding, so predictions
         # rebuilt from the saved parameters match the fit.
         return HouseEnergyParams(
-            *[round(c * energy_ratio, 6) for c in coefficients],
-            *[round(e * energy_ratio, 6) for e in std_errors],
+            feature_names=feature_names,
+            values=tuple(round(c * energy_ratio, 6) for c in coefficients),
+            std_errors=tuple(round(e * energy_ratio, 6) for e in std_errors),
             r_squared=round(r_squared, 3),
             energy_ratio=round(energy_ratio, 6),
         )

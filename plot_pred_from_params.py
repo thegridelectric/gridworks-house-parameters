@@ -4,7 +4,7 @@ import pandas as pd
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 
-from house_parameters import FEATURES, HouseEnergyParams, design_matrix
+from house_parameters import HouseEnergyParams, design_matrix
 
 WIND_SPEEDS_MPH = [0, 10, 20]
 OAT_RANGE_F = np.linspace(-10, 40, 200)
@@ -49,35 +49,38 @@ def plot_curves(
     Curves are colored by fit_oat_f, the mean outdoor temperature over the window
     the fit was made on, so the color says what weather shaped the parameters.
 
-    The model has seven features, so five of them have to be pinned before a
-    curve against outdoor temperature exists at all. These curves are therefore
-    NOT unconditional predictions: they hold at one operating point, namely
+    Most features have to be pinned before a curve against outdoor temperature
+    exists at all. These curves are therefore NOT unconditional predictions:
+    they hold at one operating point, namely
 
-        set_minus_temp_zone1/2 = 0   both rooms exactly at their setpoint
+        set_minus_temp_zone* = 0     every zone exactly at its setpoint
         previous_dist_kwh = median   sustained operation, not a cold start
         OAT_avg_6h = oat_f           envelope in equilibrium with the current weather
         solar_w_m2 = 0               no sun
-        T_i1/T_i2 average            pinned at t_i_avg, the median over the dataset,
+        interior average             pinned at t_i_avg, the median over the dataset,
                                      which is what turns oat into deltaT and
                                      windspeed_times_deltaT
 
     Wind speed is already mph in the data, so the panels need no conversion.
     """
     oat_values, norm, cmap = _oat_colors(fit_oat_f)
+    feature_names = list(house_parameters[0].feature_names)
 
     fig, axes = plt.subplots(1, len(WIND_SPEEDS_MPH), figsize=(16, 5), sharey=True)
     for ax, ws in zip(axes, WIND_SPEEDS_MPH):
         deltaT = np.maximum(t_i_avg - OAT_RANGE_F, 0.0)
-        operating_point = pd.DataFrame({
+        operating_point = {
             "deltaT": deltaT,
             "windspeed_times_deltaT": deltaT * ws,
             "solar_w_m2": np.zeros_like(OAT_RANGE_F),
-            "set_minus_temp_zone1": np.zeros_like(OAT_RANGE_F),
-            "set_minus_temp_zone2": np.zeros_like(OAT_RANGE_F),
             "previous_dist_kwh": np.full_like(OAT_RANGE_F, previous_dist_kwh_median),
             "OAT_avg_6h": OAT_RANGE_F,
-        }, columns=FEATURES)
-        X = design_matrix(operating_point)
+        }
+        for name in feature_names:
+            if name.startswith("set_minus_temp_zone"):
+                operating_point[name] = np.zeros_like(OAT_RANGE_F)
+        op_df = pd.DataFrame(operating_point, columns=feature_names)
+        X = design_matrix(op_df, feature_names)
 
         for p, d, o in zip(house_parameters, fit_days, oat_values):
             house_kwh_pred = X @ p.coefficients()

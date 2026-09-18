@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 
 from house_parameters import (
-    COEF_NAMES,
     HouseEnergyParams,
     HouseEnergyParamsComputer,
     fit_alpha_beta_gamma,
@@ -21,10 +20,15 @@ N = 20
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
-# Read the hourly CSV and build the seven features. Hours whose 6-hour history is
+# Read the hourly CSV and build model features. Hours whose 6-hour history is
 # missing or non-contiguous are dropped there, so the count below is what is left.
 df = load_hourly_features(HOUSE_ALIAS)
-print(f"{len(df)} usable hours from {df['hour_start'].min()} to {df['hour_start'].max()}")
+zones = df.attrs["zone_numbers"]
+print(
+    f"{len(df)} usable hours from {df['hour_start'].min()} to {df['hour_start'].max()} "
+    f"({len(zones)} zones)"
+)
+t_i_avg_median = float(df[[f"T_i{z}_start" for z in zones]].mean(axis=1).median())
 
 # Fit on a trailing N-day window ending on each day.
 computer = HouseEnergyParamsComputer()
@@ -87,7 +91,7 @@ print(
 # the median previous_dist_kwh stands for. See plot_curves' docstring.
 plot_curves(
     results, fit_days, fit_oat_f,
-    t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
+    t_i_avg=t_i_avg_median,
     previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: house energy prediction over the year (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_yearly_N{N}.png",
@@ -102,9 +106,10 @@ plot_pred_vs_actual(
 )
 
 # Find largest variation in each parameter across any 7-day span.
+coef_names = list(results[0].coef_names)
 params = pd.DataFrame(
-    {name: [getattr(r, name) for r in results] for name in COEF_NAMES}
-    | {f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results] for name in COEF_NAMES}
+    {name: [getattr(r, name) for r in results] for name in coef_names}
+    | {f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results] for name in coef_names}
     | {
         "r_squared": [r.r_squared for r in results],
         "energy_ratio": [r.energy_ratio for r in results],
@@ -117,7 +122,8 @@ weekly_range = params.rolling("7D").apply(lambda s: s.max() - s.min())
 
 print("\nLargest variation within a single week:")
 extreme_days = set()
-for col in ["B0", "B1", "B6", "B7"]:
+weekly_track = ["B0", "B1"] + [name for name in coef_names if int(name[1:]) >= 6]
+for col in weekly_track:
     end_day = weekly_range[col].idxmax()
     week = params.loc[end_day - pd.Timedelta("6D"):end_day]
     low_day = week[col].idxmin()
@@ -126,10 +132,8 @@ for col in ["B0", "B1", "B6", "B7"]:
     print(f"  {col}: {weekly_range[col].max():.5g} (week ending {end_day.date()})")
     for day in (low_day, high_day):
         p = params.loc[day]
-        print(
-            f"    {day.date()}: B0={p.B0:.2f}, B1={p.B1:.4f}, "
-            f"B6={p.B6:.3f}, B7={p.B7:.3f}"
-        )
+        zone_bits = " ".join(f"{name}={getattr(p, name):.3f}" for name in weekly_track[2:])
+        print(f"    {day.date()}: B0={p.B0:.2f}, B1={p.B1:.4f}, {zone_bits}")
 
 # Plot only the extreme-week days
 result_by_day = {pd.Timestamp(d): r for d, r in zip(fit_days, results)}
@@ -138,7 +142,7 @@ extreme_sorted = sorted(extreme_days)
 plot_curves(
     [result_by_day[d] for d in extreme_sorted], extreme_sorted,
     [oat_by_day[d] for d in extreme_sorted],
-    t_i_avg=float((0.5 * (df["T_i1_start"] + df["T_i2_start"])).median()),
+    t_i_avg=t_i_avg_median,
     previous_dist_kwh_median=float(df["previous_dist_kwh"].median()),
     title=f"{HOUSE_ALIAS.capitalize()}: extreme-week fit days (trailing {N}-day fits)",
     savepath=RESULTS_DIR / f"{HOUSE_ALIAS}_extremes_N{N}.png",
