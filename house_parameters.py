@@ -1,6 +1,7 @@
 import glob
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
@@ -44,6 +45,9 @@ class HouseEnergyParamsComputer:
         "oat_f",
         "windspeed_times_65_minus_oat",
     )
+    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "weekly"
+    # If True, use all history from day 1 until the window reaches n days, then a trailing n-day window.
+    GROW_WINDOW_TO_N: bool = True
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
@@ -163,6 +167,16 @@ class HouseEnergyParamsComputer:
         X = self.design_matrix(df, baseline=params.baseline)
         return np.maximum(X @ params.coefficients(), 0.0)
 
+    def _should_refit_trailing_window(self, day_index: int, days: np.ndarray, last_fit_index: int | None) -> bool:
+        if self.TRAINING_FREQUENCY == "daily" or last_fit_index is None:
+            return True
+        return days[day_index] - days[last_fit_index] >= pd.Timedelta(days=7)
+
+    def _fit_window_days(self, days: np.ndarray, day_index: int, n: int) -> np.ndarray:
+        if self.GROW_WINDOW_TO_N and day_index + 1 < n:
+            return days[0 : day_index + 1]
+        return days[day_index - n + 1 : day_index + 1]
+
     def trailing_n_day_fits(self, n: int) -> None:
         RESULTS_DIR.mkdir(exist_ok=True)
         
@@ -174,27 +188,42 @@ class HouseEnergyParamsComputer:
         oos_pred_baseline = []
         oos_actual = []
 
-        for i in range(n - 1, len(days)):
-            # Fit the model to the previous n days
-            window = days[i - n + 1 : i + 1]
-            window_df = self.df[self.df["day"].isin(window)]
-            fit_days.append(days[i])
-            params = self.fit(window_df)
-            params_baseline = self.fit(window_df, baseline=True)
-            results.append(params)
+        params: HouseEnergyParams | None = None
+        params_baseline: HouseEnergyParams | None = None
+        last_fit_index: int | None = None
 
-            # Make an out-of-sample (oos) prediction for the next day
-            if i + 1 < len(days):
-                next_df = self.df[self.df["day"] == days[i + 1]]
-                pred = self.predict(params, next_df)
-                pred_baseline = self.predict(params_baseline, next_df)
-                oos_pred.extend(pred)
-                oos_pred_baseline.extend(pred_baseline)
-                oos_actual.extend(next_df["dist_kwh"] * params.energy_ratio)
-                oos_oat_f.extend(next_df["oat_f"])
+        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n-1
+        oos_future_days = 7 if self.TRAINING_FREQUENCY == "weekly" else 1
+        
+        for i in range(first_fit_day_index, len(days)):
+            refitted = False
+            if self._should_refit_trailing_window(i, days, last_fit_index):
+                window = self._fit_window_days(days, i, n)
+                window_df = self.df[self.df["day"].isin(window)]
+                fit_days.append(days[i])
+                params = self.fit(window_df)
+                params_baseline = self.fit(window_df, baseline=True)
+                results.append(params)
+                last_fit_index = i
+                refitted = True
 
+            if params is None or params_baseline is None:
+                continue
+            if self.TRAINING_FREQUENCY == "weekly" and not refitted:
+                continue
+            if self.TRAINING_FREQUENCY == "daily" and i + 1 >= len(days):
+                continue
+
+            for j in range(i + 1, min(i + 1 + oos_future_days, len(days))):
+                day_df = self.df[self.df["day"] == days[j]]
+                oos_pred.extend(self.predict(params, day_df))
+                oos_pred_baseline.extend(self.predict(params_baseline, day_df))
+                oos_actual.extend(day_df["dist_kwh"] * params.energy_ratio)
+                oos_oat_f.extend(day_df["oat_f"])
+
+        oos_label = "next-week" if self.TRAINING_FREQUENCY == "weekly" else "next-day"
         print(
-            f"Fitted {len(results)} trailing {n}-day windows "
+            f"Fitted {len(results)} {self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             f"from {pd.Timestamp(fit_days[0]).date()} to {pd.Timestamp(fit_days[-1]).date()}"
         )
 
@@ -225,20 +254,25 @@ class HouseEnergyParamsComputer:
             },
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
-        params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}.csv")
+        growing_window_label = 'growing' if self.GROW_WINDOW_TO_N else 'fixed'
+        params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.csv")
 
         print(
-            f"Next-day out-of-sample over {len(oos_actual)} hours:\n"
+            f"{oos_label.capitalize()} out-of-sample over {len(oos_actual)} hours:\n"
             f"MAE = {mae:.2f} kWh (baseline {mae_baseline:.2f} kWh, {improvement_mae_percentage:.1f}% improvement)\n"
             f"RMSE = {rmse:.2f} kWh (baseline {rmse_baseline:.2f} kWh, {improvement_rmse_percentage:.1f}% improvement)"
         )
 
         self.plot_pred_vs_actual(
             oos_pred, oos_actual, oos_oat_f,
-            f"{self.house_alias.capitalize()}: next-day predicted vs actual (trailing {n}-day fits)",
-            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}.png",
+            (
+                f"{self.house_alias.capitalize()}: {oos_label} predicted vs actual "
+                f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
+            ),
+            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
+            oos_period_label=oos_label,
         )
 
     def sweep_n(self, min_n: int, max_n: int) -> None:
@@ -256,50 +290,78 @@ class HouseEnergyParamsComputer:
             b1_values = []
             oos_pred = []
             oos_actual = []
+            params: HouseEnergyParams | None = None
+            last_fit_index: int | None = None
 
-            for i in range(n - 1, len(days) - 1):
-                # Fit the model to the previous n days
-                window = days[i - n + 1 : i + 1]
-                window_df = self.df[self.df["day"].isin(window)]
-                fit_days.append(days[i])
-                params = self.fit(window_df)
-                b1_values.append(params.B1)
+            first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n-1
+            oos_future_days = 7 if self.TRAINING_FREQUENCY == "weekly" else 1
 
-                # Make an out-of-sample (oos) prediction for the next day
-                next_df = self.df[self.df["day"] == days[i + 1]]
-                pred = self.predict(params, next_df)
-                actual = next_df["dist_kwh"] * params.energy_ratio
-                oos_pred.extend(pred)
-                oos_actual.extend(actual)
+            for i in range(first_fit_day_index, len(days)):
+                refitted = False
+                if self._should_refit_trailing_window(i, days, last_fit_index):
+                    window = self._fit_window_days(days, i, n)
+                    window_df = self.df[self.df["day"].isin(window)]
+                    fit_days.append(days[i])
+                    params = self.fit(window_df)
+                    b1_values.append(params.B1)
+                    last_fit_index = i
+                    refitted = True
+
+                if params is None:
+                    continue
+                if self.TRAINING_FREQUENCY == "weekly" and not refitted:
+                    continue
+                if self.TRAINING_FREQUENCY == "daily" and i + 1 >= len(days):
+                    continue
+
+                for j in range(i + 1, min(i + 1 + oos_future_days, len(days))):
+                    day_df = self.df[self.df["day"] == days[j]]
+                    oos_pred.extend(self.predict(params, day_df))
+                    oos_actual.extend(day_df["dist_kwh"] * params.energy_ratio)
 
             errors = np.array(oos_pred) - np.array(oos_actual)
             rmse = float(np.sqrt((errors**2).mean()))
             b1 = pd.Series(b1_values, index=pd.DatetimeIndex(fit_days)).sort_index()
-            weekly_b1_range = b1.rolling("7D").apply(lambda s: s.max() - s.min())
-            b1_weekly_range = float(weekly_b1_range.mean())
+            if self.TRAINING_FREQUENCY == "daily":
+                b1_stability = b1.rolling("7D").apply(lambda s: s.max() - s.min())
+                b1_stability_metric = float(b1_stability.mean())
+            else:
+                b1_stability_metric = float(b1.diff().abs().mean())
             rmses.append(rmse)
-            b1_weekly_ranges.append(b1_weekly_range)
+            b1_weekly_ranges.append(b1_stability_metric)
+            oos_label = "next-week" if self.TRAINING_FREQUENCY == "weekly" else "next-day"
             print(
-                f"N={n:2d}: next-day RMSE={rmse:.4f} kWh, "
-                f"avg weekly B1 (deltaT) range={b1_weekly_range:.5g}"
+                f"N={n:2d}: {oos_label} RMSE={rmse:.4f} kWh, "
+                f"B1 stability={b1_stability_metric:.5g}"
             )
 
         fig, ax1 = plt.subplots(figsize=(9, 5))
         ax1.set_xlabel("N (trailing days in fit window)")
-        ax1.set_ylabel("Next-day RMSE (kWh)", color="tab:blue")
+        rmse_ylabel = "Next-week RMSE (kWh)" if self.TRAINING_FREQUENCY == "weekly" else "Next-day RMSE (kWh)"
+        ax1.set_ylabel(rmse_ylabel, color="tab:blue")
         ax1.plot(n_values, rmses, "o-", color="tab:blue", label="RMSE")
         ax1.tick_params(axis="y", labelcolor="tab:blue")
         ax1.set_xticks(n_values)
 
         ax2 = ax1.twinx()
-        ax2.set_ylabel("Avg largest weekly B1 (deltaT) range", color="tab:red")
-        ax2.plot(n_values, b1_weekly_ranges, "s--", color="tab:red", label="B1 weekly range")
+        b1_ylabel = (
+            "Avg largest weekly B1 (deltaT) range"
+            if self.TRAINING_FREQUENCY == "daily"
+            else "Avg |ΔB1| between weekly refits"
+        )
+        ax2.set_ylabel(b1_ylabel, color="tab:red")
+        ax2.plot(n_values, b1_weekly_ranges, "s--", color="tab:red", label="B1 stability")
         ax2.tick_params(axis="y", labelcolor="tab:red")
 
-        fig.suptitle(f"{self.house_alias.capitalize()}: effect of lookback window N")
+        window_mode = "grow to N" if self.GROW_WINDOW_TO_N else "fixed trailing"
+        fig.suptitle(
+            f"{self.house_alias.capitalize()}: effect of lookback window N "
+            f"({self.TRAINING_FREQUENCY} training, {window_mode})"
+        )
         fig.tight_layout()
         fig.savefig(
-            RESULTS_DIR / f"{self.house_alias}_sweep_N.png", dpi=150, bbox_inches="tight"
+            RESULTS_DIR / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
+            dpi=150, bbox_inches="tight",
         )
         plt.show()
 
@@ -320,6 +382,7 @@ class HouseEnergyParamsComputer:
         savepath: Path | None = None,
         baseline_mae: float | None = None,
         baseline_rmse: float | None = None,
+        oos_period_label: str = "next-day",
     ) -> None:
         import matplotlib.pyplot as plt
         from matplotlib.cm import ScalarMappable
@@ -345,7 +408,7 @@ class HouseEnergyParamsComputer:
         mae = float(np.abs(errors).mean())
         rmse = float(np.sqrt((errors**2).mean()))
 
-        scatter_title = "Next-day out-of-sample predictions"
+        scatter_title = f"{oos_period_label.capitalize()} out-of-sample predictions"
         if baseline_mae is not None and baseline_rmse is not None:
             rmse_pct = (baseline_rmse - rmse) / baseline_rmse * 100.0
             mae_pct = (baseline_mae - mae) / baseline_mae * 100.0
