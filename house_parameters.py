@@ -7,19 +7,6 @@ import pandas as pd
 
 RESULTS_DIR = Path("results")
 
-FEATURES = [
-    "deltaT",
-    "windspeed_times_deltaT",
-    "solar_w_m2",
-    "previous_dist_kwh",
-    "OAT_avg_6h",
-]
-
-FEATURES_BASELINE = [
-    "oat_f",
-    "windspeed_times_65_minus_oat",
-]
-
 
 @dataclass
 class HouseEnergyParams:
@@ -46,6 +33,18 @@ class HouseEnergyParams:
 
 
 class HouseEnergyParamsComputer:
+    FEATURE_NAMES = (
+        "deltaT",
+        "windspeed_times_deltaT",
+        "solar_w_m2",
+        "previous_dist_kwh",
+        "OAT_avg_6h",
+    )
+    FEATURE_NAMES_BASELINE = (
+        "oat_f",
+        "windspeed_times_65_minus_oat",
+    )
+
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
         self.load_data()
@@ -53,6 +52,7 @@ class HouseEnergyParamsComputer:
     def load_data(self) -> None:
         csv_path = glob.glob(f"data/{self.house_alias}_house_params_data.csv")[0]
         df = pd.read_csv(csv_path)
+        print(f"Length of df: {len(df)}")
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
         df = df.sort_values("hour_start").reset_index(drop=True)
@@ -67,6 +67,11 @@ class HouseEnergyParamsComputer:
         if not self.zones:
             raise ValueError("No T_i{z}_set_start columns found in export")
 
+        # Columns that are required for the model
+        required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
+            f"T_i{z}_set_start" for z in self.zones
+        ]
+
         # Calculate some of the features
         setpoint_avg = df[[f"T_i{z}_set_start" for z in self.zones]].mean(axis=1)
         df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
@@ -75,18 +80,20 @@ class HouseEnergyParamsComputer:
         df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
         df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
 
+        # Filter out rows with missing critical data
+        df = df.dropna(subset=required + list(self.FEATURE_NAMES)).reset_index(drop=True)
+        print(f"Length of df after removing rows with missing data: {len(df)}")
+        df = self._remove_erroneous_data(df)
+        print(f"Length of df after removing erroneous data: {len(df)}")
+        df = self._remove_outliers(df)
+        print(f"Length of df after removing outliers: {len(df)}")
+
         # Keep only rows with a history span of 6 hours, necessary for the OAT_avg_6h feature
         history_span = df["hour_start"] - df["hour_start"].shift(6)
-        self.df = df[history_span == pd.Timedelta(hours=6)]
+        df = df[history_span == pd.Timedelta(hours=6)]
+        print(f"Length of df after removing rows with history span of 6 hours: {len(df)}")
 
-        self.feature_names = tuple(FEATURES)
-        self.feature_names_baseline = tuple(FEATURES_BASELINE)
-
-        # Filter out rows with missing critical data
-        required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
-            f"T_i{z}_set_start" for z in self.zones
-        ]
-        self.df = self.df.dropna(subset=required + list(self.feature_names)).reset_index(drop=True)
+        self.df = df
 
         # Find the range of outdoor temperatures (for the plot)
         oat_min = float(self.df["oat_f"].min())
@@ -95,18 +102,37 @@ class HouseEnergyParamsComputer:
             oat_max = oat_min + 1.0
         self.oat_color_range_f = (oat_min, oat_max)
 
-    def remove_outliers(self) -> None:
-        pass
+    def _remove_erroneous_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        range_of_valid_values_per_channel = {
+            'oat_f': [-128, 134],
+            'ws_mph': [0, 254],
+            'solar_w_m2': [0, 1361],
+            'dist_kwh': [0, 30],
+            'hp_kwh_th': [0, 30],
+            'zone_setpoint_f': [40, 100],
+        }
+
+        for col in df.columns:
+            if str(col).startswith("T_i") and str(col).endswith("_set_start"):
+                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel['zone_setpoint_f']
+        range_of_valid_values_per_channel.pop('zone_setpoint_f')
+        
+        for channel, (min_value, max_value) in range_of_valid_values_per_channel.items():
+            df = df[df[channel].between(min_value, max_value)]
+        return df
+
+    def _remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False) -> np.ndarray:
-        feature_names = self.feature_names_baseline if baseline else self.feature_names
+        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.FEATURE_NAMES
         return np.column_stack(
             [np.ones(len(df))] + [df[name].to_numpy() for name in feature_names]
         )
 
     def fit(self, df: pd.DataFrame, *, baseline: bool = False) -> HouseEnergyParams:
         X = self.design_matrix(df, baseline=baseline)
-        feature_names = (self.feature_names_baseline if baseline else self.feature_names)
+        feature_names = (self.FEATURE_NAMES_BASELINE if baseline else self.FEATURE_NAMES)
 
         dist_kwh = df["dist_kwh"].to_numpy()
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
@@ -182,6 +208,8 @@ class HouseEnergyParamsComputer:
         rmse = float(np.sqrt((errors**2).mean()))
         mae_baseline = float(np.abs(errors_baseline).mean())
         rmse_baseline = float(np.sqrt((errors_baseline**2).mean()))
+        improvement_rmse_percentage = (rmse_baseline - rmse) / rmse_baseline * 100.0
+        improvement_mae_percentage = (mae_baseline - mae) / mae_baseline * 100.0
 
         # Save the parameters to a CSV file
         coef_names = list(results[0].coef_names)
@@ -201,8 +229,8 @@ class HouseEnergyParamsComputer:
 
         print(
             f"Next-day out-of-sample over {len(oos_actual)} hours:\n"
-            f"MAE = {mae:.1f} kWh (baseline {mae_baseline:.1f} kWh)\n"
-            f"RMSE = {rmse:.1f} kWh (baseline {rmse_baseline:.1f} kWh)"
+            f"MAE = {mae:.2f} kWh (baseline {mae_baseline:.2f} kWh, {improvement_mae_percentage:.1f}% improvement)\n"
+            f"RMSE = {rmse:.2f} kWh (baseline {rmse_baseline:.2f} kWh, {improvement_rmse_percentage:.1f}% improvement)"
         )
 
         self.plot_pred_vs_actual(
