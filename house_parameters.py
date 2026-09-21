@@ -7,7 +7,7 @@ import pandas as pd
 
 RESULTS_DIR = Path("results")
 
-FEATURES_WITHOUT_ZONES = [
+FEATURES = [
     "deltaT",
     "windspeed_times_deltaT",
     "solar_w_m2",
@@ -58,20 +58,19 @@ class HouseEnergyParamsComputer:
         df = df.sort_values("hour_start").reset_index(drop=True)
         df["day"] = df["hour_start"].dt.normalize()
 
-        # Find the number of zones
+        # Find the number of zones (setpoint columns)
         self.zones = sorted(
             int(n) for c in df.columns
-            if (n := str(c).removeprefix("T_i").removesuffix("_start")).isdigit()
+            if str(c).endswith("_set_start")
+            and (n := str(c).removeprefix("T_i").removesuffix("_set_start")).isdigit()
         )
         if not self.zones:
-            raise ValueError("No T_i{z}_start columns found in export")
+            raise ValueError("No T_i{z}_set_start columns found in export")
 
         # Calculate some of the features
-        inside_temp_avg = df[[f"T_i{z}_start" for z in self.zones]].mean(axis=1)
-        df["deltaT"] = (inside_temp_avg - df["oat_f"]).clip(lower=0)
+        setpoint_avg = df[[f"T_i{z}_set_start" for z in self.zones]].mean(axis=1)
+        df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
-        for z in self.zones:
-            df[f"set_minus_temp_zone{z}"] = df[f"T_i{z}_set_start"] - df[f"T_i{z}_start"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
         df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
@@ -80,14 +79,12 @@ class HouseEnergyParamsComputer:
         history_span = df["hour_start"] - df["hour_start"].shift(6)
         self.df = df[history_span == pd.Timedelta(hours=6)]
 
-        self.feature_names = tuple(
-            FEATURES_WITHOUT_ZONES + [f"set_minus_temp_zone{z}" for z in self.zones]
-        )
+        self.feature_names = tuple(FEATURES)
         self.feature_names_baseline = tuple(FEATURES_BASELINE)
 
         # Filter out rows with missing critical data
         required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
-            col for z in self.zones for col in (f"T_i{z}_start", f"T_i{z}_set_start")
+            f"T_i{z}_set_start" for z in self.zones
         ]
         self.df = self.df.dropna(subset=required + list(self.feature_names)).reset_index(drop=True)
 
