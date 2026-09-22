@@ -40,12 +40,17 @@ class HouseEnergyParamsComputer:
         "solar_w_m2": (0, 1361),
         "dist_kwh": (0, 30),
         "hp_kwh_th": (0, 30),
-        "zone_setpoint_f": (40, 90),
+        "zone_set_or_temp_f": (40, 90),
+        "zone_heatcall_fraction": (0, 1),
     }
     MAX_ABS_RATE_OF_CHANGE_PER_CHANNEL = {
         "oat_f": 25.0,
     }
     MAX_GAP_HOURS = 4
+    BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F = {
+        'default': 3,
+        'beech': {'zone2': 4.5,}
+    }
     FEATURE_NAMES = (
         "deltaT",
         "windspeed_times_deltaT",
@@ -67,51 +72,47 @@ class HouseEnergyParamsComputer:
     def load_data(self) -> None:
         csv_path = glob.glob(f"data/{self.house_alias}_house_params_data.csv")[0]
         df = pd.read_csv(csv_path)
-        print(f"Length of df: {len(df)}")
+        print(f"Length of df: {len(df)} hours")
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
         df = df.sort_values("hour_start").reset_index(drop=True)
         df["day"] = df["hour_start"].dt.normalize()
 
-        # Find the number of zones
-        zones = sorted(
-            int(n) for c in df.columns
-            if str(c).endswith("_set_start")
-            and (n := str(c).removeprefix("T_i").removesuffix("_set_start")).isdigit()
+        self.zones = sorted(
+            int(str(c).removeprefix("zone").removesuffix("_avg_set"))
+            for c in df.columns
+            if str(c).startswith("zone") and str(c).endswith("_avg_set")
         )
-        
+
         # Columns that are required for the model
-        required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"] + [
-            f"T_i{z}_set_start" for z in zones
-        ]
-        missing_columns = [col for col in required if col not in df.columns]
+        self.required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"]
+        for z in self.zones:
+            self.required.extend(
+                [
+                    f"zone{z}_avg_temp",
+                    f"zone{z}_avg_set",
+                    f"zone{z}_heatcall_fraction",
+                ]
+            )
+        missing_columns = [col for col in self.required if col not in df.columns]
         if missing_columns:
             raise ValueError(f"Missing required columns in CSV for {self.house_alias}: {missing_columns}")
 
-        # Calculate some of the features
-        setpoint_avg = df[[f"T_i{z}_set_start" for z in zones]].mean(axis=1)
+        # Clean the data
+        df_before_cleaning = df.copy()
+        df = self._remove_erroneous_data(df)
+        df = self._remove_outliers(df)
+        df = self._handle_missing_data(df)
+        df = self._filter_out_known_bad_data(df)
+        # self._plot_data_distribution(df_before_cleaning, df)
+   
+        # Calculate some of the features (OAT_avg_6h is built in _handle_missing_data)
+        setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
         df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
-        df["OAT_avg_6h"] = df["oat_f"].rolling(6).mean().shift(1)
+        df = df.drop(0).reset_index(drop=True)
         df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
-
-        df_before_cleaning = df.copy()
-
-        # Replace erroneous data and outliers with NaN
-        df = self._remove_erroneous_data(df)
-        df = self._remove_outliers(df)
-
-        # Decide when to interpolate and when to drop rows
-        df = self._handle_missing_data(df)
-        self._plot_data_distribution(df_before_cleaning, df)
-
-        exit()
-
-        # Keep only rows with a history span of 6 hours, necessary for the OAT_avg_6h feature
-        history_span = df["hour_start"] - df["hour_start"].shift(6)
-        df = df[history_span == pd.Timedelta(hours=6)]
-        print(f"Length of df after removing rows without a history span of 6 hours: {len(df)}")
 
         self.df = df
 
@@ -128,14 +129,20 @@ class HouseEnergyParamsComputer:
 
     def _remove_erroneous_data(self, df: pd.DataFrame) -> pd.DataFrame:
         # Replace slight negative values with 0
-        df.loc[df["hp_kwh_th"].between(-0.2, 0), "hp_kwh_th"] = 0
+        df.loc[df["hp_kwh_th"].between(-1, 0), "hp_kwh_th"] = 0
 
         # Remove data that is outside the range of valid values
         range_of_valid_values_per_channel = dict(self.RANGE_OF_VALID_VALUES_PER_CHANNEL)
         for col in df.columns:
-            if str(col).startswith("T_i") and str(col).endswith("_set_start"):
-                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel["zone_setpoint_f"]
-        range_of_valid_values_per_channel.pop("zone_setpoint_f")
+            col_str = str(col)
+            if col_str.startswith("zone") and col_str.endswith(("_avg_set", "_avg_temp")):
+                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel[
+                    "zone_set_or_temp_f"
+                ]
+            if str(col).startswith("zone") and str(col).endswith("_heatcall_fraction"):
+                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel["zone_heatcall_fraction"]
+        range_of_valid_values_per_channel.pop("zone_set_or_temp_f")
+        range_of_valid_values_per_channel.pop("zone_heatcall_fraction")
 
         nans_added_range = 0
         for channel, (min_value, max_value) in range_of_valid_values_per_channel.items():
@@ -182,7 +189,8 @@ class HouseEnergyParamsComputer:
         df["day"] = df["hour_start"].dt.normalize()
         print(f"Missing timestamps: inserted {len(df) - n_before} hourly rows")
 
-        # Drop rows with long missing-data gaps
+        # Mark rows inside long missing-data gaps
+        df = df.set_index("hour_start")
         drop_rows = pd.Series(False, index=df.index)
         for channel in df.columns:
             is_nan = df[channel].isna()
@@ -190,21 +198,33 @@ class HouseEnergyParamsComputer:
             block_len = is_nan.groupby(block_id).transform("size")
             drop_rows |= is_nan & (block_len >= self.MAX_GAP_HOURS)
 
-        print(f"Long missing-data gaps (>={self.MAX_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
-        df = df.loc[~drop_rows].reset_index(drop=True)
-
         # Interpolate missing data
-        non_interpolated_columns = {"hour_start", "day"}
-        df = df.set_index("hour_start")
         n_filled = 0
+        oat_f_interpolated = pd.Series(False, index=df.index)
         for channel in df.columns:
-            if channel in non_interpolated_columns:
+            if channel == "day":
                 continue
             before = df[channel].copy()
             df[channel] = df[channel].interpolate(method="time")
-            n_filled += int((before.isna() & df[channel].notna()).sum())
-        df = df.reset_index(names="hour_start")
+            if channel != "oat_f":
+                df.loc[drop_rows, channel] = before.loc[drop_rows]
+            filled = before.isna() & df[channel].notna()
+            n_filled += int(filled.sum())
+            if channel == "oat_f":
+                oat_f_interpolated |= filled
         print(f"Interpolation: {n_filled} values filled")
+
+        # Compute average OAT over last 6 hours
+        oat_mean_6h = df["oat_f"].rolling(6).mean().shift(1)
+        first_oat_observed = (~oat_f_interpolated) & df["oat_f"].notna()
+        endpoints_ok = first_oat_observed.shift(6) & first_oat_observed.shift(1)
+        df["OAT_avg_6h"] = oat_mean_6h.where(endpoints_ok)
+        df = df[df["OAT_avg_6h"].notna()]
+ 
+        # Drop rows inside missing-data gaps
+        df = df.loc[~drop_rows]
+        df = df.reset_index(names="hour_start")
+        print(f"Long missing-data gaps (>={self.MAX_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
 
         # If any rows still have NaNs, drop them
         remaining_nans = int(df.isna().sum().sum())
@@ -216,17 +236,57 @@ class HouseEnergyParamsComputer:
 
         return df
 
+    def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = self._broken_thermostat(df)
+        df = self._zone_not_at_setpoint(df)
+        df = self._external_heat_source(df)
+        return df
+    
+    def _broken_thermostat(self, df: pd.DataFrame) -> pd.DataFrame:
+        gap_cfg = self.BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F
+        default_min_gap = float(gap_cfg["default"])
+        house_gap_cfg = gap_cfg.get(self.house_alias)
+        n_flags = 0
+        for z in self.zones:
+            heatcall_col = f"zone{z}_heatcall_fraction"
+            temp_col = f"zone{z}_avg_temp"
+            setpoint_col = f"zone{z}_avg_set"
+            if isinstance(house_gap_cfg, dict) and f"zone{z}" in house_gap_cfg:
+                min_gap = float(house_gap_cfg[f"zone{z}"])
+            else:
+                min_gap = default_min_gap
+            temp_below_set = df[setpoint_col] - df[temp_col]
+            temp_above_set = df[temp_col] - df[setpoint_col]
+            heat_off_but_cold = (df[heatcall_col] == 0) & (temp_below_set >= min_gap)
+            heat_on_but_warm = (df[heatcall_col] > 0) & (temp_above_set >= min_gap)
+            n_flags += int(heat_off_but_cold.sum()) + int(heat_on_but_warm.sum())
+            for hour_start, temp, setpoint in df.loc[
+                heat_off_but_cold, ["hour_start", temp_col, setpoint_col]
+            ].itertuples(index=False):
+                print(
+                    f"Broken thermostat (zone {z}, heat off while cold): hour_start={hour_start} "
+                    f"{temp_col}={temp} < {setpoint_col}={setpoint}, {heatcall_col}=0"
+                )
+            for hour_start, temp, setpoint, heatcall in df.loc[
+                heat_on_but_warm, ["hour_start", temp_col, setpoint_col, heatcall_col]
+            ].itertuples(index=False):
+                print(
+                    f"Broken thermostat (zone {z}, heat on while warm): hour_start={hour_start} "
+                    f"{setpoint_col}={setpoint} < {temp_col}={temp}, {heatcall_col}={heatcall}"
+                )
+        print(f"Broken thermostat: {n_flags} flagged row-zone hours")
+        return df
+
+    def _zone_not_at_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
+    def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
+        return df
+
     def _plot_data_distribution(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> None:
         import matplotlib.pyplot as plt
 
-        range_of_valid_values_per_channel = dict(self.RANGE_OF_VALID_VALUES_PER_CHANNEL)
-        for col in df_before.columns:
-            if str(col).startswith("T_i") and str(col).endswith("_set_start"):
-                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel[
-                    "zone_setpoint_f"
-                ]
-        range_of_valid_values_per_channel.pop("zone_setpoint_f")
-        channels = list(range_of_valid_values_per_channel.keys())
+        channels = self.required
         n_channels = len(channels)
         fig, axes = plt.subplots(
             2,
