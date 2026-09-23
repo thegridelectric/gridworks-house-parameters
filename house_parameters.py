@@ -55,7 +55,7 @@ class HouseEnergyParamsComputer:
         "deltaT",
         "windspeed_times_deltaT",
         "solar_w_m2",
-        "previous_dist_kwh",
+        "previous_dist_kwh_scaled",
         "OAT_avg_6h",
     )
     FEATURE_NAMES_BASELINE = (
@@ -453,19 +453,25 @@ class HouseEnergyParamsComputer:
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
         plt.show()
 
-    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False) -> np.ndarray:
+    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float | None = None) -> np.ndarray:
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
-        return np.column_stack(
-            [np.ones(len(df))] + [df[name].to_numpy() for name in feature_names]
-        )
+        columns = [np.ones(len(df))]
+        for name in feature_names:
+            if name == "previous_dist_kwh_scaled":
+                if energy_ratio is None:
+                    raise ValueError("energy_ratio is required for previous_dist_kwh_scaled")
+                columns.append(df["previous_dist_kwh"].to_numpy(dtype=float) * energy_ratio)
+            else:
+                columns.append(df[name].to_numpy(dtype=float))
+        return np.column_stack(columns)
 
     def fit(self, df: pd.DataFrame, *, baseline: bool = False) -> HouseEnergyParams:
-        X = self.design_matrix(df, baseline=baseline)
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
 
         dist_kwh = df["dist_kwh"].to_numpy()
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
         y = dist_kwh * energy_ratio
+        X = self.design_matrix(df, baseline=baseline, energy_ratio=energy_ratio)
 
         coefficients, *_ = np.linalg.lstsq(X, y, rcond=None)
         residuals = y - X @ coefficients
@@ -493,7 +499,7 @@ class HouseEnergyParamsComputer:
         )
 
     def predict(self, params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
-        X = self.design_matrix(df, baseline=params.baseline)
+        X = self.design_matrix(df, baseline=params.baseline, energy_ratio=params.energy_ratio)
         return np.maximum(X @ params.coefficients(), 0.0)
 
     def _should_refit_trailing_window(self, day_index: int, days: np.ndarray, last_fit_index: int | None) -> bool:
