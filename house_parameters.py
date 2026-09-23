@@ -50,6 +50,35 @@ class HouseEnergyParams:
 
 
 class HouseEnergyParamsComputer:
+    # Features
+    FEATURE_NAMES = (
+        "deltaT",
+        "windspeed_times_deltaT",
+        "solar_w_m2",
+        "previous_dist_kwh",
+        "OAT_avg_6h",
+    )
+    FEATURE_NAMES_BASELINE = (
+        "oat_f",
+        "windspeed_times_65_minus_oat",
+    )
+
+    # Training
+    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
+    GROW_WINDOW_TO_N: bool = False
+    
+    # Occupancy
+    INCLUDE_OCCUPANCY: bool = True
+    OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
+    WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(
+        f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS
+    )
+    WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(
+        f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS
+    )
+    OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
+
+    # Data cleaning
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
         "oat_f": (-128, 134),
         "ws_mph": (0, 254),
@@ -68,19 +97,6 @@ class HouseEnergyParamsComputer:
         'beech': {'zone2': 4.5,}
     }
     EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3.0
-    FEATURE_NAMES = (
-        "deltaT",
-        "windspeed_times_deltaT",
-        "solar_w_m2",
-        "previous_dist_kwh",
-        "OAT_avg_6h",
-    )
-    FEATURE_NAMES_BASELINE = (
-        "oat_f",
-        "windspeed_times_65_minus_oat",
-    )
-    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
-    GROW_WINDOW_TO_N: bool = False
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
@@ -92,6 +108,13 @@ class HouseEnergyParamsComputer:
 
     def _log_debug(self, message: str) -> None:
         logger.debug("[%s] %s", self.house_alias, message)
+
+    @property
+    def _artifact_label(self) -> str:
+        window = "growing" if self.GROW_WINDOW_TO_N else "fixed"
+        if self.INCLUDE_OCCUPANCY:
+            return f"{self.TRAINING_FREQUENCY}_{window}_occupancy"
+        return f"{self.TRAINING_FREQUENCY}_{window}"
 
     def load_data(self) -> None:
         csv_path = glob.glob(f"data/{self.house_alias}_house_params_data.csv")[0]
@@ -137,6 +160,17 @@ class HouseEnergyParamsComputer:
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         df = df.drop(0).reset_index(drop=True)
         df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
+        if self.INCLUDE_OCCUPANCY:
+            hour = df["hour_start"].dt.hour
+            is_weekday = df["hour_start"].dt.dayofweek < 5
+            is_weekend = ~is_weekday
+            for occupancy_hour in self.OCCUPANCY_INDIVIDUAL_HOURS:
+                at_hour = hour == occupancy_hour
+                df[f"wd_hour_{occupancy_hour}"] = (is_weekday & at_hour).astype(float)
+                df[f"we_hour_{occupancy_hour}"] = (is_weekend & at_hour).astype(float)
+            self.feature_names = self.FEATURE_NAMES + self.OCCUPANCY_FEATURE_NAMES
+        else:
+            self.feature_names = self.FEATURE_NAMES
 
         self.df = df
 
@@ -420,14 +454,14 @@ class HouseEnergyParamsComputer:
         plt.show()
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False) -> np.ndarray:
-        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.FEATURE_NAMES
+        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
         return np.column_stack(
             [np.ones(len(df))] + [df[name].to_numpy() for name in feature_names]
         )
 
     def fit(self, df: pd.DataFrame, *, baseline: bool = False) -> HouseEnergyParams:
         X = self.design_matrix(df, baseline=baseline)
-        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.FEATURE_NAMES
+        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
 
         dist_kwh = df["dist_kwh"].to_numpy()
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
@@ -552,10 +586,8 @@ class HouseEnergyParamsComputer:
             },
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
-        growing_window_label = 'growing' if self.GROW_WINDOW_TO_N else 'fixed'
         params_table.to_csv(
-            self.results_dir
-            / f"{self.house_alias}_params_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.csv"
+            self.results_dir / f"{self.house_alias}_params_N{n}_{self._artifact_label}.csv"
         )
 
         self._log_info(
@@ -573,7 +605,7 @@ class HouseEnergyParamsComputer:
                 f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             ),
             savepath=self.results_dir
-            / f"{self.house_alias}_pred_vs_actual_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.png",
+            / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
             oos_period_label=oos_label,
@@ -582,10 +614,7 @@ class HouseEnergyParamsComputer:
             errors,
             oos_hour_start,
             savepath=self.results_dir
-            / (
-                f"{self.house_alias}_oos_residual_by_hour_N{n}_"
-                f"{self.TRAINING_FREQUENCY}_{growing_window_label}.png"
-            ),
+            / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
         )
 
     def sweep_n(self, min_n: int, max_n: int) -> None:
@@ -841,6 +870,7 @@ class HouseEnergyParamsComputer:
         for ax in axes:
             ax.set_xlabel("Hour of day")
             ax.tick_params(axis="x", labelbottom=True)
+            ax.set_ylim(-1.5, 1.5)
         fig.tight_layout()
         if savepath is not None:
             fig.savefig(savepath, dpi=150, bbox_inches="tight")
