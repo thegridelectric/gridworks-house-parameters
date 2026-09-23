@@ -54,8 +54,8 @@ class HouseEnergyParamsComputer:
         "oat_f": (-128, 134),
         "ws_mph": (0, 254),
         "solar_w_m2": (0, 1361),
-        "dist_kwh": (0, 30),
-        "hp_kwh_th": (0, 30),
+        "dist_kwh": (0, 25),
+        "hp_kwh_th": (0, 25),
         "zone_set_or_temp_f": (40, 90),
         "zone_heatcall_fraction": (0, 1),
     }
@@ -79,8 +79,8 @@ class HouseEnergyParamsComputer:
         "oat_f",
         "windspeed_times_65_minus_oat",
     )
-    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "weekly"
-    GROW_WINDOW_TO_N: bool = True
+    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
+    GROW_WINDOW_TO_N: bool = False
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
@@ -127,7 +127,7 @@ class HouseEnergyParamsComputer:
         df = self._remove_outliers(df)
         df = self._handle_missing_data(df)
         df = self._filter_out_known_bad_data(df)
-        # self._plot_data_distribution(df_before_cleaning, df)
+        self._plot_data_distribution(df_before_cleaning, df)
    
         # Calculate some of the features (OAT_avg_6h is built in _handle_missing_data)
         setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
@@ -365,25 +365,52 @@ class HouseEnergyParamsComputer:
     def _plot_data_distribution(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> None:
         import matplotlib.pyplot as plt
 
-        channels = self.required
+        channels = [
+            c
+            for c in self.required
+            if not (str(c).startswith("zone") and str(c).endswith("_heatcall_fraction"))
+        ]
         n_channels = len(channels)
+        col_width_in = 1.75
         fig, axes = plt.subplots(
             2,
             n_channels,
-            figsize=(max(2.5 * n_channels, 8), 8),
+            figsize=(col_width_in * n_channels + 1.25, 8),
             squeeze=False,
+            gridspec_kw={"wspace": 0.75},
         )
         row_labels = ("Before cleaning", "After cleaning")
         for row, (label, df) in enumerate(zip(row_labels, (df_before, df_after))):
             for col_idx, channel in enumerate(channels):
                 ax = axes[row, col_idx]
-                ax.boxplot(df[channel].dropna().to_numpy(), vert=True)
+                ax.boxplot(df[channel].dropna().to_numpy(), vert=True, widths=0.22)
                 if row == 0:
                     n_nans = int(df_before[channel].isna().sum())
                     nan_label = "NaN" if n_nans == 1 else "NaNs"
-                    ax.set_title(f"{channel} ({n_nans} {nan_label})", fontsize=9)
+                    ax.set_title(f"{channel}\n({n_nans} {nan_label})", fontsize=8)
                 ax.tick_params(axis="x", bottom=False, labelbottom=False)
+                ax.tick_params(axis="y", labelsize=8)
             axes[row, 0].set_ylabel(label)
+            if row == 1:
+                for z in self.zones:
+                    zone_avg_channels = [
+                        c for c in channels if str(c).startswith(f"zone{z}_avg_")
+                    ]
+                    if not zone_avg_channels:
+                        continue
+                    zone_avg_values = np.concatenate(
+                        [df[channel].dropna().to_numpy() for channel in zone_avg_channels]
+                    )
+                    if not zone_avg_values.size:
+                        continue
+                    y_min = float(zone_avg_values.min())
+                    y_max = float(zone_avg_values.max())
+                    pad = max((y_max - y_min) * 0.05, 0.25)
+                    shared_ylim = (y_min - pad, y_max + pad)
+                    zone_avg_set = set(zone_avg_channels)
+                    for col_idx, channel in enumerate(channels):
+                        if channel in zone_avg_set:
+                            axes[row, col_idx].set_ylim(shared_ylim)
         fig.suptitle(f"{self.house_alias.capitalize()}: channel distributions")
         fig.tight_layout()
         RESULTS_DIR.mkdir(exist_ok=True)
@@ -415,7 +442,11 @@ class HouseEnergyParamsComputer:
         else:
             std_errors = np.sqrt(np.diag(sigma2 * np.linalg.inv(X.T @ X)))
         ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r_squared = 1.0 - float(np.sum(residuals**2)) / ss_tot
+        ss_res = float(np.sum(residuals**2))
+        if ss_tot == 0:
+            r_squared = 1.0 if ss_res == 0 else 0.0
+        else:
+            r_squared = 1.0 - ss_res / ss_tot
 
         return HouseEnergyParams(
             feature_names=feature_names,
