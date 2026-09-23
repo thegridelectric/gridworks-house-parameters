@@ -298,9 +298,9 @@ class HouseEnergyParamsComputer:
         return df
 
     def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = self._broken_thermostat(df)
         df = self._thermostat_change(df)
         df = self._used_oil_boiler(df)
+        df = self._broken_thermostat(df)
         df = self._external_heat_source(df)
         return df
     
