@@ -98,6 +98,7 @@ class HouseEnergyParamsComputer:
         'beech': {'zone2': 4.5,}
     }
     EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
+    BELOW_SETPOINT_MIN_TEMP_SET_GAP_F = 1
     OIL_BOILER_POWER_THRESHOLD = 50
 
     def __init__(self, house_alias: str):
@@ -301,7 +302,8 @@ class HouseEnergyParamsComputer:
         df = self._thermostat_change(df)
         df = self._used_oil_boiler(df)
         df = self._broken_thermostat(df)
-        df = self._external_heat_source(df)
+        df = self._below_setpoint(df)
+        # df = self._external_heat_source(df)
         return df
     
     def _broken_thermostat(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -404,6 +406,28 @@ class HouseEnergyParamsComputer:
         n_drop = int(used.sum())
         self._log_info(f"Oil boiler: {n_drop} flagged hours, dropped {n_drop} rows")
         return df.loc[~used].reset_index(drop=True)
+    
+    def _below_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Flag and drop hours when any zone's avg temp is at least min gap below its setpoint."""
+        min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
+        drop_rows = pd.Series(False, index=df.index)
+        n_flags = 0
+        for z in self.zones:
+            temp_col = f"zone{z}_avg_temp"
+            setpoint_col = f"zone{z}_avg_set"
+            below_setpoint = (df[setpoint_col] - df[temp_col]) >= min_gap
+            drop_rows |= below_setpoint
+            n_flags += int(below_setpoint.sum())
+            for hour_start, temp, setpoint in df.loc[
+                below_setpoint, ["hour_start", temp_col, setpoint_col]
+            ].itertuples(index=False):
+                self._log_debug(
+                    f"Below setpoint (zone {z}): hour_start={hour_start} "
+                    f"{setpoint_col}={setpoint} - {temp_col}={temp} >= {min_gap}°F"
+                )
+        n_drop = int(drop_rows.sum())
+        self._log_info(f"Below setpoint: {n_flags} flagged row-zone hours, dropped {n_drop} rows")
+        return df.loc[~drop_rows].reset_index(drop=True)
 
     def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
         """Flag hours that suggest heating without a heat call (e.g. sun, stove).
