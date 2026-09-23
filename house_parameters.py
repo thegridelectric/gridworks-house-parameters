@@ -66,6 +66,7 @@ class HouseEnergyParamsComputer:
     # Training
     TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
     GROW_WINDOW_TO_N: bool = False
+    FORECAST_HORIZON_HOURS = 48
     
     # Occupancy
     INCLUDE_OCCUPANCY: bool = True
@@ -96,7 +97,8 @@ class HouseEnergyParamsComputer:
         'default': 3,
         'beech': {'zone2': 4.5,}
     }
-    EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3.0
+    EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
+    OIL_BOILER_POWER_THRESHOLD = 50
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
@@ -111,10 +113,9 @@ class HouseEnergyParamsComputer:
 
     @property
     def _artifact_label(self) -> str:
-        window = "growing" if self.GROW_WINDOW_TO_N else "fixed"
-        if self.INCLUDE_OCCUPANCY:
-            return f"{self.TRAINING_FREQUENCY}_{window}_occupancy"
-        return f"{self.TRAINING_FREQUENCY}_{window}"
+        window = "_growing" if self.GROW_WINDOW_TO_N else ""
+        occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
+        return f"{self.TRAINING_FREQUENCY}{window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
 
     def load_data(self) -> None:
         csv_path = glob.glob(f"data/{self.house_alias}_house_params_data.csv")[0]
@@ -299,6 +300,7 @@ class HouseEnergyParamsComputer:
     def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self._broken_thermostat(df)
         df = self._thermostat_change(df)
+        df = self._used_oil_boiler(df)
         df = self._external_heat_source(df)
         return df
     
@@ -355,6 +357,24 @@ class HouseEnergyParamsComputer:
     def _thermostat_change(self, df: pd.DataFrame) -> pd.DataFrame:
         return df
 
+    def _used_oil_boiler(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Flag and drop hours when average oil boiler power was on."""
+        if "oil_boiler_pwr" not in df.columns:
+            return df
+
+        threshold = self.OIL_BOILER_POWER_THRESHOLD
+        used = df["oil_boiler_pwr"] > threshold
+        for hour_start, pwr in df.loc[
+            used, ["hour_start", "oil_boiler_pwr"]
+        ].itertuples(index=False):
+            self._log_debug(
+                f"Oil boiler used: hour_start={hour_start} "
+                f"oil_boiler_pwr={pwr}W > {threshold}W"
+            )
+        n_drop = int(used.sum())
+        self._log_info(f"Oil boiler: {n_drop} flagged hours, dropped {n_drop} rows")
+        return df.loc[~used].reset_index(drop=True)
+
     def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
         """Flag hours that suggest heating without a heat call (e.g. sun, stove).
 
@@ -385,12 +405,12 @@ class HouseEnergyParamsComputer:
                 external_heat &= max_other_temp <= df[temp_col]
             drop_rows |= external_heat
             n_flags += int(external_heat.sum())
-            for hour_start, temp, setpoint in df.loc[
-                external_heat, ["hour_start", temp_col, setpoint_col]
+            for hour_start, oat_f, temp, setpoint in df.loc[
+                external_heat, ["hour_start", "oat_f", temp_col, setpoint_col]
             ].itertuples(index=False):
                 self._log_debug(
                     f"External heat source (zone {z}): hour_start={hour_start} "
-                    f"{temp_col}={temp} >= {setpoint_col}={setpoint} + {min_gap}°F, "
+                    f"oat_f={oat_f}, {temp_col}={temp} >= {setpoint_col}={setpoint} + {min_gap}°F, "
                     f"{heatcall_col}=0"
                 )
         n_drop = int(drop_rows.sum())
@@ -451,7 +471,7 @@ class HouseEnergyParamsComputer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
         savepath = self.results_dir / f"{self.house_alias}_channel_boxplots.png"
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
-        plt.show()
+        plt.close(fig)
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float | None = None) -> np.ndarray:
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
@@ -502,6 +522,157 @@ class HouseEnergyParamsComputer:
         X = self.design_matrix(df, baseline=params.baseline, energy_ratio=params.energy_ratio)
         return np.maximum(X @ params.coefficients(), 0.0)
 
+    def predict_recursive_horizon(
+        self,
+        params: HouseEnergyParams,
+        origin_index: int,
+        horizon: int | None = None,
+    ) -> np.ndarray:
+        if params.baseline:
+            target = self.df.iloc[origin_index + 1 : origin_index + 1 + (horizon or self.FORECAST_HORIZON_HOURS)]
+            return self.predict(params, target)
+        if horizon is None:
+            horizon = self.FORECAST_HORIZON_HOURS
+        ratio = params.energy_ratio
+        preds = np.empty(horizon, dtype=float)
+        for step in range(horizon):
+            target_idx = origin_index + 1 + step
+            row = self.df.iloc[[target_idx]].copy()
+            if step > 0:
+                row["previous_dist_kwh"] = preds[step - 1] / ratio
+            preds[step] = self.predict(params, row)[0]
+        return preds
+
+    def _fit_trailing_models(
+        self, n: int
+    ) -> tuple[list[pd.Timestamp], list[HouseEnergyParams], list[HouseEnergyParams]]:
+        days = np.sort(self.df["day"].unique())
+        fit_days: list[pd.Timestamp] = []
+        results: list[HouseEnergyParams] = []
+        results_baseline: list[HouseEnergyParams] = []
+        last_fit_index: int | None = None
+        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n - 1
+
+        for i in range(first_fit_day_index, len(days)):
+            if self._should_refit_trailing_window(i, days, last_fit_index):
+                window = self._fit_window_days(days, i, n)
+                window_df = self.df[self.df["day"].isin(window)]
+                fit_days.append(days[i])
+                results.append(self.fit(window_df))
+                results_baseline.append(self.fit(window_df, baseline=True))
+                last_fit_index = i
+
+        return fit_days, results, results_baseline
+
+    def _params_index_for_origin_day(
+        self, origin_day: pd.Timestamp, fit_days: list[pd.Timestamp]
+    ) -> int | None:
+        fit_idx = len(fit_days) - 1
+        while fit_idx >= 0 and fit_days[fit_idx] >= origin_day:
+            fit_idx -= 1
+        return fit_idx if fit_idx >= 0 else None
+
+    def _evaluate_recursive_horizon_oos(
+        self,
+        n: int,
+        *,
+        collect_pointwise: bool = False,
+    ) -> dict:
+        horizon = self.FORECAST_HORIZON_HOURS
+        fit_days, results, results_baseline = self._fit_trailing_models(n)
+        if not fit_days:
+            raise ValueError(f"No trailing fits produced for N={n}")
+
+        df = self.df
+        dist_kwh = df["dist_kwh"].to_numpy(dtype=float)
+        max_origin = len(df) - horizon
+
+        errors_by_lead: list[list[float]] = [[] for _ in range(horizon)]
+        errors_baseline_by_lead: list[list[float]] = [[] for _ in range(horizon)]
+        oos_pred: list[float] = []
+        oos_pred_baseline: list[float] = []
+        oos_actual: list[float] = []
+        oos_oat_f: list[float] = []
+        oos_hour_start: list[pd.Timestamp] = []
+        oos_lead1_errors: list[float] = []
+        oos_lead1_hour_start: list[pd.Timestamp] = []
+
+        for origin in range(max_origin):
+            origin_day = df["day"].iloc[origin]
+            fit_idx = self._params_index_for_origin_day(origin_day, fit_days)
+            if fit_idx is None:
+                continue
+
+            params = results[fit_idx]
+            params_baseline = results_baseline[fit_idx]
+            pred = self.predict_recursive_horizon(params, origin, horizon)
+            pred_baseline = self.predict_recursive_horizon(params_baseline, origin, horizon)
+            target_start = origin + 1
+            actual = dist_kwh[target_start : target_start + horizon] * params.energy_ratio
+
+            for step in range(horizon):
+                err = float(pred[step] - actual[step])
+                err_baseline = float(pred_baseline[step] - actual[step])
+                errors_by_lead[step].append(err)
+                errors_baseline_by_lead[step].append(err_baseline)
+
+            if collect_pointwise:
+                oos_pred.extend(pred.tolist())
+                oos_pred_baseline.extend(pred_baseline.tolist())
+                oos_actual.extend(actual.tolist())
+                oos_oat_f.extend(df["oat_f"].iloc[target_start : target_start + horizon].tolist())
+                oos_hour_start.extend(
+                    df["hour_start"].iloc[target_start : target_start + horizon].tolist()
+                )
+                oos_lead1_errors.append(float(pred[0] - actual[0]))
+                oos_lead1_hour_start.append(df["hour_start"].iloc[target_start])
+
+        rmse_by_lead = [
+            float(np.sqrt(np.mean(np.square(errors))))
+            if errors
+            else float("nan")
+            for errors in errors_by_lead
+        ]
+        rmse_baseline_by_lead = [
+            float(np.sqrt(np.mean(np.square(errors))))
+            if errors
+            else float("nan")
+            for errors in errors_baseline_by_lead
+        ]
+        all_errors = [err for lead in errors_by_lead for err in lead]
+        all_errors_baseline = [err for lead in errors_baseline_by_lead for err in lead]
+        rmse = float(np.sqrt(np.mean(np.square(all_errors)))) if all_errors else float("nan")
+        rmse_baseline = (
+            float(np.sqrt(np.mean(np.square(all_errors_baseline))))
+            if all_errors_baseline
+            else float("nan")
+        )
+        mae = float(np.mean(np.abs(all_errors))) if all_errors else float("nan")
+        mae_baseline = (
+            float(np.mean(np.abs(all_errors_baseline))) if all_errors_baseline else float("nan")
+        )
+
+        return {
+            "fit_days": fit_days,
+            "results": results,
+            "results_baseline": results_baseline,
+            "rmse": rmse,
+            "rmse_baseline": rmse_baseline,
+            "mae": mae,
+            "mae_baseline": mae_baseline,
+            "rmse_by_lead": rmse_by_lead,
+            "rmse_baseline_by_lead": rmse_baseline_by_lead,
+            "n_forecast_points": len(all_errors),
+            "oos_pred": np.array(oos_pred),
+            "oos_pred_baseline": np.array(oos_pred_baseline),
+            "oos_actual": np.array(oos_actual),
+            "oos_oat_f": np.array(oos_oat_f),
+            "oos_hour_start": oos_hour_start,
+            "errors": np.array(all_errors),
+            "oos_lead1_errors": np.array(oos_lead1_errors),
+            "oos_lead1_hour_start": oos_lead1_hour_start,
+        }
+
     def _should_refit_trailing_window(self, day_index: int, days: np.ndarray, last_fit_index: int | None) -> bool:
         if self.TRAINING_FREQUENCY == "daily" or last_fit_index is None:
             return True
@@ -514,67 +685,30 @@ class HouseEnergyParamsComputer:
 
     def trailing_n_day_fits(self, n: int) -> None:
         self.results_dir.mkdir(parents=True, exist_ok=True)
-        
-        days = np.sort(self.df["day"].unique())
-        fit_days = []
-        results: list[HouseEnergyParams] = []
-        oos_oat_f = []
-        oos_hour_start = []
-        oos_pred = []
-        oos_pred_baseline = []
-        oos_actual = []
 
-        params: HouseEnergyParams | None = None
-        params_baseline: HouseEnergyParams | None = None
-        last_fit_index: int | None = None
+        oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=True)
+        fit_days = oos["fit_days"]
+        results = oos["results"]
+        oos_pred = oos["oos_pred"]
+        oos_pred_baseline = oos["oos_pred_baseline"]
+        oos_actual = oos["oos_actual"]
+        oos_oat_f = oos["oos_oat_f"]
+        oos_hour_start = oos["oos_hour_start"]
+        errors = oos["errors"]
+        mae = oos["mae"]
+        rmse = oos["rmse"]
+        mae_baseline = oos["mae_baseline"]
+        rmse_baseline = oos["rmse_baseline"]
+        rmse_by_lead = oos["rmse_by_lead"]
+        rmse_baseline_by_lead = oos["rmse_baseline_by_lead"]
 
-        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n-1
-        oos_future_days = 7 if self.TRAINING_FREQUENCY == "weekly" else 1
-        
-        for i in range(first_fit_day_index, len(days)):
-            refitted = False
-            if self._should_refit_trailing_window(i, days, last_fit_index):
-                window = self._fit_window_days(days, i, n)
-                window_df = self.df[self.df["day"].isin(window)]
-                fit_days.append(days[i])
-                params = self.fit(window_df)
-                params_baseline = self.fit(window_df, baseline=True)
-                results.append(params)
-                last_fit_index = i
-                refitted = True
-
-            if params is None or params_baseline is None:
-                continue
-            if self.TRAINING_FREQUENCY == "weekly" and not refitted:
-                continue
-            if self.TRAINING_FREQUENCY == "daily" and i + 1 >= len(days):
-                continue
-
-            for j in range(i + 1, min(i + 1 + oos_future_days, len(days))):
-                day_df = self.df[self.df["day"] == days[j]]
-                oos_pred.extend(self.predict(params, day_df))
-                oos_pred_baseline.extend(self.predict(params_baseline, day_df))
-                oos_actual.extend(day_df["dist_kwh"] * params.energy_ratio)
-                oos_oat_f.extend(day_df["oat_f"])
-                oos_hour_start.extend(day_df["hour_start"])
-
-        oos_label = "next-week" if self.TRAINING_FREQUENCY == "weekly" else "next-day"
+        oos_label = f"recursive {self.FORECAST_HORIZON_HOURS}h"
         self._log_info(
             f"Fitted {len(results)} {self.TRAINING_FREQUENCY} training, "
             f"{'with' if self.GROW_WINDOW_TO_N else 'no'} growing window "
             f"from {pd.Timestamp(fit_days[0]).date()} to {pd.Timestamp(fit_days[-1]).date()}"
         )
 
-        oos_pred = np.array(oos_pred)
-        oos_pred_baseline = np.array(oos_pred_baseline)
-        oos_actual = np.array(oos_actual)
-        oos_oat_f = np.array(oos_oat_f)
-        errors = oos_pred - oos_actual
-        errors_baseline = oos_pred_baseline - oos_actual
-        mae = float(np.abs(errors).mean())
-        rmse = float(np.sqrt((errors**2).mean()))
-        mae_baseline = float(np.abs(errors_baseline).mean())
-        rmse_baseline = float(np.sqrt((errors_baseline**2).mean()))
         improvement_rmse_percentage = (rmse_baseline - rmse) / rmse_baseline * 100.0
         improvement_mae_percentage = (mae_baseline - mae) / mae_baseline * 100.0
 
@@ -597,11 +731,28 @@ class HouseEnergyParamsComputer:
         )
 
         self._log_info(
-            f"{oos_label.capitalize()} out-of-sample over {len(oos_actual)} hours: "
-            f"MAE = {mae:.2f} kWh (baseline {mae_baseline:.2f} kWh, "
+            f"{oos_label.capitalize()} out-of-sample over {oos['n_forecast_points']} "
+            f"origin×lead points: MAE = {mae:.2f} kWh (baseline {mae_baseline:.2f} kWh, "
             f"{improvement_mae_percentage:.1f}% improvement), "
             f"RMSE = {rmse:.2f} kWh (baseline {rmse_baseline:.2f} kWh, "
             f"{improvement_rmse_percentage:.1f}% improvement)"
+        )
+        self._log_info(
+            "RMSE by lead (kWh): "
+            + ", ".join(f"{h}h={rmse_by_lead[h - 1]:.2f}" for h in (1, 6, 12, 24, 48))
+        )
+
+        rmse_by_lead_df = pd.DataFrame(
+            {
+                "lead_hour": range(1, self.FORECAST_HORIZON_HOURS + 1),
+                "rmse_kwh": rmse_by_lead,
+                "rmse_baseline_kwh": rmse_baseline_by_lead,
+            }
+        )
+        rmse_by_lead_df.to_csv(
+            self.results_dir
+            / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.csv",
+            index=False,
         )
 
         self.plot_pred_vs_actual(
@@ -617,10 +768,17 @@ class HouseEnergyParamsComputer:
             oos_period_label=oos_label,
         )
         self.plot_oos_residual_by_hour_of_day(
-            errors,
-            oos_hour_start,
+            oos["oos_lead1_errors"],
+            oos["oos_lead1_hour_start"],
             savepath=self.results_dir
             / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
+            subtitle="first forecast hour (lead 1) only",
+        )
+        self.plot_oos_rmse_by_lead(
+            rmse_by_lead,
+            rmse_baseline_by_lead,
+            savepath=self.results_dir
+            / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.png",
         )
 
     def sweep_n(self, min_n: int, max_n: int) -> None:
@@ -628,47 +786,15 @@ class HouseEnergyParamsComputer:
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
-        days = np.sort(self.df["day"].unique())
         rmses: list[float] = []
         b1_weekly_ranges: list[float] = []
         n_values = list(range(min_n, max_n + 1))
 
         for n in n_values:
-            fit_days = []
-            b1_values = []
-            oos_pred = []
-            oos_actual = []
-            params: HouseEnergyParams | None = None
-            last_fit_index: int | None = None
-
-            first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n-1
-            oos_future_days = 7 if self.TRAINING_FREQUENCY == "weekly" else 1
-
-            for i in range(first_fit_day_index, len(days)):
-                refitted = False
-                if self._should_refit_trailing_window(i, days, last_fit_index):
-                    window = self._fit_window_days(days, i, n)
-                    window_df = self.df[self.df["day"].isin(window)]
-                    fit_days.append(days[i])
-                    params = self.fit(window_df)
-                    b1_values.append(params.B1)
-                    last_fit_index = i
-                    refitted = True
-
-                if params is None:
-                    continue
-                if self.TRAINING_FREQUENCY == "weekly" and not refitted:
-                    continue
-                if self.TRAINING_FREQUENCY == "daily" and i + 1 >= len(days):
-                    continue
-
-                for j in range(i + 1, min(i + 1 + oos_future_days, len(days))):
-                    day_df = self.df[self.df["day"] == days[j]]
-                    oos_pred.extend(self.predict(params, day_df))
-                    oos_actual.extend(day_df["dist_kwh"] * params.energy_ratio)
-
-            errors = np.array(oos_pred) - np.array(oos_actual)
-            rmse = float(np.sqrt((errors**2).mean()))
+            oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=False)
+            rmse = oos["rmse"]
+            fit_days = oos["fit_days"]
+            b1_values = [r.B1 for r in oos["results"]]
             b1 = pd.Series(b1_values, index=pd.DatetimeIndex(fit_days)).sort_index()
             if self.TRAINING_FREQUENCY == "daily":
                 b1_stability = b1.rolling("7D").apply(lambda s: s.max() - s.min())
@@ -677,15 +803,14 @@ class HouseEnergyParamsComputer:
                 b1_stability_metric = float(b1.diff().abs().mean())
             rmses.append(rmse)
             b1_weekly_ranges.append(b1_stability_metric)
-            oos_label = "next-week" if self.TRAINING_FREQUENCY == "weekly" else "next-day"
             self._log_info(
-                f"N={n:2d}: {oos_label} RMSE={rmse:.4f} kWh, "
+                f"N={n:2d}: recursive {self.FORECAST_HORIZON_HOURS}h RMSE={rmse:.4f} kWh, "
                 f"B1 stability={b1_stability_metric:.5g}"
             )
 
         fig, ax1 = plt.subplots(figsize=(9, 5))
         ax1.set_xlabel("N (trailing days in fit window)")
-        rmse_ylabel = "Next-week RMSE (kWh)" if self.TRAINING_FREQUENCY == "weekly" else "Next-day RMSE (kWh)"
+        rmse_ylabel = f"Recursive {self.FORECAST_HORIZON_HOURS}h RMSE (kWh)"
         ax1.set_ylabel(rmse_ylabel, color="tab:blue")
         ax1.plot(n_values, rmses, "o-", color="tab:blue", label="RMSE")
         ax1.tick_params(axis="y", labelcolor="tab:blue")
@@ -711,7 +836,7 @@ class HouseEnergyParamsComputer:
             self.results_dir / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
             dpi=150, bbox_inches="tight",
         )
-        plt.show()
+        plt.close(fig)
 
     def _oat_colors(self, oat_f):
         import matplotlib.pyplot as plt
@@ -800,6 +925,7 @@ class HouseEnergyParamsComputer:
 
         if savepath is not None:
             fig.savefig(savepath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
     @staticmethod
     def _hourly_residual_mean_and_ci95(
@@ -845,11 +971,37 @@ class HouseEnergyParamsComputer:
             f"mean error and 95% CI on energy use prediction"
         )
 
+    def plot_oos_rmse_by_lead(
+        self,
+        rmse_by_lead: list[float],
+        rmse_baseline_by_lead: list[float],
+        savepath: Path | None = None,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        leads = np.arange(1, len(rmse_by_lead) + 1)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(leads, rmse_by_lead, "o-", label="Model", color="tab:blue")
+        ax.plot(leads, rmse_baseline_by_lead, "s--", label="Baseline", color="tab:orange")
+        ax.set_xlabel("Forecast lead (hours ahead)")
+        ax.set_ylabel("RMSE (kWh)")
+        ax.set_title(
+            f"{self.house_alias.capitalize()}: out-of-sample RMSE by lead "
+            f"({self.FORECAST_HORIZON_HOURS}h recursive load)"
+        )
+        ax.set_xticks([1, 6, 12, 24, 36, 48])
+        ax.legend()
+        fig.tight_layout()
+        if savepath is not None:
+            fig.savefig(savepath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
     def plot_oos_residual_by_hour_of_day(
         self,
         residuals: np.ndarray,
         hour_starts,
         savepath: Path | None = None,
+        subtitle: str | None = None,
     ) -> None:
         import matplotlib.pyplot as plt
 
@@ -877,6 +1029,9 @@ class HouseEnergyParamsComputer:
             ax.set_xlabel("Hour of day")
             ax.tick_params(axis="x", labelbottom=True)
             ax.set_ylim(-1.5, 1.5)
+        if subtitle:
+            fig.suptitle(subtitle, fontsize=11, y=1.02)
         fig.tight_layout()
         if savepath is not None:
             fig.savefig(savepath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
