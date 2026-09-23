@@ -127,7 +127,7 @@ class HouseEnergyParamsComputer:
         df = self._remove_outliers(df)
         df = self._handle_missing_data(df)
         df = self._filter_out_known_bad_data(df)
-        self._plot_data_distribution(df_before_cleaning, df)
+        # self._plot_data_distribution(df_before_cleaning, df)
    
         # Calculate some of the features (OAT_avg_6h is built in _handle_missing_data)
         setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
