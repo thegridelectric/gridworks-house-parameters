@@ -84,6 +84,7 @@ class HouseEnergyParamsComputer:
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
+        self.results_dir = RESULTS_DIR / house_alias
         self.load_data()
 
     def _log_info(self, message: str) -> None:
@@ -413,8 +414,8 @@ class HouseEnergyParamsComputer:
                             axes[row, col_idx].set_ylim(shared_ylim)
         fig.suptitle(f"{self.house_alias.capitalize()}: channel distributions")
         fig.tight_layout()
-        RESULTS_DIR.mkdir(exist_ok=True)
-        savepath = RESULTS_DIR / f"{self.house_alias}_channel_boxplots.png"
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        savepath = self.results_dir / f"{self.house_alias}_channel_boxplots.png"
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
         plt.show()
 
@@ -472,12 +473,13 @@ class HouseEnergyParamsComputer:
         return days[day_index - n + 1 : day_index + 1]
 
     def trailing_n_day_fits(self, n: int) -> None:
-        RESULTS_DIR.mkdir(exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
         
         days = np.sort(self.df["day"].unique())
         fit_days = []
         results: list[HouseEnergyParams] = []
         oos_oat_f = []
+        oos_hour_start = []
         oos_pred = []
         oos_pred_baseline = []
         oos_actual = []
@@ -514,6 +516,7 @@ class HouseEnergyParamsComputer:
                 oos_pred_baseline.extend(self.predict(params_baseline, day_df))
                 oos_actual.extend(day_df["dist_kwh"] * params.energy_ratio)
                 oos_oat_f.extend(day_df["oat_f"])
+                oos_hour_start.extend(day_df["hour_start"])
 
         oos_label = "next-week" if self.TRAINING_FREQUENCY == "weekly" else "next-day"
         self._log_info(
@@ -550,7 +553,10 @@ class HouseEnergyParamsComputer:
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
         growing_window_label = 'growing' if self.GROW_WINDOW_TO_N else 'fixed'
-        params_table.to_csv(RESULTS_DIR / f"{self.house_alias}_params_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.csv")
+        params_table.to_csv(
+            self.results_dir
+            / f"{self.house_alias}_params_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.csv"
+        )
 
         self._log_info(
             f"{oos_label.capitalize()} out-of-sample over {len(oos_actual)} hours: "
@@ -566,16 +572,26 @@ class HouseEnergyParamsComputer:
                 f"{self.house_alias.capitalize()}: {oos_label} predicted vs actual "
                 f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             ),
-            savepath=RESULTS_DIR / f"{self.house_alias}_pred_vs_actual_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.png",
+            savepath=self.results_dir
+            / f"{self.house_alias}_pred_vs_actual_N{n}_{self.TRAINING_FREQUENCY}_{growing_window_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
             oos_period_label=oos_label,
+        )
+        self.plot_oos_residual_by_hour_of_day(
+            errors,
+            oos_hour_start,
+            savepath=self.results_dir
+            / (
+                f"{self.house_alias}_oos_residual_by_hour_N{n}_"
+                f"{self.TRAINING_FREQUENCY}_{growing_window_label}.png"
+            ),
         )
 
     def sweep_n(self, min_n: int, max_n: int) -> None:
         import matplotlib.pyplot as plt
 
-        RESULTS_DIR.mkdir(exist_ok=True)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
 
         days = np.sort(self.df["day"].unique())
         rmses: list[float] = []
@@ -657,7 +673,7 @@ class HouseEnergyParamsComputer:
         )
         fig.tight_layout()
         fig.savefig(
-            RESULTS_DIR / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
+            self.results_dir / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
             dpi=150, bbox_inches="tight",
         )
         plt.show()
@@ -747,5 +763,84 @@ class HouseEnergyParamsComputer:
 
         fig.suptitle(title)
 
+        if savepath is not None:
+            fig.savefig(savepath, dpi=150, bbox_inches="tight")
+
+    @staticmethod
+    def _hourly_residual_mean_and_ci95(
+        residuals: np.ndarray, hour_of_day: pd.Series
+    ) -> tuple[np.ndarray, np.ndarray]:
+        by_hour = (
+            pd.DataFrame({"hour": hour_of_day, "residual": residuals})
+            .groupby("hour", sort=True)["residual"]
+            .agg(["mean", "std", "count"])
+            .reindex(range(24))
+        )
+        sem = by_hour["std"] / np.sqrt(by_hour["count"])
+        ci95 = 1.96 * sem
+        ci95 = ci95.where(by_hour["count"] >= 2, 0.0).fillna(0.0)
+        return by_hour["mean"].to_numpy(), ci95.to_numpy()
+
+    def _plot_hourly_residual_bars_on_ax(
+        self,
+        ax,
+        residuals: np.ndarray,
+        hour_of_day: pd.Series,
+        *,
+        house_alias: str,
+        panel_title: str,
+    ) -> None:
+        means, ci95 = self._hourly_residual_mean_and_ci95(residuals, hour_of_day)
+        hours = np.arange(24)
+        ax.bar(
+            hours,
+            means,
+            yerr=ci95,
+            color="tab:blue",
+            alpha=0.85,
+            width=0.8,
+            capsize=3,
+            error_kw={"linewidth": 1, "ecolor": "0.25"},
+        )
+        ax.axhline(0, color="k", linestyle="--", linewidth=1)
+        ax.set_xticks(hours)
+        ax.set_ylabel("Mean residual (predicted − actual, kWh)")
+        ax.set_title(
+            f"{house_alias.capitalize()} - {panel_title} - "
+            f"mean error and 95% CI on energy use prediction"
+        )
+
+    def plot_oos_residual_by_hour_of_day(
+        self,
+        residuals: np.ndarray,
+        hour_starts,
+        savepath: Path | None = None,
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        residuals = np.asarray(residuals, dtype=float)
+        timestamps = pd.to_datetime(hour_starts)
+        hour_of_day = timestamps.hour
+        weekend_mask = np.asarray(timestamps.dayofweek >= 5, dtype=bool)
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+        panels = (
+            ("Weekday", ~weekend_mask),
+            ("Weekend", weekend_mask),
+        )
+        for ax, (panel_title, mask) in zip(axes, panels):
+            panel_residuals = residuals[mask]
+            panel_hours = hour_of_day[mask]
+            self._plot_hourly_residual_bars_on_ax(
+                ax,
+                panel_residuals,
+                panel_hours,
+                house_alias=self.house_alias,
+                panel_title=panel_title,
+            )
+        for ax in axes:
+            ax.set_xlabel("Hour of day")
+            ax.tick_params(axis="x", labelbottom=True)
+        fig.tight_layout()
         if savepath is not None:
             fig.savefig(savepath, dpi=150, bbox_inches="tight")
