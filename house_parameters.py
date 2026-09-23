@@ -355,7 +355,37 @@ class HouseEnergyParamsComputer:
         return df.loc[~drop_rows].reset_index(drop=True)
 
     def _thermostat_change(self, df: pd.DataFrame) -> pd.DataFrame:
-        return df
+        """Drop hours when any zone's thermostat setpoint changed from the prior hour."""
+        drop_rows = pd.Series(False, index=df.index)
+        n_flags = 0
+        for z in self.zones:
+            setpoint_col = f"zone{z}_avg_set"
+            prev_setpoint = df[setpoint_col].shift(1)
+            prev_hour = df["hour_start"].shift(1)
+            consecutive = (df["hour_start"] - prev_hour) == pd.Timedelta(hours=1)
+            changed = (
+                consecutive
+                & df[setpoint_col].notna()
+                & prev_setpoint.notna()
+                & (df[setpoint_col] != prev_setpoint)
+            )
+            drop_rows |= changed
+            n_flags += int(changed.sum())
+            for hour_start, previous, new_set in zip(
+                df.loc[changed, "hour_start"],
+                prev_setpoint.loc[changed],
+                df.loc[changed, setpoint_col],
+                strict=True,
+            ):
+                self._log_debug(
+                    f"Thermostat setpoint change (zone {z}): hour_start={hour_start} "
+                    f"{setpoint_col} {previous} -> {new_set}"
+                )
+        n_drop = int(drop_rows.sum())
+        self._log_info(
+            f"Thermostat setpoint change: {n_flags} flagged row-zone hours, dropped {n_drop} rows"
+        )
+        return df.loc[~drop_rows].reset_index(drop=True)
 
     def _used_oil_boiler(self, df: pd.DataFrame) -> pd.DataFrame:
         """Flag and drop hours when average oil boiler power was on."""
