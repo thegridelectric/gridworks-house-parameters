@@ -1,4 +1,8 @@
-from house_parameters import HouseEnergyParamsComputer
+import logging
+
+from house_parameters import HouseEnergyParamsComputer, logger
+
+logger.setLevel(logging.INFO)
 
 HOUSE_ALIASES = [
     "beech",
