@@ -16,13 +16,13 @@ Features:
 - `dist_kwh_scaled_avg_4h`: 4-hour rolling mean of scaled load
 - Optional weekday/weekend hour-of-day indicators for selected hours
 
-**ŷ** is predicted scaled distribution energy (`scaled_dist_kwh`). Coefficients **B₀** (intercept), **B₁**, … follow feature order in code. We use ordinary least squares (OLS) to fit the model.
+$\hat{y}$ is predicted scaled distribution energy (`scaled_dist_kwh`). Coefficients $B_0$ (intercept), $B_1$, … follow feature order in code (same names as the feature list above). We use ordinary least squares (OLS) to fit the model.
 
 $$
-\hat{y} = \max(0, B_0 + B_1 \cdot \Delta T + B_2 \cdot (w_s \cdot \Delta T) + B_3 \cdot \text{solar} + B_4 \cdot \text{previous\_dist\_kwh\_scaled} + B_5 \cdot \text{OAT\_avg\_4h} + B_6 \cdot \text{dist\_kwh\_scaled\_avg\_4h} + \sum_i B_i \cdot \text{occ}_i)
+\hat{y} = \max\left(0,\; B_0 + B_1 \Delta T + B_2 (w_s \Delta T) + B_3\,\text{solar} + B_4\,\text{prev} + B_5\,\text{OAT4} + B_6\,\text{load4} + \sum_i B_i\, o_i \right)
 $$
 
-With occupancy on, each `wd_hour_*` (weekday) / `we_hour_*` (weekend) column gets its own coefficient (**B₇**, **B₈**, …).
+Here prev / OAT4 / load4 match `previous_dist_kwh_scaled`, `OAT_avg_4h`, and `dist_kwh_scaled_avg_4h`. With occupancy on, each `wd_hour_*` / `we_hour_*` column adds another $B_i$ and $o_i$ term.
 
 ### Baseline
 
