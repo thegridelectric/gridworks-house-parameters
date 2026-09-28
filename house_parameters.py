@@ -47,7 +47,7 @@ class HouseEnergyParamsComputer:
     OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
 
     # Training
-    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
+    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "weekly"
     GROW_WINDOW_TO_N: bool = False
     MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
@@ -664,6 +664,7 @@ class HouseEnergyParamsComputer:
         oos_lead1_hour_start: list[pd.Timestamp] = []
 
         # Score the recursive horizon forecasts
+        self._log_info(f"Scoring recursive horizon forecasts for {max_origin} origins...")
         for origin in range(max_origin):
             self._log_debug(f"Scoring recursive horizon forecasts for origin {origin} / {max_origin}")
             origin_day = df["day"].iloc[origin]
