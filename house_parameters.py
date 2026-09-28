@@ -630,6 +630,7 @@ class HouseEnergyParamsComputer:
         else:
             first_fit_day_index = n - 1
 
+        # Fit the models (baseline and non-baseline)
         for i in range(first_fit_day_index, len(days)):
             should_refit = (
                 self.TRAINING_FREQUENCY == "daily"
@@ -662,7 +663,9 @@ class HouseEnergyParamsComputer:
         oos_lead1_errors: list[float] = []
         oos_lead1_hour_start: list[pd.Timestamp] = []
 
+        # Score the recursive horizon forecasts
         for origin in range(max_origin):
+            self._log_debug(f"Scoring recursive horizon forecasts for origin {origin} / {max_origin}")
             origin_day = df["day"].iloc[origin]
             fit_idx = len(fit_days) - 1
             while fit_idx >= 0 and fit_days[fit_idx] >= origin_day:
@@ -670,6 +673,7 @@ class HouseEnergyParamsComputer:
             if fit_idx < 0:
                 continue
 
+            # Get the predicted and actual distribution kWh for the next ``horizon`` hours
             params = results[fit_idx]
             params_baseline = results_baseline[fit_idx]
             pred = self.predict_recursive_horizon(params, origin, horizon)
@@ -677,12 +681,15 @@ class HouseEnergyParamsComputer:
             target_start = origin + 1
             actual = dist_kwh[target_start : target_start + horizon] * params.energy_ratio
 
+            # Collect the errors by lead
             for step in range(horizon):
                 err = float(pred[step] - actual[step])
                 err_baseline = float(pred_baseline[step] - actual[step])
                 errors_by_lead[step].append(err)
                 errors_baseline_by_lead[step].append(err_baseline)
 
+            # Gathering of individual prediction and target values for every origin×lead in the recursive forecast evaluation.
+            # This is used by the plotting functions in trailing_n_day_fits() to plot the predicted vs actual values.
             if collect_pointwise:
                 oos_pred.extend(pred.tolist())
                 oos_actual.extend(actual.tolist())
@@ -690,6 +697,7 @@ class HouseEnergyParamsComputer:
                 oos_lead1_errors.append(float(pred[0] - actual[0]))
                 oos_lead1_hour_start.append(df["hour_start"].iloc[target_start])
 
+        # Calculate the RMSE by lead
         rmse_by_lead = [
             float(np.sqrt(np.mean(np.square(errors))))
             if errors
@@ -702,18 +710,17 @@ class HouseEnergyParamsComputer:
             else float("nan")
             for errors in errors_baseline_by_lead
         ]
+
+        # Calculate the overall RMSE and MAE
         all_errors = [err for lead in errors_by_lead for err in lead]
         all_errors_baseline = [err for lead in errors_baseline_by_lead for err in lead]
         rmse = float(np.sqrt(np.mean(np.square(all_errors)))) if all_errors else float("nan")
         rmse_baseline = (
             float(np.sqrt(np.mean(np.square(all_errors_baseline))))
-            if all_errors_baseline
-            else float("nan")
+            if all_errors_baseline else float("nan")
         )
         mae = float(np.mean(np.abs(all_errors))) if all_errors else float("nan")
-        mae_baseline = (
-            float(np.mean(np.abs(all_errors_baseline))) if all_errors_baseline else float("nan")
-        )
+        mae_baseline = float(np.mean(np.abs(all_errors_baseline))) if all_errors_baseline else float("nan")
 
         return {
             "fit_days": fit_days,
@@ -732,7 +739,7 @@ class HouseEnergyParamsComputer:
             "oos_lead1_hour_start": oos_lead1_hour_start,
         }
 
-    @property # TODO
+    @property
     def _artifact_label(self) -> str:
         window = "_growing" if self.GROW_WINDOW_TO_N else ""
         min_window = (
@@ -759,6 +766,7 @@ class HouseEnergyParamsComputer:
         b1_weekly_ranges: list[float] = []
         n_values = list(range(min_n, max_n + 1))
 
+        # Evaluate the recursive horizon forecasts for each number of trailing days
         for n in n_values:
             oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=False)
             rmse = oos["rmse"]
@@ -778,6 +786,7 @@ class HouseEnergyParamsComputer:
                 f"B1 stability={b1_stability_metric:.5g}"
             )
 
+        # Plot the RMSE and B1 stability
         fig, ax1 = plt.subplots(figsize=(9, 5))
         ax1.set_xlabel("N (trailing days in fit window)")
         rmse_ylabel = f"Recursive {self.FORECAST_HORIZON_HOURS}h RMSE (kWh)"
