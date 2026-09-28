@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,19 +16,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
-
-# -----------------
-# Configuration
-# -----------------
-
-HOUSE_ALIAS = "beech"
-LOCAL_TZ = ZoneInfo("America/New_York")
-T_START = datetime(2025, 11, 1, tzinfo=LOCAL_TZ)
-T_END = datetime(2025, 11, 3, tzinfo=LOCAL_TZ)
-OUTPUT_CSV = (
-    Path(__file__).resolve().parent / "results"
-    / f"{HOUSE_ALIAS}_house_params_data.csv"
-)
 
 # -----------------
 # Channel names
@@ -130,123 +117,148 @@ ORDER BY time_bucket, rc.name
 """)
 
 
-def hour_start_key(raw_timestamp: datetime) -> str:
-    tb = raw_timestamp
-    if tb.tzinfo is None:
-        tb = tb.replace(tzinfo=ZoneInfo("UTC"))
-    local = tb.astimezone(LOCAL_TZ)
-    return local.replace(tzinfo=None).isoformat(timespec="seconds")
+class HouseParamsDataFetcher:
+    def __init__(self, house_alias: str, t_start: datetime, t_end: datetime, local_tz: ZoneInfo) -> None:
+        dotenv.load_dotenv()
+        db_url = os.environ.get("GW_DATA_DB_URL")
+        if not db_url:
+            raise SystemExit("GW_DATA_DB_URL is not set (e.g. in .env)")
+        db_echo = os.environ.get("GW_DATA_DB_ECHO", "").lower() in ("1", "true", "yes")
+        self.engine: Engine = create_engine(db_url, echo=db_echo)
+        self.house_alias = house_alias
+        self.t_start = t_start
+        self.t_end = t_end
+        self.local_tz = local_tz
+
+    def hour_start_key(self, raw_timestamp: datetime) -> str:
+        tb = raw_timestamp
+        if tb.tzinfo is None:
+            tb = tb.replace(tzinfo=ZoneInfo("UTC"))
+        local = tb.astimezone(self.local_tz)
+        return local.replace(tzinfo=None).isoformat(timespec="seconds")
+    
+    def fetch(self) -> tuple[dict[str, dict[str, float | None]], list[str], list[int]]:
+        logger.info(
+            f"{self.house_alias} - Exporting from {self.t_start.isoformat()} "
+            f"to {self.t_end.isoformat()} ({self.local_tz})"
+        )
+
+        # Prepare query parameters
+        params = {
+            "house_alias": f"%{self.house_alias}%",
+            "t_start": self.t_start,
+            "t_end": self.t_end,
+            "t_end_inclusive": self.t_end - timedelta(microseconds=1),
+            "local_tz": str(self.local_tz),
+            "oil_boiler_channel": OIL_BOILER_CHANNEL,
+            "energy_channels": ENERGY_CHANNELS,
+        }
+
+        # Execute queries
+        with self.engine.connect() as conn:
+            energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
+            oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
+            zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
+
+        # Initialize by-hour dictionary
+        channel_data_by_hour_start: dict[str, dict[str, float | None]] = {}
+        cursor = self.t_start
+        while cursor < self.t_end:
+            hour = cursor.replace(tzinfo=None).isoformat(timespec="seconds")
+            channel_data_by_hour_start[hour] = {}
+            cursor += timedelta(hours=1)
+
+        # Populate by-hour dictionary with energy data
+        for row in energy_rows:
+            key = self.hour_start_key(row["time_bucket"])
+            bucket = channel_data_by_hour_start.setdefault(key, {})
+            bucket["dist_kwh"] = 0.0 if row["dist_kwh"] is None else round(float(row["dist_kwh"]), 2)
+            bucket["hp_kwh_th"] = 0.0 if row["hp_kwh_th"] is None else round(float(row["hp_kwh_th"]), 2)
+
+        # Populate by-hour dictionary with oil boiler power data
+        for row in oil_rows:
+            key = self.hour_start_key(row["time_bucket"])
+            bucket = channel_data_by_hour_start.setdefault(key, {})
+            avg = row["avg_value"]
+            bucket["oil_boiler_pwr"] = round(float(avg), 1) if avg is not None else 0.0
+
+        # Populate by-hour dictionary with zone data
+        zone_ids: set[int] = set()
+        zone_accum: dict[str, list[float]] = {}
+
+        for row in zone_rows:
+            name = row["channel_name"]
+            parsed = ZONE_CHANNEL.match(name)
+            if not parsed:
+                continue
+            zone = int(parsed.group(1))
+            kind = parsed.group(2)
+            zone_ids.add(zone)
+
+            unit = row["unit"]
+            raw = float(row["avg_value"]) if row["avg_value"] is not None else None
+            if raw is None:
+                continue
+            if kind in ("temp", "set"):
+                value = round(raw / 1000.0 if unit == "AirTempFTimes1000" else raw, 1)
+            else:
+                value = round(raw, 2)
+
+            key = self.hour_start_key(row["time_bucket"])
+            if kind == "heat-call":
+                field = f"zone{zone}_heatcall_fraction"
+            elif kind == "temp":
+                field = f"zone{zone}_avg_temp"
+            else:
+                field = f"zone{zone}_avg_set"
+            zone_accum.setdefault(f"{key}|{field}", []).append(value)
+
+        for compound, values in zone_accum.items():
+            hour_key, field = compound.split("|", 1)
+            bucket = channel_data_by_hour_start.setdefault(hour_key, {})
+            bucket[field] = round(sum(values) / len(values), 1 if "avg_" in field else 2)
+
+        zone_numbers = sorted(zone_ids)
+
+        # Build CSV column order
+        csv_fieldnames = [
+            "hour_start",
+            "oat_f",
+            "ws_mph",
+            "solar_w_m2",
+            "dist_kwh",
+            "hp_kwh_th",
+            "oil_boiler_pwr",
+        ]
+        for zone in zone_numbers:
+            csv_fieldnames.append(f"zone{zone}_heatcall_fraction")
+        for zone in zone_numbers:
+            csv_fieldnames.extend([f"zone{zone}_avg_set", f"zone{zone}_avg_temp"])
+
+        return channel_data_by_hour_start, csv_fieldnames, zone_numbers
 
 
 def main() -> int:
-    dotenv.load_dotenv()
-    db_url = os.environ.get("GW_DATA_DB_URL")
-    if not db_url:
-        raise SystemExit("GW_DATA_DB_URL is not set (e.g. in .env)")
-    db_echo = os.environ.get("GW_DATA_DB_ECHO", "").lower() in ("1", "true", "yes")
-    engine = create_engine(db_url, echo=db_echo)
 
-    logger.info(f"{HOUSE_ALIAS} - Exporting from {T_START.isoformat()} to {T_END.isoformat()} ({LOCAL_TZ})"),
+    HOUSE_ALIAS = "beech"
+    LOCAL_TZ = ZoneInfo("America/New_York")
+    T_START = datetime(2025, 11, 1, tzinfo=LOCAL_TZ)
+    T_END = datetime(2025, 11, 3, tzinfo=LOCAL_TZ)
+    OUTPUT_CSV = (
+        Path(__file__).resolve().parent / "results"
+        / f"{HOUSE_ALIAS}_house_params_data.csv"
+    )
 
-    # Prepare query parameters
-    params = {
-        "house_alias": f"%{HOUSE_ALIAS}%",
-        "t_start": T_START,
-        "t_end": T_END,
-        "t_end_inclusive": T_END - timedelta(microseconds=1),
-        "local_tz": str(LOCAL_TZ),
-        "oil_boiler_channel": OIL_BOILER_CHANNEL,
-        "energy_channels": ENERGY_CHANNELS,
-    }
-
-    # Execute queries
-    with engine.connect() as conn:
-        energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
-        oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
-        zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
-
-    # Initialize by-hour dictionary
-    by_hour: dict[str, dict[str, float | None]] = {}
-    cursor = T_START
-    while cursor < T_END:
-        hour = cursor.replace(tzinfo=None).isoformat(timespec="seconds")
-        by_hour[hour] = {}
-        cursor += timedelta(hours=1)
-
-    # Populate by-hour dictionary with energy data
-    for row in energy_rows:
-        key = hour_start_key(row["time_bucket"])
-        bucket = by_hour.setdefault(key, {})
-        bucket["dist_kwh"] = 0.0 if row["dist_kwh"] is None else round(float(row["dist_kwh"]), 2)
-        bucket["hp_kwh_th"] = 0.0 if row["hp_kwh_th"] is None else round(float(row["hp_kwh_th"]), 2)
-
-    # Populate by-hour dictionary with oil boiler power data
-    for row in oil_rows:
-        key = hour_start_key(row["time_bucket"])
-        bucket = by_hour.setdefault(key, {})
-        avg = row["avg_value"]
-        bucket["oil_boiler_pwr"] = round(float(avg), 1) if avg is not None else 0.0
-
-    # Populate by-hour dictionary with zone data
-    zone_ids: set[int] = set()
-    zone_accum: dict[str, list[float]] = {}
-
-    for row in zone_rows:
-        name = row["channel_name"]
-        parsed = ZONE_CHANNEL.match(name)
-        if not parsed:
-            continue
-        zone = int(parsed.group(1))
-        kind = parsed.group(2)
-        zone_ids.add(zone)
-
-        unit = row["unit"]
-        raw = float(row["avg_value"]) if row["avg_value"] is not None else None
-        if raw is None:
-            continue
-        if kind in ("temp", "set"):
-            value = round(raw / 1000.0 if unit == "AirTempFTimes1000" else raw, 1)
-        else:
-            value = round(raw, 2)
-
-        key = hour_start_key(row["time_bucket"])
-        if kind == "heat-call":
-            field = f"zone{zone}_heatcall_fraction"
-        elif kind == "temp":
-            field = f"zone{zone}_avg_temp"
-        else:
-            field = f"zone{zone}_avg_set"
-        zone_accum.setdefault(f"{key}|{field}", []).append(value)
-
-    for compound, values in zone_accum.items():
-        hour_key, field = compound.split("|", 1)
-        bucket = by_hour.setdefault(hour_key, {})
-        bucket[field] = round(sum(values) / len(values), 1 if "avg_" in field else 2)
-
-    zone_id_list = sorted(zone_ids)
-
-    # Build all column_names
-    column_names = [
-        "hour_start",
-        "oat_f",
-        "ws_mph",
-        "solar_w_m2",
-        "dist_kwh",
-        "hp_kwh_th",
-        "oil_boiler_pwr",
-    ]
-    for zone in zone_id_list:
-        column_names.append(f"zone{zone}_heatcall_fraction")
-    for zone in zone_id_list:
-        column_names.extend([f"zone{zone}_avg_set", f"zone{zone}_avg_temp"])
+    fetcher = HouseParamsDataFetcher(HOUSE_ALIAS, T_START, T_END, LOCAL_TZ)
+    channel_data_by_hour_start, csv_fieldnames, zone_numbers = fetcher.fetch()
 
     # Write to CSV
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as out:
-        writer = csv.DictWriter(out, fieldnames=column_names, extrasaction="ignore")
+        writer = csv.DictWriter(out, fieldnames=csv_fieldnames, extrasaction="ignore")
         writer.writeheader()
-        for hour in sorted(by_hour.keys()):
-            data = by_hour[hour]
+        for hour in sorted(channel_data_by_hour_start.keys()):
+            data = channel_data_by_hour_start[hour]
             row = {
                 "hour_start": hour,
                 "oat_f": "",
@@ -256,13 +268,13 @@ def main() -> int:
                 "hp_kwh_th": data.get("hp_kwh_th", 0.0),
                 "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
             }
-            for zone in zone_id_list:
+            for zone in zone_numbers:
                 row[f"zone{zone}_heatcall_fraction"] = data.get(f"zone{zone}_heatcall_fraction", 0.0)
-            for zone in zone_id_list:
+            for zone in zone_numbers:
                 row[f"zone{zone}_avg_set"] = data.get(f"zone{zone}_avg_set", "")
                 row[f"zone{zone}_avg_temp"] = data.get(f"zone{zone}_avg_temp", "")
             writer.writerow(row)
-    logger.info(f"Wrote {len(by_hour)} rows to {OUTPUT_CSV}")
+    logger.info(f"Wrote {len(channel_data_by_hour_start)} rows to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
