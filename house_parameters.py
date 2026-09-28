@@ -46,7 +46,7 @@ class HouseEnergyParamsComputer:
     GROW_WINDOW_TO_N: bool = False
     FORECAST_HORIZON_HOURS = 48
     
-    # Data cleaning
+    # Data cleaning - erroneous data
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
         "oat_f": (-128, 134),
         "ws_mph": (0, 254),
@@ -59,7 +59,11 @@ class HouseEnergyParamsComputer:
     MAX_ABS_RATE_OF_CHANGE_PER_CHANNEL = {
         "oat_f": 25.0,
     }
+
+    # Data cleaning - missing data
     MAX_DATA_GAP_HOURS = 4
+
+    # Data cleaning - known bad data
     OIL_BOILER_POWER_THRESHOLD_WATTS = 50
     BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F = {
         'default': 3,
@@ -71,7 +75,17 @@ class HouseEnergyParamsComputer:
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
         self.results_dir = Path("results") / house_alias
-        self.load_data()
+        self.prepare_data()
+        
+    def prepare_data(self) -> None:
+        """
+        - Loads the data
+        - Cleans the data
+        - Engineers the features
+        """
+        self._load_data()
+        self._clean_data()
+        self._engineer_features()
 
     def _log_info(self, message: str) -> None:
         logger.info("[%s] %s", self.house_alias, message)
@@ -79,14 +93,20 @@ class HouseEnergyParamsComputer:
     def _log_debug(self, message: str) -> None:
         logger.debug("[%s] %s", self.house_alias, message)
 
-    @property
+    @property # TODO
     def _artifact_label(self) -> str:
         window = "_growing" if self.GROW_WINDOW_TO_N else ""
         occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
         return f"{self.TRAINING_FREQUENCY}{window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
 
-    def load_data(self) -> None:
-        csv_path = glob.glob(f"data/{self.house_alias}_house_params_data.csv")[0]
+    def _load_data(self) -> None:
+        """
+        Loads the data from the CSV file and prepares it for the analysis.
+        - Sorts by hour_start, and adds a day column.
+        - Finds the number of zones
+        - Checks that all required columns are present
+        """
+        csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
         df = pd.read_csv(csv_path)
         self._log_info(f"Length of df: {len(df)} hours")
 
@@ -100,7 +120,6 @@ class HouseEnergyParamsComputer:
             if str(c).startswith("zone") and str(c).endswith("_avg_set")
         )
 
-        # Columns that are required for the model
         self.required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"]
         for z in self.zones:
             self.required.extend(
@@ -113,25 +132,35 @@ class HouseEnergyParamsComputer:
         missing_columns = [col for col in self.required if col not in df.columns]
         if missing_columns:
             raise ValueError(f"Missing required columns in CSV for {self.house_alias}: {missing_columns}")
+        
+        self.df = df
 
-        # Clean the data
-        df_before_cleaning = df.copy()
-        df = self._remove_erroneous_data(df)
-        df = self._handle_missing_data(df)
-        df = self._filter_out_known_bad_data(df)
-        # self._plot_data_distribution(df_before_cleaning, df)
-   
-        # Calculate some of the features (OAT_avg_6h is built in _handle_missing_data)
+    def _clean_data(self) -> None:
+        """
+        - Removes erroneous data
+        - Handles missing data
+        - Filters out known bad data
+        """
+        self.df = self._remove_erroneous_data(self.df)
+        self.df = self._handle_missing_data(self.df)
+        self.df = self._filter_out_known_bad_data(self.df)
+
+    def _engineer_features(self) -> None:
+        """
+        Adds engineered columns to the dataframe and sets self.feature_names.
+        (OAT_avg_6h is built during missing-data handling in _clean_data.)
+        """
+        df = self.df.copy()
         setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
         df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         df = df.drop(0).reset_index(drop=True)
-        df['windspeed_times_65_minus_oat'] = df["ws_mph"] * (65.0 - df["oat_f"])
+        df["windspeed_times_65_minus_oat"] = df["ws_mph"] * (65.0 - df["oat_f"])
         if self.INCLUDE_OCCUPANCY:
-            hour = df["hour_start"].dt.hour
-            is_weekday = df["hour_start"].dt.dayofweek < 5
-            is_weekend = ~is_weekday
+            hour = int(df["hour_start"].dt.hour)
+            is_weekday = int(df["hour_start"].dt.dayofweek) < 5
+            is_weekend = not is_weekday
             for occupancy_hour in self.OCCUPANCY_INDIVIDUAL_HOURS:
                 at_hour = hour == occupancy_hour
                 df[f"wd_hour_{occupancy_hour}"] = (is_weekday & at_hour).astype(float)
@@ -139,30 +168,26 @@ class HouseEnergyParamsComputer:
             self.feature_names = self.FEATURE_NAMES + self.OCCUPANCY_FEATURE_NAMES
         else:
             self.feature_names = self.FEATURE_NAMES
-
         self.df = df
 
-        # Find the range of outdoor temperatures (for the plot)
-        oat_min = float(self.df["oat_f"].min())
-        oat_max = float(self.df["oat_f"].max())
-        if oat_min >= oat_max:
-            oat_max = oat_min + 1.0
-        self.oat_color_range_f = (oat_min, oat_max)
-
     def _remove_erroneous_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Replace slight negative values with 0
+        """
+        Removes erroneous data:
+        - Data outside the range of valid values
+        - Data outside the maximum absolute rate of change
+        """
+        # Replace slight negative HP thermal power values with 0
         df.loc[df["hp_kwh_th"].between(-1, 0), "hp_kwh_th"] = 0
 
         # Remove data that is outside the range of valid values
         range_of_valid_values_per_channel = dict(self.RANGE_OF_VALID_VALUES_PER_CHANNEL)
         for col in df.columns:
-            col_str = str(col)
-            if col_str.startswith("zone") and col_str.endswith(("_avg_set", "_avg_temp")):
-                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel[
-                    "zone_set_or_temp_f"
-                ]
+            if str(col).startswith("zone") and str(col).endswith(("_avg_set", "_avg_temp")):
+                if "zone_set_or_temp_f" in range_of_valid_values_per_channel:
+                    range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel["zone_set_or_temp_f"]
             if str(col).startswith("zone") and str(col).endswith("_heatcall_fraction"):
-                range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel["zone_heatcall_fraction"]
+                if "zone_heatcall_fraction" in range_of_valid_values_per_channel:
+                    range_of_valid_values_per_channel[col] = range_of_valid_values_per_channel["zone_heatcall_fraction"]
         range_of_valid_values_per_channel.pop("zone_set_or_temp_f")
         range_of_valid_values_per_channel.pop("zone_heatcall_fraction")
 
@@ -171,13 +196,8 @@ class HouseEnergyParamsComputer:
             out_of_range = df[channel].notna() & ~df[channel].between(min_value, max_value)
             nans_added_range += int(out_of_range.sum())
             reason = f"valid range [{min_value}, {max_value}]"
-            for hour_start, value in df.loc[out_of_range, ["hour_start", channel]].itertuples(
-                index=False
-            ):
-                self._log_debug(
-                    f"Erroneous data ({reason}): channel={channel} hour_start={hour_start} "
-                    f"value={value}"
-                )
+            for hour_start, value in df.loc[out_of_range, ["hour_start", channel]].itertuples(index=False):
+                self._log_debug(f"Erroneous data ({reason}): channel={channel} hour_start={hour_start} value={value}")
             df[channel] = df[channel].where(df[channel].between(min_value, max_value))
         self._log_info(f"Erroneous data (valid range): {nans_added_range} NaNs added")
 
@@ -190,19 +210,23 @@ class HouseEnergyParamsComputer:
             excessive_roc = df[channel].notna() & ~roc_ok
             nans_added_roc += int(excessive_roc.sum())
             reason = f"rate of change > {max_abs_change}"
-            for hour_start, value in df.loc[excessive_roc, ["hour_start", channel]].itertuples(
-                index=False
-            ):
-                self._log_debug(
-                    f"Erroneous data ({reason}): channel={channel} hour_start={hour_start} "
-                    f"value={value}"
-                )
+            for hour_start, value in df.loc[excessive_roc, ["hour_start", channel]].itertuples(index=False):
+                self._log_debug(f"Erroneous data ({reason}): channel={channel} hour_start={hour_start} value={value}")
             df[channel] = df[channel].where(roc_ok | df[channel].isna())
         self._log_info(f"Erroneous data (rate of change): {nans_added_roc} NaNs added")
 
         return df
 
     def _handle_missing_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Handles missing data:
+        - Ensures there is one row per hour
+        - Marks rows inside long missing-data gaps
+        - Interpolates missing data
+        - Computes average OAT over last 6 hours when the start and end value are not interpolated, otherwise drops the row
+        - Drops rows inside missing-data gaps
+        - Drops remaining rows that contain NaNs
+        """
         # Insert missing rows (need one row per hour)
         df = df.copy()
         df["hour_start"] = pd.to_datetime(df["hour_start"])
@@ -247,9 +271,7 @@ class HouseEnergyParamsComputer:
         # Drop rows inside missing-data gaps
         df = df.loc[~drop_rows]
         df = df.reset_index(names="hour_start")
-        self._log_info(
-            f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows"
-        )
+        self._log_info(f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
 
         # If any rows still have NaNs, drop them
         remaining_nans = int(df.isna().sum().sum())
@@ -262,30 +284,81 @@ class HouseEnergyParamsComputer:
         return df
 
     def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = self._thermostat_change(df)
+        """
+        Filters out hours which include known-bad data:
+        - Used oil boiler
+        - Zone below setpoint
+        - Zone setpoint change
+        - Broken thermostat
+        - External heat source (voluntarily excluded for now)
+        """
         df = self._used_oil_boiler(df)
+        df = self._zone_below_setpoint(df)
+        df = self._setpoint_change(df)
         df = self._broken_thermostat(df)
-        df = self._below_setpoint(df)
         # df = self._external_heat_source(df)
         return df
     
+    def _used_oil_boiler(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop hours when the oil boiler power indicates it was used."""
+        threshold = self.OIL_BOILER_POWER_THRESHOLD_WATTS
+        if "oil_boiler_pwr" not in df.columns:
+            return df
+        used = df["oil_boiler_pwr"] > threshold
+        for hour_start, pwr in df.loc[used, ["hour_start", "oil_boiler_pwr"]].itertuples(index=False):
+            self._log_debug(f"Oil boiler used: hour_start={hour_start} oil_boiler_pwr={pwr}W > {threshold}W")
+        self._log_info(f"Oil boiler: dropped {int(used.sum())} rows")
+        return df.loc[~used].reset_index(drop=True)
+    
+    def _zone_below_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop hours when any zone's average temperature is well below its average setpoint."""
+        min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
+        drop_rows = pd.Series(False, index=df.index)
+        for z in self.zones:
+            temp_col = f"zone{z}_avg_temp"
+            setpoint_col = f"zone{z}_avg_set"
+            below_setpoint = (df[setpoint_col] - df[temp_col]) >= min_gap
+            drop_rows |= below_setpoint
+            for hour_start, temp, setpoint in df.loc[below_setpoint, ["hour_start", temp_col, setpoint_col]].itertuples(index=False):
+                self._log_debug(f"Below setpoint (zone {z}): hour_start={hour_start} set={setpoint} - temp={temp} >= {min_gap}°F")
+        self._log_info(f"Below setpoint: dropped {int(drop_rows.sum())} rows")
+        return df.loc[~drop_rows].reset_index(drop=True)
+
+    def _setpoint_change(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Drop hours when any zone's setpoint changed from the prior hour."""
+        drop_rows = pd.Series(False, index=df.index)
+        for z in self.zones:
+            setpoint_col = f"zone{z}_avg_set"
+            prev_setpoint = df[setpoint_col].shift(1)
+            prev_hour = df["hour_start"].shift(1)
+            consecutive = (df["hour_start"] - prev_hour) == pd.Timedelta(hours=1)
+            changed = (
+                consecutive
+                & df[setpoint_col].notna()
+                & prev_setpoint.notna()
+                & (df[setpoint_col] != prev_setpoint)
+            )
+            drop_rows |= changed
+            for hour_start, previous, new_set in zip(
+                df.loc[changed, "hour_start"],
+                prev_setpoint.loc[changed],
+                df.loc[changed, setpoint_col],
+                strict=True,
+            ):
+                self._log_debug(f"Setpoint change (zone {z}): hour_start={hour_start} {setpoint_col} {previous} -> {new_set}")
+        self._log_info(f"Setpoint change: dropped {int(drop_rows.sum())} rows")
+        return df.loc[~drop_rows].reset_index(drop=True)
+    
     def _broken_thermostat(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Flag and drop hours with inconsistent heat call vs zone temperature.
-
-        Per zone, uses min temp-set gap from BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F
-        (default 3 °F; optional per-house zone overrides, e.g. beech zone2).
-
-        Triggers when either:
+        """
+        Drop hours when the thermostat is broken (one of the following conditions is met):
         - Heat off while cold: heatcall_fraction == 0 and avg_set - avg_temp >= min gap.
         - Heat on while warm: heatcall_fraction > 0.01 and avg_temp - avg_set >= min gap.
-
-        Any hour flagged in any zone is removed from the dataframe.
         """
         gap_cfg = self.BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F
         default_min_gap = float(gap_cfg["default"])
         house_gap_cfg = gap_cfg.get(self.house_alias)
         drop_rows = pd.Series(False, index=df.index)
-        n_flags = 0
         for z in self.zones:
             heatcall_col = f"zone{z}_heatcall_fraction"
             temp_col = f"zone{z}_avg_temp"
@@ -300,114 +373,26 @@ class HouseEnergyParamsComputer:
             heat_on_but_warm = (df[heatcall_col] > 0.01) & (temp_above_set >= min_gap)
             broken = heat_off_but_cold | heat_on_but_warm
             drop_rows |= broken
-            n_flags += int(heat_off_but_cold.sum()) + int(heat_on_but_warm.sum())
             for hour_start, temp, setpoint in df.loc[
                 heat_off_but_cold, ["hour_start", temp_col, setpoint_col]
             ].itertuples(index=False):
-                self._log_debug(
-                    f"Broken thermostat (zone {z}, heat off while cold): hour_start={hour_start} "
-                    f"{temp_col}={temp} < {setpoint_col}={setpoint}, {heatcall_col}=0"
-                )
+                self._log_debug(f"Broken thermostat (zone {z}): hour_start={hour_start} temp={temp} < set={setpoint}, heatcall=0")
             for hour_start, temp, setpoint, heatcall in df.loc[
                 heat_on_but_warm, ["hour_start", temp_col, setpoint_col, heatcall_col]
             ].itertuples(index=False):
-                self._log_debug(
-                    f"Broken thermostat (zone {z}, heat on while warm): hour_start={hour_start} "
-                    f"{setpoint_col}={setpoint} < {temp_col}={temp}, {heatcall_col}={heatcall}"
-                )
-        n_drop = int(drop_rows.sum())
-        self._log_info(f"Broken thermostat: {n_flags} flagged row-zone hours, dropped {n_drop} rows")
-        return df.loc[~drop_rows].reset_index(drop=True)
-
-    def _thermostat_change(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Drop hours when any zone's thermostat setpoint changed from the prior hour."""
-        drop_rows = pd.Series(False, index=df.index)
-        n_flags = 0
-        for z in self.zones:
-            setpoint_col = f"zone{z}_avg_set"
-            prev_setpoint = df[setpoint_col].shift(1)
-            prev_hour = df["hour_start"].shift(1)
-            consecutive = (df["hour_start"] - prev_hour) == pd.Timedelta(hours=1)
-            changed = (
-                consecutive
-                & df[setpoint_col].notna()
-                & prev_setpoint.notna()
-                & (df[setpoint_col] != prev_setpoint)
-            )
-            drop_rows |= changed
-            n_flags += int(changed.sum())
-            for hour_start, previous, new_set in zip(
-                df.loc[changed, "hour_start"],
-                prev_setpoint.loc[changed],
-                df.loc[changed, setpoint_col],
-                strict=True,
-            ):
-                self._log_debug(
-                    f"Thermostat setpoint change (zone {z}): hour_start={hour_start} "
-                    f"{setpoint_col} {previous} -> {new_set}"
-                )
-        n_drop = int(drop_rows.sum())
-        self._log_info(
-            f"Thermostat setpoint change: {n_flags} flagged row-zone hours, dropped {n_drop} rows"
-        )
-        return df.loc[~drop_rows].reset_index(drop=True)
-
-    def _used_oil_boiler(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Flag and drop hours when average oil boiler power was on."""
-        if "oil_boiler_pwr" not in df.columns:
-            return df
-
-        threshold = self.OIL_BOILER_POWER_THRESHOLD_WATTS
-        used = df["oil_boiler_pwr"] > threshold
-        for hour_start, pwr in df.loc[
-            used, ["hour_start", "oil_boiler_pwr"]
-        ].itertuples(index=False):
-            self._log_debug(
-                f"Oil boiler used: hour_start={hour_start} "
-                f"oil_boiler_pwr={pwr}W > {threshold}W"
-            )
-        n_drop = int(used.sum())
-        self._log_info(f"Oil boiler: {n_drop} flagged hours, dropped {n_drop} rows")
-        return df.loc[~used].reset_index(drop=True)
-    
-    def _below_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Flag and drop hours when any zone's avg temp is at least min gap below its setpoint."""
-        min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
-        drop_rows = pd.Series(False, index=df.index)
-        n_flags = 0
-        for z in self.zones:
-            temp_col = f"zone{z}_avg_temp"
-            setpoint_col = f"zone{z}_avg_set"
-            below_setpoint = (df[setpoint_col] - df[temp_col]) >= min_gap
-            drop_rows |= below_setpoint
-            n_flags += int(below_setpoint.sum())
-            for hour_start, temp, setpoint in df.loc[
-                below_setpoint, ["hour_start", temp_col, setpoint_col]
-            ].itertuples(index=False):
-                self._log_debug(
-                    f"Below setpoint (zone {z}): hour_start={hour_start} "
-                    f"{setpoint_col}={setpoint} - {temp_col}={temp} >= {min_gap}°F"
-                )
-        n_drop = int(drop_rows.sum())
-        self._log_info(f"Below setpoint: {n_flags} flagged row-zone hours, dropped {n_drop} rows")
+                self._log_debug(f"Broken thermostat (zone {z}): hour_start={hour_start} set={setpoint} < temp={temp}, heatcall={heatcall}")
+        self._log_info(f"Broken thermostat: dropped {int(drop_rows.sum())} rows")
         return df.loc[~drop_rows].reset_index(drop=True)
 
     def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Flag hours that suggest heating without a heat call (e.g. sun, stove).
-
-        Per zone, uses EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F (default 3 °F).
-
-        Triggers when:
+        """
+        Drop hours that suggest heating without a heat call (e.g. sun, fireplace):
         - heatcall_fraction == 0, and
-        - avg_temp - avg_set >= that threshold, and
-        - no other zone has avg_temp strictly above this zone's avg_temp (warmth
-          from another zone is excluded).
-
-        Any hour flagged in any zone is removed from the dataframe.
+        - avg_temp - avg_set >= threshold, and
+        - no other zone has avg_temp strictly above this zone's avg_temp (warmth from another zone is excluded).
         """
         min_gap = self.EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F
         drop_rows = pd.Series(False, index=df.index)
-        n_flags = 0
         for z in self.zones:
             heatcall_col = f"zone{z}_heatcall_fraction"
             temp_col = f"zone{z}_avg_temp"
@@ -416,12 +401,9 @@ class HouseEnergyParamsComputer:
             external_heat = (df[heatcall_col] == 0) & (temp_above_set >= min_gap)
             other_zones = [other_z for other_z in self.zones if other_z != z]
             if other_zones:
-                max_other_temp = df[[f"zone{other_z}_avg_temp" for other_z in other_zones]].max(
-                    axis=1
-                )
+                max_other_temp = df[[f"zone{other_z}_avg_temp" for other_z in other_zones]].max(axis=1)
                 external_heat &= max_other_temp <= df[temp_col]
             drop_rows |= external_heat
-            n_flags += int(external_heat.sum())
             for hour_start, oat_f, temp, setpoint in df.loc[
                 external_heat, ["hour_start", "oat_f", temp_col, setpoint_col]
             ].itertuples(index=False):
@@ -430,65 +412,8 @@ class HouseEnergyParamsComputer:
                     f"oat_f={oat_f}, {temp_col}={temp} >= {setpoint_col}={setpoint} + {min_gap}°F, "
                     f"{heatcall_col}=0"
                 )
-        n_drop = int(drop_rows.sum())
-        self._log_info(f"External heat source: {n_flags} flagged row-zone hours, dropped {n_drop} rows")
+        self._log_info(f"External heat source: dropped {int(drop_rows.sum())} rows")
         return df.loc[~drop_rows].reset_index(drop=True)
-
-    def _plot_data_distribution(self, df_before: pd.DataFrame, df_after: pd.DataFrame) -> None:
-        import matplotlib.pyplot as plt
-
-        channels = [
-            c
-            for c in self.required
-            if not (str(c).startswith("zone") and str(c).endswith("_heatcall_fraction"))
-        ]
-        n_channels = len(channels)
-        col_width_in = 1.75
-        fig, axes = plt.subplots(
-            2,
-            n_channels,
-            figsize=(col_width_in * n_channels + 1.25, 8),
-            squeeze=False,
-            gridspec_kw={"wspace": 0.75},
-        )
-        row_labels = ("Before cleaning", "After cleaning")
-        for row, (label, df) in enumerate(zip(row_labels, (df_before, df_after))):
-            for col_idx, channel in enumerate(channels):
-                ax = axes[row, col_idx]
-                ax.boxplot(df[channel].dropna().to_numpy(), vert=True, widths=0.22)
-                if row == 0:
-                    n_nans = int(df_before[channel].isna().sum())
-                    nan_label = "NaN" if n_nans == 1 else "NaNs"
-                    ax.set_title(f"{channel}\n({n_nans} {nan_label})", fontsize=8)
-                ax.tick_params(axis="x", bottom=False, labelbottom=False)
-                ax.tick_params(axis="y", labelsize=8)
-            axes[row, 0].set_ylabel(label)
-            if row == 1:
-                for z in self.zones:
-                    zone_avg_channels = [
-                        c for c in channels if str(c).startswith(f"zone{z}_avg_")
-                    ]
-                    if not zone_avg_channels:
-                        continue
-                    zone_avg_values = np.concatenate(
-                        [df[channel].dropna().to_numpy() for channel in zone_avg_channels]
-                    )
-                    if not zone_avg_values.size:
-                        continue
-                    y_min = float(zone_avg_values.min())
-                    y_max = float(zone_avg_values.max())
-                    pad = max((y_max - y_min) * 0.05, 0.25)
-                    shared_ylim = (y_min - pad, y_max + pad)
-                    zone_avg_set = set(zone_avg_channels)
-                    for col_idx, channel in enumerate(channels):
-                        if channel in zone_avg_set:
-                            axes[row, col_idx].set_ylim(shared_ylim)
-        fig.suptitle(f"{self.house_alias.capitalize()}: channel distributions")
-        fig.tight_layout()
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-        savepath = self.results_dir / f"{self.house_alias}_channel_boxplots.png"
-        fig.savefig(savepath, dpi=150, bbox_inches="tight")
-        plt.close(fig)
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float | None = None) -> np.ndarray:
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
@@ -857,14 +782,6 @@ class HouseEnergyParamsComputer:
         )
         plt.close(fig)
 
-    def _oat_colors(self, oat_f):
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import Normalize
-
-        oat_f = np.asarray(oat_f, dtype=float)
-        vmin, vmax = self.oat_color_range_f
-        return oat_f, Normalize(vmin=vmin, vmax=vmax), plt.cm.coolwarm
-
     def plot_pred_vs_actual(
         self,
         predicted: np.ndarray,
@@ -878,13 +795,19 @@ class HouseEnergyParamsComputer:
     ) -> None:
         import matplotlib.pyplot as plt
         from matplotlib.cm import ScalarMappable
+        from matplotlib.colors import Normalize
 
         predicted = np.asarray(predicted)
         actual = np.asarray(actual)
-        oat_f = np.asarray(oat_f)
+        oat_values = np.asarray(oat_f, dtype=float)
         errors = predicted - actual
 
-        oat_values, norm, cmap = self._oat_colors(oat_f)
+        oat_min = float(self.df["oat_f"].min())
+        oat_max = float(self.df["oat_f"].max())
+        if oat_min >= oat_max:
+            oat_max = oat_min + 1.0
+        norm = Normalize(vmin=oat_min, vmax=oat_max)
+        cmap = plt.cm.coolwarm
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
