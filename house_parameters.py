@@ -162,9 +162,9 @@ class HouseEnergyParamsComputer:
         df = df.drop(0).reset_index(drop=True)
         df["windspeed_times_65_minus_oat"] = df["ws_mph"] * (65.0 - df["oat_f"])
         if self.INCLUDE_OCCUPANCY:
-            hour = int(df["hour_start"].dt.hour)
-            is_weekday = int(df["hour_start"].dt.dayofweek) < 5
-            is_weekend = not is_weekday
+            hour = df["hour_start"].dt.hour
+            is_weekday = df["hour_start"].dt.dayofweek < 5
+            is_weekend = ~is_weekday
             for occupancy_hour in self.OCCUPANCY_INDIVIDUAL_HOURS:
                 at_hour = hour == occupancy_hour
                 df[f"wd_hour_{occupancy_hour}"] = (is_weekday & at_hour).astype(float)
