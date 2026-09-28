@@ -1,11 +1,14 @@
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+from get_data import HouseParamsDataFetcher
 from plots import (
     plot_oos_residual_by_hour_of_day,
     plot_oos_rmse_by_lead,
@@ -26,33 +29,8 @@ class HouseEnergyParams:
 
 
 class HouseEnergyParamsComputer:
-    # Features
-    FEATURE_NAMES = (
-        "deltaT",
-        "windspeed_times_deltaT",
-        "solar_w_m2",
-        "previous_dist_kwh_scaled",
-        "OAT_avg_4h",
-        "dist_kwh_scaled_avg_4h",
-    )
-    FEATURE_NAMES_BASELINE = (
-        "oat_f",
-        "windspeed_times_65_minus_oat",
-    )
-
-    # Occupancy features
-    INCLUDE_OCCUPANCY: bool = True
-    OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
-    WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
-    WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
-    OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
-
-    # Training
-    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "weekly"
-    GROW_WINDOW_TO_N: bool = False
-    MIN_FIT_WINDOW_DAYS: int = 10
-    FORECAST_HORIZON_HOURS = 48
-    ROLLING_AVG_HOURS = 4
+    # Data source
+    DATA_SOURCE: Literal["database", "csv"] = "csv"
 
     # Data cleaning - erroneous data
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
@@ -80,16 +58,55 @@ class HouseEnergyParamsComputer:
     BELOW_SETPOINT_MIN_TEMP_SET_GAP_F = 1
     EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
 
-    def __init__(self, house_alias: str):
+    # Regression features
+    FEATURE_NAMES = (
+        "deltaT",
+        "windspeed_times_deltaT",
+        "solar_w_m2",
+        "previous_dist_kwh_scaled",
+        "OAT_avg_4h",
+        "dist_kwh_scaled_avg_4h",
+    )
+
+    # Baseline regression features (alpha beta gamma model)
+    FEATURE_NAMES_BASELINE = (
+        "oat_f",
+        "windspeed_times_65_minus_oat",
+    )
+
+    # Occupancy features
+    INCLUDE_OCCUPANCY: bool = True
+    OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
+    WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
+    WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
+    OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
+
+    # Training
+    TRAINING_FREQUENCY: Literal["daily", "weekly"] = "weekly"
+    GROW_WINDOW_TO_N: bool = False
+    MIN_FIT_WINDOW_DAYS: int = 10
+    FORECAST_HORIZON_HOURS = 48
+    ROLLING_AVG_HOURS = 4
+
+    def __init__(
+        self,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+    ) -> None:
         self.house_alias = house_alias
+        self.start_time = start_time
+        self.end_time = end_time
+        self.timezone = timezone
         self.results_dir = Path("results") / house_alias
         self.prepare_data()
         
     def _log_info(self, message: str) -> None:
-        logger.info("[%s] %s", self.house_alias, message)
+        logger.info(f"[{self.house_alias}] {message}")
 
     def _log_debug(self, message: str) -> None:
-        logger.debug("[%s] %s", self.house_alias, message)
+        logger.debug(f"[{self.house_alias}] {message}")
 
     # --------------------------------
     # Data preparation 
@@ -107,16 +124,56 @@ class HouseEnergyParamsComputer:
 
     def _load_data(self) -> None:
         """
-        Loads the data from the CSV file and prepares it for the analysis.
+        Loads house params data from CSV or the database and prepares it for analysis.
         - Sorts by hour_start, and adds a day column.
         - Finds the number of zones
         - Checks that all required columns are present
         """
-        csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
-        df = pd.read_csv(csv_path)
-        self._log_info(f"Length of df: {len(df)} hours")
+        if self.DATA_SOURCE == "csv":
+            csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
+            df = pd.read_csv(csv_path)
+            self._log_info(f"Loaded {csv_path}")
+
+        elif self.DATA_SOURCE == "database":
+            fetcher = HouseParamsDataFetcher(
+                self.house_alias,
+                self.start_time,
+                self.end_time,
+                self.timezone,
+            )
+            channel_data_by_hour_start, csv_fieldnames, zone_numbers = fetcher.fetch()
+            rows: list[dict[str, object]] = []
+            for hour in sorted(channel_data_by_hour_start.keys()):
+                data = channel_data_by_hour_start[hour]
+                row: dict[str, object] = {
+                    "hour_start": hour,
+                    "oat_f": data.get("oat_f", np.nan),
+                    "ws_mph": data.get("ws_mph", np.nan),
+                    "solar_w_m2": data.get("solar_w_m2", np.nan),
+                    "dist_kwh": data.get("dist_kwh", 0.0),
+                    "hp_kwh_th": data.get("hp_kwh_th", 0.0),
+                    "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
+                }
+                for zone in zone_numbers:
+                    row[f"zone{zone}_heatcall_fraction"] = data.get(
+                        f"zone{zone}_heatcall_fraction", 0.0
+                    )
+                for zone in zone_numbers:
+                    row[f"zone{zone}_avg_set"] = data.get(f"zone{zone}_avg_set", np.nan)
+                    row[f"zone{zone}_avg_temp"] = data.get(f"zone{zone}_avg_temp", np.nan)
+                rows.append(row)
+            df = pd.DataFrame(rows, columns=csv_fieldnames)
+            self._log_info(f"Loaded data from database ({len(df)} rows)")
+
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
+        range_start = self.start_time.astimezone(self.timezone).replace(tzinfo=None)
+        range_end = self.end_time.astimezone(self.timezone).replace(tzinfo=None)
+        df = df[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
+        self._log_info(
+            f"Cropped datafrom {range_start.isoformat()} to "
+            f"{range_end.isoformat()} ({self.timezone})"
+        )
         df = df.sort_values("hour_start").reset_index(drop=True)
         df["day"] = df["hour_start"].dt.normalize()
 
@@ -137,7 +194,7 @@ class HouseEnergyParamsComputer:
             )
         missing_columns = [col for col in self.required if col not in df.columns]
         if missing_columns:
-            raise ValueError(f"Missing required columns in CSV for {self.house_alias}: {missing_columns}")
+            raise ValueError(f"Missing required columns for {self.house_alias}: {missing_columns}")
         
         self.df = df
 
