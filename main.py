@@ -1,8 +1,11 @@
 import logging
 
-from house_parameters import HouseEnergyParamsComputer, logger
+from house_parameters import HouseEnergyParamsComputer
 
-logger.setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(levelname)s: %(message)s"
+)
 
 HOUSE_ALIASES = [
     "beech",

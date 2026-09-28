@@ -1,6 +1,5 @@
 import glob
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -8,21 +7,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
-RESULTS_DIR = Path("results")
 logger = logging.getLogger(__name__)
-
-
-def _init_module_logging() -> None:
-    level_name = os.environ.get("HOUSE_PARAMS_LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    logger.setLevel(level)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        logger.addHandler(handler)
-
-
-_init_module_logging()
 
 
 @dataclass
@@ -103,7 +88,7 @@ class HouseEnergyParamsComputer:
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
-        self.results_dir = RESULTS_DIR / house_alias
+        self.results_dir = Path("results") / house_alias
         self.load_data()
 
     def _log_info(self, message: str) -> None:
@@ -150,7 +135,6 @@ class HouseEnergyParamsComputer:
         # Clean the data
         df_before_cleaning = df.copy()
         df = self._remove_erroneous_data(df)
-        df = self._remove_outliers(df)
         df = self._handle_missing_data(df)
         df = self._filter_out_known_bad_data(df)
         # self._plot_data_distribution(df_before_cleaning, df)
@@ -234,9 +218,6 @@ class HouseEnergyParamsComputer:
             df[channel] = df[channel].where(roc_ok | df[channel].isna())
         self._log_info(f"Erroneous data (rate of change): {nans_added_roc} NaNs added")
 
-        return df
-
-    def _remove_outliers(self, df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     def _handle_missing_data(self, df: pd.DataFrame) -> pd.DataFrame:
