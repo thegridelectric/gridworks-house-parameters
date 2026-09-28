@@ -62,7 +62,7 @@ For every training day, we fit the model on the last N calendar days ending that
 
 Training is done weekly or daily, depending on the `TRAINING_FREQUENCY` variable.
 
-### Out-of-sample backtest
+### Testing the performance
 
 In this part of the code, we are trying to figure out how well our model predicts the next 48 hours (the default `FORECAST_HORIZON_HOURS`) of house heating load. This is the part that will end up in the weekly report.
 
