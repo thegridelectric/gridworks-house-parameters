@@ -17,21 +17,7 @@ class HouseEnergyParams:
     std_errors: tuple[float, ...]
     r_squared: float
     energy_ratio: float
-    baseline: bool = False
-
-    @property
-    def coef_names(self) -> tuple[str, ...]:
-        return tuple(f"B{i}" for i in range(len(self.values)))
-
-    def coefficients(self) -> np.ndarray:
-        return np.array(self.values, dtype=float)
-
-    def __getattr__(self, name: str):
-        if name.startswith("std_error_B") and name[len("std_error_B"):].isdigit():
-            return self.std_errors[int(name[len("std_error_B"):])]
-        if name.startswith("B") and len(name) > 1 and name[1:].isdigit():
-            return self.values[int(name[1:])]
-        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+    is_baseline: bool = False
 
 
 class HouseEnergyParamsComputer:
@@ -48,22 +34,18 @@ class HouseEnergyParamsComputer:
         "windspeed_times_65_minus_oat",
     )
 
+    # Occupancy features
+    INCLUDE_OCCUPANCY: bool = True
+    OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
+    WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
+    WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
+    OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
+
     # Training
     TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
     GROW_WINDOW_TO_N: bool = False
     FORECAST_HORIZON_HOURS = 48
     
-    # Occupancy
-    INCLUDE_OCCUPANCY: bool = True
-    OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
-    WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(
-        f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS
-    )
-    WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(
-        f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS
-    )
-    OCCUPANCY_FEATURE_NAMES = WEEKDAY_OCCUPANCY_FEATURE_NAMES + WEEKEND_OCCUPANCY_FEATURE_NAMES
-
     # Data cleaning
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
         "oat_f": (-128, 134),
@@ -77,14 +59,14 @@ class HouseEnergyParamsComputer:
     MAX_ABS_RATE_OF_CHANGE_PER_CHANNEL = {
         "oat_f": 25.0,
     }
-    MAX_GAP_HOURS = 4
+    MAX_DATA_GAP_HOURS = 4
+    OIL_BOILER_POWER_THRESHOLD_WATTS = 50
     BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F = {
         'default': 3,
         'beech': {'zone2': 4.5,}
     }
-    EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
     BELOW_SETPOINT_MIN_TEMP_SET_GAP_F = 1
-    OIL_BOILER_POWER_THRESHOLD = 50
+    EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
 
     def __init__(self, house_alias: str):
         self.house_alias = house_alias
@@ -237,7 +219,7 @@ class HouseEnergyParamsComputer:
             is_nan = df[channel].isna()
             block_id = is_nan.ne(is_nan.shift()).cumsum()
             block_len = is_nan.groupby(block_id).transform("size")
-            drop_rows |= is_nan & (block_len >= self.MAX_GAP_HOURS)
+            drop_rows |= is_nan & (block_len >= self.MAX_DATA_GAP_HOURS)
 
         # Interpolate missing data
         n_filled = 0
@@ -266,7 +248,7 @@ class HouseEnergyParamsComputer:
         df = df.loc[~drop_rows]
         df = df.reset_index(names="hour_start")
         self._log_info(
-            f"Long missing-data gaps (>={self.MAX_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows"
+            f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows"
         )
 
         # If any rows still have NaNs, drop them
@@ -375,7 +357,7 @@ class HouseEnergyParamsComputer:
         if "oil_boiler_pwr" not in df.columns:
             return df
 
-        threshold = self.OIL_BOILER_POWER_THRESHOLD
+        threshold = self.OIL_BOILER_POWER_THRESHOLD_WATTS
         used = df["oil_boiler_pwr"] > threshold
         for hour_start, pwr in df.loc[
             used, ["hour_start", "oil_boiler_pwr"]
@@ -550,12 +532,12 @@ class HouseEnergyParamsComputer:
             std_errors=tuple(round(float(e), 6) for e in std_errors),
             r_squared=round(r_squared, 3),
             energy_ratio=round(energy_ratio, 3),
-            baseline=baseline,
+            is_baseline=baseline,
         )
 
     def predict(self, params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
-        X = self.design_matrix(df, baseline=params.baseline, energy_ratio=params.energy_ratio)
-        return np.maximum(X @ params.coefficients(), 0.0)
+        X = self.design_matrix(df, baseline=params.is_baseline, energy_ratio=params.energy_ratio)
+        return np.maximum(X @ np.asarray(params.values, dtype=float), 0.0)
 
     def predict_recursive_horizon(
         self,
@@ -563,7 +545,7 @@ class HouseEnergyParamsComputer:
         origin_index: int,
         horizon: int | None = None,
     ) -> np.ndarray:
-        if params.baseline:
+        if params.is_baseline:
             target = self.df.iloc[origin_index + 1 : origin_index + 1 + (horizon or self.FORECAST_HORIZON_HOURS)]
             return self.predict(params, target)
         if horizon is None:
@@ -748,12 +730,13 @@ class HouseEnergyParamsComputer:
         improvement_mae_percentage = (mae_baseline - mae) / mae_baseline * 100.0
 
         # Save the parameters to a CSV file
-        coef_names = list(results[0].coef_names)
+        n_coef = len(results[0].values)
+        coef_names = [f"B{i}" for i in range(n_coef)]
         params_table = pd.DataFrame(
-            {name: [getattr(r, name) for r in results] for name in coef_names}
+            {name: [r.values[i] for r in results] for i, name in enumerate(coef_names)}
             | {
-                f"std_error_{name}": [getattr(r, f"std_error_{name}") for r in results]
-                for name in coef_names
+                f"std_error_{name}": [r.std_errors[i] for r in results]
+                for i, name in enumerate(coef_names)
             }
             | {
                 "r_squared": [r.r_squared for r in results],
@@ -829,7 +812,8 @@ class HouseEnergyParamsComputer:
             oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=False)
             rmse = oos["rmse"]
             fit_days = oos["fit_days"]
-            b1_values = [r.B1 for r in oos["results"]]
+            delta_t_coef_index = 1 + self.FEATURE_NAMES.index("deltaT")
+            b1_values = [r.values[delta_t_coef_index] for r in oos["results"]]
             b1 = pd.Series(b1_values, index=pd.DatetimeIndex(fit_days)).sort_index()
             if self.TRAINING_FREQUENCY == "daily":
                 b1_stability = b1.rolling("7D").apply(lambda s: s.max() - s.min())
