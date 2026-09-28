@@ -554,6 +554,19 @@ class HouseEnergyParamsComputer:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
 
+    # --------------------------------------------
+    # Get parameters for the last N days of data
+    # --------------------------------------------
+
+    def fit_on_last_n_days(self, n: int) -> HouseEnergyParams:
+        """
+        Fits the model on the last ``n`` calendar days of data.
+        """
+        days = np.sort(self.df["day"].unique())
+        window_days = days[-n:] if len(days) >= n else days
+        window_df = self.df[self.df["day"].isin(window_days)]
+        return self.fit(window_df)
+
     # ---------------------------------------------------------
     # Evaluate the accuracy of the recursive horizon forecasts
     # ---------------------------------------------------------
