@@ -7,6 +7,12 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from plots import (
+    plot_oos_residual_by_hour_of_day,
+    plot_oos_rmse_by_lead,
+    plot_pred_vs_actual,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -77,6 +83,16 @@ class HouseEnergyParamsComputer:
         self.results_dir = Path("results") / house_alias
         self.prepare_data()
         
+    def _log_info(self, message: str) -> None:
+        logger.info("[%s] %s", self.house_alias, message)
+
+    def _log_debug(self, message: str) -> None:
+        logger.debug("[%s] %s", self.house_alias, message)
+
+    # --------------------------------
+    # Data preparation 
+    # --------------------------------
+
     def prepare_data(self) -> None:
         """
         - Loads the data
@@ -86,18 +102,6 @@ class HouseEnergyParamsComputer:
         self._load_data()
         self._clean_data()
         self._engineer_features()
-
-    def _log_info(self, message: str) -> None:
-        logger.info("[%s] %s", self.house_alias, message)
-
-    def _log_debug(self, message: str) -> None:
-        logger.debug("[%s] %s", self.house_alias, message)
-
-    @property # TODO
-    def _artifact_label(self) -> str:
-        window = "_growing" if self.GROW_WINDOW_TO_N else ""
-        occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
-        return f"{self.TRAINING_FREQUENCY}{window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
 
     def _load_data(self) -> None:
         """
@@ -415,24 +419,21 @@ class HouseEnergyParamsComputer:
         self._log_info(f"External heat source: dropped {int(drop_rows.sum())} rows")
         return df.loc[~drop_rows].reset_index(drop=True)
 
-    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float | None = None) -> np.ndarray:
-        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
-        columns = [np.ones(len(df))]
-        for name in feature_names:
-            if name == "previous_dist_kwh_scaled":
-                if energy_ratio is None:
-                    raise ValueError("energy_ratio is required for previous_dist_kwh_scaled")
-                columns.append(df["previous_dist_kwh"].to_numpy(dtype=float) * energy_ratio)
-            else:
-                columns.append(df[name].to_numpy(dtype=float))
-        return np.column_stack(columns)
+    # --------------------------------
+    # Model: fitting and predicting
+    # --------------------------------
 
     def fit(self, df: pd.DataFrame, *, baseline: bool = False) -> HouseEnergyParams:
-        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
-
+        """
+        Fits the linear regression model to the data
+        - Calculates the energy ratio from the data and scales the distribution kWh by it.
+        - Fits the model and returns the parameters.
+        - Can be called for the baseline model (alpha/beta/gamma) too.
+        """
         dist_kwh = df["dist_kwh"].to_numpy()
         energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
-        y = dist_kwh * energy_ratio
+        dist_kwh_scaled = dist_kwh * energy_ratio
+        y = dist_kwh_scaled
         X = self.design_matrix(df, baseline=baseline, energy_ratio=energy_ratio)
 
         coefficients, *_ = np.linalg.lstsq(X, y, rcond=None)
@@ -452,7 +453,7 @@ class HouseEnergyParamsComputer:
             r_squared = 1.0 - ss_res / ss_tot
 
         return HouseEnergyParams(
-            feature_names=feature_names,
+            feature_names=self.FEATURE_NAMES_BASELINE if baseline else self.feature_names,
             values=tuple(round(float(c), 6) for c in coefficients),
             std_errors=tuple(round(float(e), 6) for e in std_errors),
             r_squared=round(r_squared, 3),
@@ -461,171 +462,39 @@ class HouseEnergyParamsComputer:
         )
 
     def predict(self, params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
+        """Predicts the scaled distribution kWh using a given set of parameters and data."""
         X = self.design_matrix(df, baseline=params.is_baseline, energy_ratio=params.energy_ratio)
         return np.maximum(X @ np.asarray(params.values, dtype=float), 0.0)
 
-    def predict_recursive_horizon(
-        self,
-        params: HouseEnergyParams,
-        origin_index: int,
-        horizon: int | None = None,
-    ) -> np.ndarray:
-        if params.is_baseline:
-            target = self.df.iloc[origin_index + 1 : origin_index + 1 + (horizon or self.FORECAST_HORIZON_HOURS)]
-            return self.predict(params, target)
-        if horizon is None:
-            horizon = self.FORECAST_HORIZON_HOURS
-        ratio = params.energy_ratio
-        preds = np.empty(horizon, dtype=float)
-        for step in range(horizon):
-            target_idx = origin_index + 1 + step
-            row = self.df.iloc[[target_idx]].copy()
-            if step > 0:
-                row["previous_dist_kwh"] = preds[step - 1] / ratio
-            preds[step] = self.predict(params, row)[0]
-        return preds
+    def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float) -> np.ndarray:
+        """
+        Constructs the matrix of features for the linear regression model.
+        - Can be used for baseline (alpha/beta/gamma) or non-baseline model.
+        - Scales the previous distribution kWh (by the energy ratio) since the model predicts scaled distribution kWh.
+        """
+        feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
+        columns = [np.ones(len(df))]
+        for name in feature_names:
+            if name == "previous_dist_kwh_scaled":
+                columns.append(df["previous_dist_kwh"].to_numpy(dtype=float) * energy_ratio)
+            else:
+                columns.append(df[name].to_numpy(dtype=float))
+        return np.column_stack(columns)
 
-    def _fit_trailing_models(
-        self, n: int
-    ) -> tuple[list[pd.Timestamp], list[HouseEnergyParams], list[HouseEnergyParams]]:
-        days = np.sort(self.df["day"].unique())
-        fit_days: list[pd.Timestamp] = []
-        results: list[HouseEnergyParams] = []
-        results_baseline: list[HouseEnergyParams] = []
-        last_fit_index: int | None = None
-        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n - 1
-
-        for i in range(first_fit_day_index, len(days)):
-            if self._should_refit_trailing_window(i, days, last_fit_index):
-                window = self._fit_window_days(days, i, n)
-                window_df = self.df[self.df["day"].isin(window)]
-                fit_days.append(days[i])
-                results.append(self.fit(window_df))
-                results_baseline.append(self.fit(window_df, baseline=True))
-                last_fit_index = i
-
-        return fit_days, results, results_baseline
-
-    def _params_index_for_origin_day(
-        self, origin_day: pd.Timestamp, fit_days: list[pd.Timestamp]
-    ) -> int | None:
-        fit_idx = len(fit_days) - 1
-        while fit_idx >= 0 and fit_days[fit_idx] >= origin_day:
-            fit_idx -= 1
-        return fit_idx if fit_idx >= 0 else None
-
-    def _evaluate_recursive_horizon_oos(
-        self,
-        n: int,
-        *,
-        collect_pointwise: bool = False,
-    ) -> dict:
-        horizon = self.FORECAST_HORIZON_HOURS
-        fit_days, results, results_baseline = self._fit_trailing_models(n)
-        if not fit_days:
-            raise ValueError(f"No trailing fits produced for N={n}")
-
-        df = self.df
-        dist_kwh = df["dist_kwh"].to_numpy(dtype=float)
-        max_origin = len(df) - horizon
-
-        errors_by_lead: list[list[float]] = [[] for _ in range(horizon)]
-        errors_baseline_by_lead: list[list[float]] = [[] for _ in range(horizon)]
-        oos_pred: list[float] = []
-        oos_pred_baseline: list[float] = []
-        oos_actual: list[float] = []
-        oos_oat_f: list[float] = []
-        oos_hour_start: list[pd.Timestamp] = []
-        oos_lead1_errors: list[float] = []
-        oos_lead1_hour_start: list[pd.Timestamp] = []
-
-        for origin in range(max_origin):
-            origin_day = df["day"].iloc[origin]
-            fit_idx = self._params_index_for_origin_day(origin_day, fit_days)
-            if fit_idx is None:
-                continue
-
-            params = results[fit_idx]
-            params_baseline = results_baseline[fit_idx]
-            pred = self.predict_recursive_horizon(params, origin, horizon)
-            pred_baseline = self.predict_recursive_horizon(params_baseline, origin, horizon)
-            target_start = origin + 1
-            actual = dist_kwh[target_start : target_start + horizon] * params.energy_ratio
-
-            for step in range(horizon):
-                err = float(pred[step] - actual[step])
-                err_baseline = float(pred_baseline[step] - actual[step])
-                errors_by_lead[step].append(err)
-                errors_baseline_by_lead[step].append(err_baseline)
-
-            if collect_pointwise:
-                oos_pred.extend(pred.tolist())
-                oos_pred_baseline.extend(pred_baseline.tolist())
-                oos_actual.extend(actual.tolist())
-                oos_oat_f.extend(df["oat_f"].iloc[target_start : target_start + horizon].tolist())
-                oos_hour_start.extend(
-                    df["hour_start"].iloc[target_start : target_start + horizon].tolist()
-                )
-                oos_lead1_errors.append(float(pred[0] - actual[0]))
-                oos_lead1_hour_start.append(df["hour_start"].iloc[target_start])
-
-        rmse_by_lead = [
-            float(np.sqrt(np.mean(np.square(errors))))
-            if errors
-            else float("nan")
-            for errors in errors_by_lead
-        ]
-        rmse_baseline_by_lead = [
-            float(np.sqrt(np.mean(np.square(errors))))
-            if errors
-            else float("nan")
-            for errors in errors_baseline_by_lead
-        ]
-        all_errors = [err for lead in errors_by_lead for err in lead]
-        all_errors_baseline = [err for lead in errors_baseline_by_lead for err in lead]
-        rmse = float(np.sqrt(np.mean(np.square(all_errors)))) if all_errors else float("nan")
-        rmse_baseline = (
-            float(np.sqrt(np.mean(np.square(all_errors_baseline))))
-            if all_errors_baseline
-            else float("nan")
-        )
-        mae = float(np.mean(np.abs(all_errors))) if all_errors else float("nan")
-        mae_baseline = (
-            float(np.mean(np.abs(all_errors_baseline))) if all_errors_baseline else float("nan")
-        )
-
-        return {
-            "fit_days": fit_days,
-            "results": results,
-            "results_baseline": results_baseline,
-            "rmse": rmse,
-            "rmse_baseline": rmse_baseline,
-            "mae": mae,
-            "mae_baseline": mae_baseline,
-            "rmse_by_lead": rmse_by_lead,
-            "rmse_baseline_by_lead": rmse_baseline_by_lead,
-            "n_forecast_points": len(all_errors),
-            "oos_pred": np.array(oos_pred),
-            "oos_pred_baseline": np.array(oos_pred_baseline),
-            "oos_actual": np.array(oos_actual),
-            "oos_oat_f": np.array(oos_oat_f),
-            "oos_hour_start": oos_hour_start,
-            "errors": np.array(all_errors),
-            "oos_lead1_errors": np.array(oos_lead1_errors),
-            "oos_lead1_hour_start": oos_lead1_hour_start,
-        }
-
-    def _should_refit_trailing_window(self, day_index: int, days: np.ndarray, last_fit_index: int | None) -> bool:
-        if self.TRAINING_FREQUENCY == "daily" or last_fit_index is None:
-            return True
-        return days[day_index] - days[last_fit_index] >= pd.Timedelta(days=7)
-
-    def _fit_window_days(self, days: np.ndarray, day_index: int, n: int) -> np.ndarray:
-        if self.GROW_WINDOW_TO_N and day_index + 1 < n:
-            return days[0 : day_index + 1]
-        return days[day_index - n + 1 : day_index + 1]
+    # ---------------------------------------------------------
+    # Evaluate the accuracy of the recursive horizon forecasts
+    # ---------------------------------------------------------
 
     def trailing_n_day_fits(self, n: int) -> None:
+        """
+        Repeatedly (daily or weekly, depending on ``TRAINING_FREQUENCY``) refits the house model 
+        on the last ``n`` days of data. When ``GROW_WINDOW_TO_N`` is True and there is less 
+        than ``n`` previous days available, it uses all previous data.
+        
+        For every hour, it takes the latest fit whose training window ends before that hour's day, 
+        runs a recursive ``FORECAST_HORIZON_HOURS``-step ahead prediction, and scores errors against
+        actual scaled_dist_kwh. 
+        """
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
         oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=True)
@@ -698,33 +567,198 @@ class HouseEnergyParamsComputer:
             index=False,
         )
 
-        self.plot_pred_vs_actual(
+        plot_pred_vs_actual(
             oos_pred, oos_actual, oos_oat_f,
             (
                 f"{self.house_alias.capitalize()}: {oos_label} predicted vs actual "
                 f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             ),
+            oat_f_colormap_bounds=(float(self.df["oat_f"].min()), float(self.df["oat_f"].max())),
             savepath=self.results_dir
             / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
             oos_period_label=oos_label,
         )
-        self.plot_oos_residual_by_hour_of_day(
+        plot_oos_residual_by_hour_of_day(
             oos["oos_lead1_errors"],
             oos["oos_lead1_hour_start"],
+            house_alias=self.house_alias,
             savepath=self.results_dir
             / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
             subtitle="first forecast hour (lead 1) only",
         )
-        self.plot_oos_rmse_by_lead(
+        plot_oos_rmse_by_lead(
             rmse_by_lead,
             rmse_baseline_by_lead,
+            house_alias=self.house_alias,
+            forecast_horizon_hours=self.FORECAST_HORIZON_HOURS,
             savepath=self.results_dir
             / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.png",
         )
 
+    def predict_recursive_horizon(self, params: HouseEnergyParams, origin_index: int, horizon: int) -> np.ndarray:
+        """
+        Forecast scaled_dist_kwh for the next ``horizon`` hours after a forecast origin.
+
+        For the main (non-baseline) model,the lagged load feature uses the observed 
+        previous hour for lead 1, then the prior step's prediction for leads 2 onward.
+
+        Returns a length-``horizon`` array of scaled_dist_kwh.
+        """
+        if params.is_baseline:
+            target = self.df.iloc[origin_index + 1 : origin_index + 1 + (horizon or self.FORECAST_HORIZON_HOURS)]
+            return self.predict(params, target)
+        preds = np.empty(horizon, dtype=float)
+        for step in range(horizon):
+            target_idx = origin_index + 1 + step
+            row = self.df.iloc[[target_idx]].copy()
+            if step > 0:
+                row["previous_dist_kwh"] = preds[step - 1] / params.energy_ratio
+            preds[step] = self.predict(params, row)[0]
+        return preds
+
+    def _evaluate_recursive_horizon_oos(self, n: int, *, collect_pointwise: bool = False) -> dict:
+        """
+        Evaluates the recursive horizon out-of-sample predictions.
+        - Fits the trailing models.
+        - Predicts the distribution kWh for the given dataframe using the given parameters.
+        - Returns the predicted distribution kWh.
+        """
+        horizon = self.FORECAST_HORIZON_HOURS
+        days = np.sort(self.df["day"].unique())
+        fit_days: list[pd.Timestamp] = []
+        results: list[HouseEnergyParams] = []
+        results_baseline: list[HouseEnergyParams] = []
+        last_fit_index: int | None = None
+        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n - 1
+
+        for i in range(first_fit_day_index, len(days)):
+            should_refit = (
+                self.TRAINING_FREQUENCY == "daily"
+                or last_fit_index is None
+                or days[i] - days[last_fit_index] >= pd.Timedelta(days=7)
+            )
+            if should_refit:
+                if self.GROW_WINDOW_TO_N and i + 1 < n:
+                    window = days[0 : i + 1]
+                else:
+                    window = days[i - n + 1 : i + 1]
+                window_df = self.df[self.df["day"].isin(window)]
+                fit_days.append(days[i])
+                results.append(self.fit(window_df))
+                results_baseline.append(self.fit(window_df, baseline=True))
+                last_fit_index = i
+
+        if not fit_days:
+            raise ValueError(f"No trailing fits produced for N={n}")
+
+        df = self.df
+        dist_kwh = df["dist_kwh"].to_numpy(dtype=float)
+        max_origin = len(df) - horizon
+
+        errors_by_lead: list[list[float]] = [[] for _ in range(horizon)]
+        errors_baseline_by_lead: list[list[float]] = [[] for _ in range(horizon)]
+        oos_pred: list[float] = []
+        oos_pred_baseline: list[float] = []
+        oos_actual: list[float] = []
+        oos_oat_f: list[float] = []
+        oos_hour_start: list[pd.Timestamp] = []
+        oos_lead1_errors: list[float] = []
+        oos_lead1_hour_start: list[pd.Timestamp] = []
+
+        for origin in range(max_origin):
+            origin_day = df["day"].iloc[origin]
+            fit_idx = len(fit_days) - 1
+            while fit_idx >= 0 and fit_days[fit_idx] >= origin_day:
+                fit_idx -= 1
+            if fit_idx < 0:
+                continue
+
+            params = results[fit_idx]
+            params_baseline = results_baseline[fit_idx]
+            pred = self.predict_recursive_horizon(params, origin, horizon)
+            pred_baseline = self.predict_recursive_horizon(params_baseline, origin, horizon)
+            target_start = origin + 1
+            actual = dist_kwh[target_start : target_start + horizon] * params.energy_ratio
+
+            for step in range(horizon):
+                err = float(pred[step] - actual[step])
+                err_baseline = float(pred_baseline[step] - actual[step])
+                errors_by_lead[step].append(err)
+                errors_baseline_by_lead[step].append(err_baseline)
+
+            if collect_pointwise:
+                oos_pred.extend(pred.tolist())
+                oos_pred_baseline.extend(pred_baseline.tolist())
+                oos_actual.extend(actual.tolist())
+                oos_oat_f.extend(df["oat_f"].iloc[target_start : target_start + horizon].tolist())
+                oos_hour_start.extend(
+                    df["hour_start"].iloc[target_start : target_start + horizon].tolist()
+                )
+                oos_lead1_errors.append(float(pred[0] - actual[0]))
+                oos_lead1_hour_start.append(df["hour_start"].iloc[target_start])
+
+        rmse_by_lead = [
+            float(np.sqrt(np.mean(np.square(errors))))
+            if errors
+            else float("nan")
+            for errors in errors_by_lead
+        ]
+        rmse_baseline_by_lead = [
+            float(np.sqrt(np.mean(np.square(errors))))
+            if errors
+            else float("nan")
+            for errors in errors_baseline_by_lead
+        ]
+        all_errors = [err for lead in errors_by_lead for err in lead]
+        all_errors_baseline = [err for lead in errors_baseline_by_lead for err in lead]
+        rmse = float(np.sqrt(np.mean(np.square(all_errors)))) if all_errors else float("nan")
+        rmse_baseline = (
+            float(np.sqrt(np.mean(np.square(all_errors_baseline))))
+            if all_errors_baseline
+            else float("nan")
+        )
+        mae = float(np.mean(np.abs(all_errors))) if all_errors else float("nan")
+        mae_baseline = (
+            float(np.mean(np.abs(all_errors_baseline))) if all_errors_baseline else float("nan")
+        )
+
+        return {
+            "fit_days": fit_days,
+            "results": results,
+            "results_baseline": results_baseline,
+            "rmse": rmse,
+            "rmse_baseline": rmse_baseline,
+            "mae": mae,
+            "mae_baseline": mae_baseline,
+            "rmse_by_lead": rmse_by_lead,
+            "rmse_baseline_by_lead": rmse_baseline_by_lead,
+            "n_forecast_points": len(all_errors),
+            "oos_pred": np.array(oos_pred),
+            "oos_pred_baseline": np.array(oos_pred_baseline),
+            "oos_actual": np.array(oos_actual),
+            "oos_oat_f": np.array(oos_oat_f),
+            "oos_hour_start": oos_hour_start,
+            "errors": np.array(all_errors),
+            "oos_lead1_errors": np.array(oos_lead1_errors),
+            "oos_lead1_hour_start": oos_lead1_hour_start,
+        }
+
+    @property # TODO
+    def _artifact_label(self) -> str:
+        window = "_growing" if self.GROW_WINDOW_TO_N else ""
+        occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
+        return f"{self.TRAINING_FREQUENCY}{window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
+
+    # ---------------------------------------------------------
+    # Sweep the number of trailing days
+    # ---------------------------------------------------------
+
     def sweep_n(self, min_n: int, max_n: int) -> None:
+        """
+        Sweeps the number of trailing days and plots the RMSE and B1 stability.
+        """
         import matplotlib.pyplot as plt
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
@@ -780,200 +814,4 @@ class HouseEnergyParamsComputer:
             self.results_dir / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
             dpi=150, bbox_inches="tight",
         )
-        plt.close(fig)
-
-    def plot_pred_vs_actual(
-        self,
-        predicted: np.ndarray,
-        actual: np.ndarray,
-        oat_f: np.ndarray,
-        title: str,
-        savepath: Path | None = None,
-        baseline_mae: float | None = None,
-        baseline_rmse: float | None = None,
-        oos_period_label: str = "next-day",
-    ) -> None:
-        import matplotlib.pyplot as plt
-        from matplotlib.cm import ScalarMappable
-        from matplotlib.colors import Normalize
-
-        predicted = np.asarray(predicted)
-        actual = np.asarray(actual)
-        oat_values = np.asarray(oat_f, dtype=float)
-        errors = predicted - actual
-
-        oat_min = float(self.df["oat_f"].min())
-        oat_max = float(self.df["oat_f"].max())
-        if oat_min >= oat_max:
-            oat_max = oat_min + 1.0
-        norm = Normalize(vmin=oat_min, vmax=oat_max)
-        cmap = plt.cm.coolwarm
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-        ax = axes[0]
-        ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
-        hi = float(max(actual.max(), predicted.max()) * 1.05)
-        limits = [0, hi]
-        ax.plot(limits, limits, "k--", linewidth=1)
-        ax.set_xlim(limits)
-        ax.set_ylim(limits)
-        ax.set_xlabel("Actual scaled dist_kwh (kWh)")
-        ax.set_ylabel("Predicted scaled dist_kwh (kWh)")
-        mae = float(np.abs(errors).mean())
-        rmse = float(np.sqrt((errors**2).mean()))
-
-        scatter_title = f"{oos_period_label.capitalize()} out-of-sample predictions"
-        if baseline_mae is not None and baseline_rmse is not None:
-            rmse_pct = (baseline_rmse - rmse) / baseline_rmse * 100.0
-            mae_pct = (baseline_mae - mae) / baseline_mae * 100.0
-            scatter_title += (
-                "\n"
-                + f"RMSE {abs(rmse_pct):.0f}% {'better' if rmse_pct >= 0 else 'worse'}"
-                + ", "
-                + f"MAE {abs(mae_pct):.0f}% {'better' if mae_pct >= 0 else 'worse'}"
-                + " than αβγ"
-            )
-        ax.set_title(scatter_title)
-
-        stats = f"MAE  = {mae:.3f} kWh\n"
-        if baseline_mae is not None:
-            stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
-        stats += f"RMSE = {rmse:.3f} kWh\n"
-        if baseline_rmse is not None:
-            stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
-        stats = stats.rstrip()
-        ax.text(
-            0.97, 0.03, stats, transform=ax.transAxes, ha="right", va="bottom",
-            family="monospace", fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-        )
-
-        ax = axes[1]
-        ax.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
-        ax.axvline(0, color="k", linestyle="--", linewidth=1)
-        ax.set_xlim(-6, 6)
-        ax.set_xlabel("Prediction error (scaled kWh)")
-        ax.set_ylabel("Hours")
-        ax.set_title("Error distribution")
-
-        sm = ScalarMappable(norm=norm, cmap=cmap)
-        cbar = fig.colorbar(sm, ax=list(axes), fraction=0.03, pad=0.02)
-        ticks = np.linspace(norm.vmin, norm.vmax, 6)
-        cbar.set_ticks(ticks)
-        cbar.set_ticklabels([f"{t:.0f}°F" for t in ticks])
-
-        fig.suptitle(title)
-
-        if savepath is not None:
-            fig.savefig(savepath, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-    @staticmethod
-    def _hourly_residual_mean_and_ci95(
-        residuals: np.ndarray, hour_of_day: pd.Series
-    ) -> tuple[np.ndarray, np.ndarray]:
-        by_hour = (
-            pd.DataFrame({"hour": hour_of_day, "residual": residuals})
-            .groupby("hour", sort=True)["residual"]
-            .agg(["mean", "std", "count"])
-            .reindex(range(24))
-        )
-        sem = by_hour["std"] / np.sqrt(by_hour["count"])
-        ci95 = 1.96 * sem
-        ci95 = ci95.where(by_hour["count"] >= 2, 0.0).fillna(0.0)
-        return by_hour["mean"].to_numpy(), ci95.to_numpy()
-
-    def _plot_hourly_residual_bars_on_ax(
-        self,
-        ax,
-        residuals: np.ndarray,
-        hour_of_day: pd.Series,
-        *,
-        house_alias: str,
-        panel_title: str,
-    ) -> None:
-        means, ci95 = self._hourly_residual_mean_and_ci95(residuals, hour_of_day)
-        hours = np.arange(24)
-        ax.bar(
-            hours,
-            means,
-            yerr=ci95,
-            color="tab:blue",
-            alpha=0.85,
-            width=0.8,
-            capsize=3,
-            error_kw={"linewidth": 1, "ecolor": "0.25"},
-        )
-        ax.axhline(0, color="k", linestyle="--", linewidth=1)
-        ax.set_xticks(hours)
-        ax.set_ylabel("Mean residual (predicted − actual, kWh)")
-        ax.set_title(
-            f"{house_alias.capitalize()} - {panel_title} - "
-            f"mean error and 95% CI on energy use prediction"
-        )
-
-    def plot_oos_rmse_by_lead(
-        self,
-        rmse_by_lead: list[float],
-        rmse_baseline_by_lead: list[float],
-        savepath: Path | None = None,
-    ) -> None:
-        import matplotlib.pyplot as plt
-
-        leads = np.arange(1, len(rmse_by_lead) + 1)
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(leads, rmse_by_lead, "o-", label="Model", color="tab:blue")
-        ax.plot(leads, rmse_baseline_by_lead, "s--", label="Baseline", color="tab:orange")
-        ax.set_xlabel("Forecast lead (hours ahead)")
-        ax.set_ylabel("RMSE (kWh)")
-        ax.set_title(
-            f"{self.house_alias.capitalize()}: out-of-sample RMSE by lead "
-            f"({self.FORECAST_HORIZON_HOURS}h recursive load)"
-        )
-        ax.set_xticks([1, 6, 12, 24, 36, 48])
-        ax.legend()
-        fig.tight_layout()
-        if savepath is not None:
-            fig.savefig(savepath, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
-    def plot_oos_residual_by_hour_of_day(
-        self,
-        residuals: np.ndarray,
-        hour_starts,
-        savepath: Path | None = None,
-        subtitle: str | None = None,
-    ) -> None:
-        import matplotlib.pyplot as plt
-
-        residuals = np.asarray(residuals, dtype=float)
-        timestamps = pd.to_datetime(hour_starts)
-        hour_of_day = timestamps.hour
-        weekend_mask = np.asarray(timestamps.dayofweek >= 5, dtype=bool)
-
-        fig, axes = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
-        panels = (
-            ("Weekday", ~weekend_mask),
-            ("Weekend", weekend_mask),
-        )
-        for ax, (panel_title, mask) in zip(axes, panels):
-            panel_residuals = residuals[mask]
-            panel_hours = hour_of_day[mask]
-            self._plot_hourly_residual_bars_on_ax(
-                ax,
-                panel_residuals,
-                panel_hours,
-                house_alias=self.house_alias,
-                panel_title=panel_title,
-            )
-        for ax in axes:
-            ax.set_xlabel("Hour of day")
-            ax.tick_params(axis="x", labelbottom=True)
-            ax.set_ylim(-1.5, 1.5)
-        if subtitle:
-            fig.suptitle(subtitle, fontsize=11, y=1.02)
-        fig.tight_layout()
-        if savepath is not None:
-            fig.savefig(savepath, dpi=150, bbox_inches="tight")
         plt.close(fig)
