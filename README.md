@@ -36,6 +36,8 @@ $$
 
 We load hourly data from the database or from `data/{house}_house_params_data.csv` (depending on the `DATA_SOURCE` variable). We then crop to `[start_time, end_time)`.
 
+Note: When loading from the database, queries do not yet populate weather columns (`oat_f`, `ws_mph`, `solar_w_m2`). Those fields are necessary for the regression, and I'm working on getting them populated through the database path too.
+
 After data cleaning, we either fit the model on the last N calendar days ending that day (or all days so far if `GROW_WINDOW_TO_N` is True). This gives the parameters that we will use to make 48-hour predictions.
 
 If we are interested in the model's performance over past data, we can simulate a backtest. Use `trailing_n_day_fits(n)` for one lookback *N*, or `sweep_n` to try several values of *N*.
