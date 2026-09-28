@@ -33,6 +33,7 @@ class HouseEnergyParamsComputer:
         "solar_w_m2",
         "previous_dist_kwh_scaled",
         "OAT_avg_6h",
+        "dist_kwh_scaled_avg_6h",
     )
     FEATURE_NAMES_BASELINE = (
         "oat_f",
@@ -152,7 +153,7 @@ class HouseEnergyParamsComputer:
     def _engineer_features(self) -> None:
         """
         Adds engineered columns to the dataframe and sets self.feature_names.
-        (OAT_avg_6h is built during missing-data handling in _clean_data.)
+        (OAT_avg_6h and dist_kwh_avg_6h are built during missing-data handling in _clean_data.)
         """
         df = self.df.copy()
         setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
@@ -228,6 +229,7 @@ class HouseEnergyParamsComputer:
         - Marks rows inside long missing-data gaps
         - Interpolates missing data
         - Computes average OAT over last 6 hours when the start and end value are not interpolated, otherwise drops the row
+        - Computes average dist_kwh over last 6 hours only when all six hours are not interpolated, otherwise drops the row
         - Drops rows inside missing-data gaps
         - Drops remaining rows that contain NaNs
         """
@@ -252,6 +254,7 @@ class HouseEnergyParamsComputer:
         # Interpolate missing data
         n_filled = 0
         oat_f_interpolated = pd.Series(False, index=df.index)
+        dist_kwh_interpolated = pd.Series(False, index=df.index)
         for channel in df.columns:
             if channel == "day":
                 continue
@@ -263,14 +266,24 @@ class HouseEnergyParamsComputer:
             n_filled += int(filled.sum())
             if channel == "oat_f":
                 oat_f_interpolated |= filled
+            if channel == "dist_kwh":
+                dist_kwh_interpolated |= filled
         self._log_info(f"Interpolation: {n_filled} values filled")
 
-        # Compute average OAT over last 6 hours
+        # Compute average OAT and dist_kwh over last 6 hours
         oat_mean_6h = df["oat_f"].rolling(6).mean().shift(1)
         first_oat_observed = (~oat_f_interpolated) & df["oat_f"].notna()
-        endpoints_ok = first_oat_observed.shift(6) & first_oat_observed.shift(1)
-        df["OAT_avg_6h"] = oat_mean_6h.where(endpoints_ok)
-        df = df[df["OAT_avg_6h"].notna()]
+        oat_endpoints_ok = first_oat_observed.shift(6) & first_oat_observed.shift(1)
+        df["OAT_avg_6h"] = oat_mean_6h.where(oat_endpoints_ok)
+
+        dist_kwh_mean_6h = df["dist_kwh"].rolling(6).mean().shift(1)
+        first_dist_kwh_observed = (~dist_kwh_interpolated) & df["dist_kwh"].notna()
+        dist_kwh_window_ok = first_dist_kwh_observed.shift(1)
+        for lag in range(2, 7):
+            dist_kwh_window_ok &= first_dist_kwh_observed.shift(lag)
+        df["dist_kwh_avg_6h"] = dist_kwh_mean_6h.where(dist_kwh_window_ok)
+
+        df = df[df["OAT_avg_6h"].notna() & df["dist_kwh_avg_6h"].notna()]
  
         # Drop rows inside missing-data gaps
         df = df.loc[~drop_rows]
@@ -475,8 +488,9 @@ class HouseEnergyParamsComputer:
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
         columns = [np.ones(len(df))]
         for name in feature_names:
-            if name == "previous_dist_kwh_scaled":
-                columns.append(df["previous_dist_kwh"].to_numpy(dtype=float) * energy_ratio)
+            if name in ("previous_dist_kwh_scaled", "dist_kwh_scaled_avg_6h"):
+                raw_col = "previous_dist_kwh" if name == "previous_dist_kwh_scaled" else "dist_kwh_avg_6h"
+                columns.append(df[raw_col].to_numpy(dtype=float) * energy_ratio)
             else:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
