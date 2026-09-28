@@ -22,7 +22,7 @@ $$
 \hat{y} = \max\left(0,\; B_0 + B_1 \Delta T + B_2 (w_s \Delta T) + B_3\,\text{solar} + B_4\,\text{prev} + B_5\,\text{OAT4} + B_6\,\text{load4} + \sum_i B_i\, o_i \right)
 $$
 
-Here prev / OAT4 / load4 match `previous_dist_kwh_scaled`, `OAT_avg_4h`, and `dist_kwh_scaled_avg_4h`. With occupancy on, each `wd_hour_*` / `we_hour_*` column adds another $B_i$ and $o_i$ term.
+ With occupancy on, each `wd_hour_*` (weekday) / `we_hour_*` (weekend) column adds another $B_i$ and $o_i$ term.
 
 ### Baseline
 
@@ -47,7 +47,7 @@ If we are interested in the model's performance over past data, we can simulate 
 3. **Bad operating hours**: we remove such hours from the training data:
    - Oil boiler was running
    - Zone was below setpoint
-   - Setpoint changed from the previous hour
+   - Setpoint changed from the previous hour (working on removing also the next hours while we wait for the temperature to reach the new setpoint)
    - Broken thermostat (no heat calls although the temperature is below setpoint, or heat calls but the temperature is above setpoint)
 
 ### Feature engineering
