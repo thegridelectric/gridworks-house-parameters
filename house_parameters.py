@@ -1,4 +1,3 @@
-import glob
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +49,7 @@ class HouseEnergyParamsComputer:
     # Training
     TRAINING_FREQUENCY: Literal["daily", "weekly"] = "daily"
     GROW_WINDOW_TO_N: bool = False
+    MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
     
     # Data cleaning - erroneous data
@@ -489,7 +489,8 @@ class HouseEnergyParamsComputer:
         """
         Repeatedly (daily or weekly, depending on ``TRAINING_FREQUENCY``) refits the house model 
         on the last ``n`` days of data. When ``GROW_WINDOW_TO_N`` is True and there is less 
-        than ``n`` previous days available, it uses all previous data.
+        than ``n`` previous days available, it uses all previous data (but not until at least
+        ``MIN_FIT_WINDOW_DAYS`` calendar days are available).
         
         For every hour, it takes the latest fit whose training window ends before that hour's day, 
         runs a recursive ``FORECAST_HORIZON_HOURS``-step ahead prediction, and scores errors against
@@ -498,20 +499,21 @@ class HouseEnergyParamsComputer:
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
         oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=True)
+
+        # Collect the results
         fit_days = oos["fit_days"]
         results = oos["results"]
         oos_pred = oos["oos_pred"]
-        oos_pred_baseline = oos["oos_pred_baseline"]
         oos_actual = oos["oos_actual"]
         oos_oat_f = oos["oos_oat_f"]
-        oos_hour_start = oos["oos_hour_start"]
-        errors = oos["errors"]
         mae = oos["mae"]
         rmse = oos["rmse"]
         mae_baseline = oos["mae_baseline"]
         rmse_baseline = oos["rmse_baseline"]
         rmse_by_lead = oos["rmse_by_lead"]
         rmse_baseline_by_lead = oos["rmse_baseline_by_lead"]
+        improvement_rmse_percentage = (rmse_baseline - rmse) / rmse_baseline * 100.0
+        improvement_mae_percentage = (mae_baseline - mae) / mae_baseline * 100.0
 
         oos_label = f"recursive {self.FORECAST_HORIZON_HOURS}h"
         self._log_info(
@@ -520,10 +522,7 @@ class HouseEnergyParamsComputer:
             f"from {pd.Timestamp(fit_days[0]).date()} to {pd.Timestamp(fit_days[-1]).date()}"
         )
 
-        improvement_rmse_percentage = (rmse_baseline - rmse) / rmse_baseline * 100.0
-        improvement_mae_percentage = (mae_baseline - mae) / mae_baseline * 100.0
-
-        # Save the parameters to a CSV file
+        # Save the learned model parameters to a CSV file
         n_coef = len(results[0].values)
         coef_names = [f"B{i}" for i in range(n_coef)]
         params_table = pd.DataFrame(
@@ -549,11 +548,9 @@ class HouseEnergyParamsComputer:
             f"RMSE = {rmse:.2f} kWh (baseline {rmse_baseline:.2f} kWh, "
             f"{improvement_rmse_percentage:.1f}% improvement)"
         )
-        self._log_info(
-            "RMSE by lead (kWh): "
-            + ", ".join(f"{h}h={rmse_by_lead[h - 1]:.2f}" for h in (1, 6, 12, 24, 48))
-        )
+        self._log_info("RMSE by lead (kWh): " + ", ".join(f"{h}h={rmse_by_lead[h - 1]:.2f}" for h in (1, 6, 12, 24, 48)))
 
+        # Save the RMSE by lead (number of hours ahead of the forecast origin) to a CSV
         rmse_by_lead_df = pd.DataFrame(
             {
                 "lead_hour": range(1, self.FORECAST_HORIZON_HOURS + 1),
@@ -567,6 +564,7 @@ class HouseEnergyParamsComputer:
             index=False,
         )
 
+        # Plots
         plot_pred_vs_actual(
             oos_pred, oos_actual, oos_oat_f,
             (
@@ -574,8 +572,7 @@ class HouseEnergyParamsComputer:
                 f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             ),
             oat_f_colormap_bounds=(float(self.df["oat_f"].min()), float(self.df["oat_f"].max())),
-            savepath=self.results_dir
-            / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
             oos_period_label=oos_label,
@@ -584,8 +581,7 @@ class HouseEnergyParamsComputer:
             oos["oos_lead1_errors"],
             oos["oos_lead1_hour_start"],
             house_alias=self.house_alias,
-            savepath=self.results_dir
-            / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
             subtitle="first forecast hour (lead 1) only",
         )
         plot_oos_rmse_by_lead(
@@ -593,8 +589,7 @@ class HouseEnergyParamsComputer:
             rmse_baseline_by_lead,
             house_alias=self.house_alias,
             forecast_horizon_hours=self.FORECAST_HORIZON_HOURS,
-            savepath=self.results_dir
-            / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.png",
         )
 
     def predict_recursive_horizon(self, params: HouseEnergyParams, origin_index: int, horizon: int) -> np.ndarray:
@@ -621,9 +616,8 @@ class HouseEnergyParamsComputer:
     def _evaluate_recursive_horizon_oos(self, n: int, *, collect_pointwise: bool = False) -> dict:
         """
         Evaluates the recursive horizon out-of-sample predictions.
-        - Fits the trailing models.
-        - Predicts the distribution kWh for the given dataframe using the given parameters.
-        - Returns the predicted distribution kWh.
+        - Fits the trailing (or growing-to-N) models.
+        - Scores recursive multi-step forecasts at each origin hour.
         """
         horizon = self.FORECAST_HORIZON_HOURS
         days = np.sort(self.df["day"].unique())
@@ -631,7 +625,10 @@ class HouseEnergyParamsComputer:
         results: list[HouseEnergyParams] = []
         results_baseline: list[HouseEnergyParams] = []
         last_fit_index: int | None = None
-        first_fit_day_index = 0 if self.GROW_WINDOW_TO_N else n - 1
+        if self.GROW_WINDOW_TO_N:
+            first_fit_day_index = max(self.MIN_FIT_WINDOW_DAYS - 1, 0)
+        else:
+            first_fit_day_index = n - 1
 
         for i in range(first_fit_day_index, len(days)):
             should_refit = (
@@ -660,10 +657,8 @@ class HouseEnergyParamsComputer:
         errors_by_lead: list[list[float]] = [[] for _ in range(horizon)]
         errors_baseline_by_lead: list[list[float]] = [[] for _ in range(horizon)]
         oos_pred: list[float] = []
-        oos_pred_baseline: list[float] = []
         oos_actual: list[float] = []
         oos_oat_f: list[float] = []
-        oos_hour_start: list[pd.Timestamp] = []
         oos_lead1_errors: list[float] = []
         oos_lead1_hour_start: list[pd.Timestamp] = []
 
@@ -690,12 +685,8 @@ class HouseEnergyParamsComputer:
 
             if collect_pointwise:
                 oos_pred.extend(pred.tolist())
-                oos_pred_baseline.extend(pred_baseline.tolist())
                 oos_actual.extend(actual.tolist())
                 oos_oat_f.extend(df["oat_f"].iloc[target_start : target_start + horizon].tolist())
-                oos_hour_start.extend(
-                    df["hour_start"].iloc[target_start : target_start + horizon].tolist()
-                )
                 oos_lead1_errors.append(float(pred[0] - actual[0]))
                 oos_lead1_hour_start.append(df["hour_start"].iloc[target_start])
 
@@ -727,7 +718,6 @@ class HouseEnergyParamsComputer:
         return {
             "fit_days": fit_days,
             "results": results,
-            "results_baseline": results_baseline,
             "rmse": rmse,
             "rmse_baseline": rmse_baseline,
             "mae": mae,
@@ -736,11 +726,8 @@ class HouseEnergyParamsComputer:
             "rmse_baseline_by_lead": rmse_baseline_by_lead,
             "n_forecast_points": len(all_errors),
             "oos_pred": np.array(oos_pred),
-            "oos_pred_baseline": np.array(oos_pred_baseline),
             "oos_actual": np.array(oos_actual),
             "oos_oat_f": np.array(oos_oat_f),
-            "oos_hour_start": oos_hour_start,
-            "errors": np.array(all_errors),
             "oos_lead1_errors": np.array(oos_lead1_errors),
             "oos_lead1_hour_start": oos_lead1_hour_start,
         }
@@ -748,8 +735,13 @@ class HouseEnergyParamsComputer:
     @property # TODO
     def _artifact_label(self) -> str:
         window = "_growing" if self.GROW_WINDOW_TO_N else ""
+        min_window = (
+            f"_min{self.MIN_FIT_WINDOW_DAYS}"
+            if self.GROW_WINDOW_TO_N and self.MIN_FIT_WINDOW_DAYS > 1
+            else ""
+        )
         occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
-        return f"{self.TRAINING_FREQUENCY}{window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
+        return f"{self.TRAINING_FREQUENCY}{window}{min_window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
 
     # ---------------------------------------------------------
     # Sweep the number of trailing days
