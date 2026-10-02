@@ -238,7 +238,7 @@ class HouseParamsDataFetcher:
         return channel_data_by_hour_start, csv_fieldnames, zone_numbers
 
 
-def main() -> int:
+def main() -> None:
 
     HOUSE_ALIAS = "beech"
     LOCAL_TZ = ZoneInfo("America/New_York")

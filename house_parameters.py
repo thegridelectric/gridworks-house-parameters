@@ -165,11 +165,13 @@ class HouseEnergyParamsComputer:
             df = pd.DataFrame(rows, columns=csv_fieldnames)
             self._log_info(f"Loaded data from database ({len(df)} rows)")
 
+        else:
+            raise ValueError(f"Unsupported DATA_SOURCE: {self.DATA_SOURCE!r}")
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
         range_start = self.start_time.astimezone(self.timezone).replace(tzinfo=None)
         range_end = self.end_time.astimezone(self.timezone).replace(tzinfo=None)
-        df = df[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
+        df = df.loc[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
         self._log_info(
             f"Cropped datafrom {range_start.isoformat()} to "
             f"{range_end.isoformat()} ({self.timezone})"
@@ -330,19 +332,19 @@ class HouseEnergyParamsComputer:
 
         # Compute average OAT and dist_kwh over the last ROLLING_AVG_HOURS
         n = self.ROLLING_AVG_HOURS
-        oat_mean = df["oat_f"].rolling(n).mean().shift(1)
+        oat_mean = pd.Series(df["oat_f"].rolling(n).mean(), index=df.index).shift(1)
         first_oat_observed = (~oat_f_interpolated) & df["oat_f"].notna()
         oat_endpoints_ok = first_oat_observed.shift(n) & first_oat_observed.shift(1)
         df["OAT_avg_4h"] = oat_mean.where(oat_endpoints_ok)
 
-        dist_kwh_mean = df["dist_kwh"].rolling(n).mean().shift(1)
+        dist_kwh_mean = pd.Series(df["dist_kwh"].rolling(n).mean(), index=df.index).shift(1)
         first_dist_kwh_observed = (~dist_kwh_interpolated) & df["dist_kwh"].notna()
         dist_kwh_window_ok = first_dist_kwh_observed.shift(1)
         for lag in range(2, n + 1):
             dist_kwh_window_ok &= first_dist_kwh_observed.shift(lag)
         df["dist_kwh_avg_4h"] = dist_kwh_mean.where(dist_kwh_window_ok)
 
-        df = df[df["OAT_avg_4h"].notna() & df["dist_kwh_avg_4h"].notna()]
+        df = df.loc[df["OAT_avg_4h"].notna() & df["dist_kwh_avg_4h"].notna()]
  
         # Drop rows inside missing-data gaps
         df = df.loc[~drop_rows]
@@ -503,7 +505,7 @@ class HouseEnergyParamsComputer:
         - Can be called for the baseline model (alpha/beta/gamma) too.
         """
         dist_kwh = df["dist_kwh"].to_numpy()
-        energy_ratio = float(df["hp_kwh_th"].sum()) / float(dist_kwh.sum())
+        energy_ratio = float(np.sum(df["hp_kwh_th"].to_numpy())) / float(np.sum(dist_kwh))
         dist_kwh_scaled = dist_kwh * energy_ratio
         y = dist_kwh_scaled
         X = self.design_matrix(df, baseline=baseline, energy_ratio=energy_ratio)
@@ -562,9 +564,9 @@ class HouseEnergyParamsComputer:
         """
         Fits the model on the last ``n`` calendar days of data.
         """
-        days = np.sort(self.df["day"].unique())
-        window_days = days[-n:] if len(days) >= n else days
-        window_df = self.df[self.df["day"].isin(window_days)]
+        days = np.unique(self.df["day"].to_numpy())
+        window_days = (days[-n:] if len(days) >= n else days).tolist()
+        window_df = self.df.loc[self.df["day"].isin(window_days)]
         return self.fit(window_df)
 
     # ---------------------------------------------------------
@@ -657,7 +659,10 @@ class HouseEnergyParamsComputer:
                 f"{self.house_alias.capitalize()}: {oos_label} predicted vs actual "
                 f"({self.TRAINING_FREQUENCY} training, {'with' if self.GROW_WINDOW_TO_N else 'no'} growing window)"
             ),
-            oat_f_colormap_bounds=(float(self.df["oat_f"].min()), float(self.df["oat_f"].max())),
+            oat_f_colormap_bounds=(
+                float(np.min(self.df["oat_f"].to_numpy())),
+                float(np.max(self.df["oat_f"].to_numpy())),
+            ),
             savepath=self.results_dir / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
@@ -706,7 +711,7 @@ class HouseEnergyParamsComputer:
         - Scores recursive multi-step forecasts at each origin hour.
         """
         horizon = self.FORECAST_HORIZON_HOURS
-        days = np.sort(self.df["day"].unique())
+        days = np.unique(self.df["day"].to_numpy())
         fit_days: list[pd.Timestamp] = []
         results: list[HouseEnergyParams] = []
         results_baseline: list[HouseEnergyParams] = []
@@ -728,7 +733,7 @@ class HouseEnergyParamsComputer:
                     window = days[0 : i + 1]
                 else:
                     window = days[i - n + 1 : i + 1]
-                window_df = self.df[self.df["day"].isin(window)]
+                window_df = self.df.loc[self.df["day"].isin(window.tolist())]
                 fit_days.append(days[i])
                 results.append(self.fit(window_df))
                 results_baseline.append(self.fit(window_df, baseline=True))
@@ -863,9 +868,9 @@ class HouseEnergyParamsComputer:
             b1 = pd.Series(b1_values, index=pd.DatetimeIndex(fit_days)).sort_index()
             if self.TRAINING_FREQUENCY == "daily":
                 b1_stability = b1.rolling("7D").apply(lambda s: s.max() - s.min())
-                b1_stability_metric = float(b1_stability.mean())
+                b1_stability_metric = float(np.nanmean(b1_stability.to_numpy()))
             else:
-                b1_stability_metric = float(b1.diff().abs().mean())
+                b1_stability_metric = float(np.nanmean(b1.diff().abs().to_numpy()))
             rmses.append(rmse)
             b1_weekly_ranges.append(b1_stability_metric)
             self._log_info(

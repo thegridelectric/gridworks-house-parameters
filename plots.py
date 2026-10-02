@@ -15,10 +15,12 @@ def _hourly_residual_mean_and_ci95(
         .agg(["mean", "std", "count"])
         .reindex(range(24))
     )
-    sem = by_hour["std"] / np.sqrt(by_hour["count"])
-    ci95 = 1.96 * sem
-    ci95 = ci95.where(by_hour["count"] >= 2, 0.0).fillna(0.0)
-    return by_hour["mean"].to_numpy(), ci95.to_numpy()
+    count = np.asarray(by_hour["count"], dtype=float)
+    std = np.asarray(by_hour["std"], dtype=float)
+    sem = std / np.sqrt(count)
+    ci95 = np.where(count >= 2, 1.96 * sem, 0.0)
+    ci95 = np.where(np.isnan(ci95), 0.0, ci95)
+    return np.asarray(by_hour["mean"]), ci95
 
 
 def _plot_hourly_residual_bars_on_ax(
@@ -127,7 +129,7 @@ def plot_pred_vs_actual(
 
     sm = ScalarMappable(norm=norm, cmap=cmap)
     cbar = fig.colorbar(sm, ax=list(axes), fraction=0.03, pad=0.02)
-    ticks = np.linspace(norm.vmin, norm.vmax, 6)
+    ticks = np.linspace(oat_min, oat_max, num=6, retstep=False).tolist()
     cbar.set_ticks(ticks)
     cbar.set_ticklabels([f"{t:.0f}°F" for t in ticks])
 
@@ -239,7 +241,7 @@ def plot_data_distribution(
             ax = axes[row, col_idx]
             ax.boxplot(df[channel].dropna().to_numpy(), vert=True, widths=0.22)
             if row == 0:
-                n_nans = int(df_before[channel].isna().sum())
+                n_nans = int(np.sum(df_before[channel].isna().to_numpy()))
                 nan_label = "NaN" if n_nans == 1 else "NaNs"
                 ax.set_title(f"{channel}\n({n_nans} {nan_label})", fontsize=8)
             ax.tick_params(axis="x", bottom=False, labelbottom=False)
