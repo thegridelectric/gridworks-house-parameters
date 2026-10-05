@@ -28,6 +28,16 @@ class HouseEnergyParams:
     is_baseline: bool = False
 
 
+@dataclass
+class HouseRswtParams:
+    rwt_min: float
+    rwt_intercept: float
+    rwt_slope: float
+    rwt_intercept_chc: float
+    rwt_slope_chc: float
+    water_kg_hour_chc: float
+
+
 class HouseEnergyParamsComputer:
     # Data source
     DATA_SOURCE: Literal["database", "csv"] = "csv"
@@ -48,6 +58,7 @@ class HouseEnergyParamsComputer:
 
     # Data cleaning - missing data
     MAX_DATA_GAP_HOURS = 4
+    NON_INTERPOLATED_OPTIONAL_COLUMNS = ("swt_average", "rwt_average", "dist_water_kg")
 
     # Data cleaning - known bad data
     OIL_BOILER_POWER_THRESHOLD_WATTS = 50
@@ -87,6 +98,7 @@ class HouseEnergyParamsComputer:
     MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
     ROLLING_AVG_HOURS = 4
+    RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
 
     def __init__(
         self,
@@ -152,6 +164,9 @@ class HouseEnergyParamsComputer:
                     "solar_w_m2": data.get("solar_w_m2", np.nan),
                     "dist_kwh": data.get("dist_kwh", 0.0),
                     "hp_kwh_th": data.get("hp_kwh_th", 0.0),
+                    "swt_average": data.get("swt_average", np.nan),
+                    "rwt_average": data.get("rwt_average", np.nan),
+                    "dist_water_kg": data.get("dist_water_kg", np.nan),
                     "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
                 }
                 for zone in zone_numbers:
@@ -163,6 +178,7 @@ class HouseEnergyParamsComputer:
                     row[f"zone{zone}_avg_temp"] = data.get(f"zone{zone}_avg_temp", np.nan)
                 rows.append(row)
             df = pd.DataFrame(rows, columns=csv_fieldnames)
+            df.to_csv(Path("data") / f"{self.house_alias}_input_data.csv", index=False)
             self._log_info(f"Loaded data from database ({len(df)} rows)")
 
         else:
@@ -291,7 +307,7 @@ class HouseEnergyParamsComputer:
         - Computes average OAT over the last ROLLING_AVG_HOURS when the start and end value are not interpolated, otherwise drops the row
         - Computes average dist_kwh over the last ROLLING_AVG_HOURS only when all hours in the window are not interpolated, otherwise drops the row
         - Drops rows inside missing-data gaps
-        - Drops remaining rows that contain NaNs
+        - Drops remaining rows that contain NaNs (except dist SWT/RWT averages)
         """
         # Insert missing rows (need one row per hour)
         df = df.copy()
@@ -306,6 +322,8 @@ class HouseEnergyParamsComputer:
         df = df.set_index("hour_start")
         drop_rows = pd.Series(False, index=df.index)
         for channel in df.columns:
+            if channel == "day" or channel in self.NON_INTERPOLATED_OPTIONAL_COLUMNS:
+                continue
             is_nan = df[channel].isna()
             block_id = is_nan.ne(is_nan.shift()).cumsum()
             block_len = is_nan.groupby(block_id).transform("size")
@@ -316,7 +334,7 @@ class HouseEnergyParamsComputer:
         oat_f_interpolated = pd.Series(False, index=df.index)
         dist_kwh_interpolated = pd.Series(False, index=df.index)
         for channel in df.columns:
-            if channel == "day":
+            if channel == "day" or channel in self.NON_INTERPOLATED_OPTIONAL_COLUMNS:
                 continue
             before = df[channel].copy()
             df[channel] = df[channel].interpolate(method="time")
@@ -351,12 +369,13 @@ class HouseEnergyParamsComputer:
         df = df.reset_index(names="hour_start")
         self._log_info(f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
 
-        # If any rows still have NaNs, drop them
-        remaining_nans = int(df.isna().sum().sum())
-        self._log_info(f"NaNs remaining: {remaining_nans}")
+        # If any rows still have NaNs (except in NON_INTERPOLATED_OPTIONAL_COLUMNS), drop them
+        required_for_dropna = [c for c in df.columns if c not in self.NON_INTERPOLATED_OPTIONAL_COLUMNS]
+        remaining_nans = int(df[required_for_dropna].isna().sum().sum())
+        self._log_info(f"NaNs remaining (excl. dist SWT/RWT): {remaining_nans}")
         if remaining_nans > 0:
             n_before = len(df)
-            df = df.dropna().reset_index(drop=True)
+            df = df.dropna(subset=required_for_dropna).reset_index(drop=True)
             self._log_info(f"Dropped {n_before - len(df)} rows with NaNs")
 
         return df
@@ -556,11 +575,11 @@ class HouseEnergyParamsComputer:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
 
-    # --------------------------------------------
-    # Get parameters for the last N days of data
-    # --------------------------------------------
+    # --------------------------------------------------
+    # Get energy parameters for the last N days of data
+    # --------------------------------------------------
 
-    def fit_on_last_n_days(self, n: int) -> HouseEnergyParams:
+    def energy_fit_on_last_n_days(self, n: int) -> HouseEnergyParams:
         """
         Fits the model on the last ``n`` calendar days of data.
         """
@@ -568,6 +587,67 @@ class HouseEnergyParamsComputer:
         window_days = (days[-n:] if len(days) >= n else days).tolist()
         window_df = self.df.loc[self.df["day"].isin(window_days)]
         return self.fit(window_df)
+
+    # ----------------------------------------------------
+    # Get rswt parameters for the last N days of data
+    # ----------------------------------------------------
+
+    def rswt_fit_on_last_n_days(self, n: int) -> HouseRswtParams:
+        """
+        Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
+
+        Uses ``rwt_average ~ rwt_intercept + rwt_slope * swt_average`` on all complete rows,
+        and the same model on hours with max zone heat-call fraction above 80% for the ``_chc`` params.
+        ``water_kg_hour_chc`` is the maximum hourly ``dist_water_kg`` in the window.
+        """
+        days = np.unique(self.df["day"].to_numpy())
+        window_days = (days[-n:] if len(days) >= n else days).tolist()
+        window_df = self.df.loc[self.df["day"].isin(window_days)]
+
+        heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
+        rwt_cols = ["swt_average", "rwt_average", *heatcall_cols]
+        rwt_df = window_df[rwt_cols].dropna()
+        if rwt_df.empty:
+            raise ValueError(
+                f"{self.house_alias}: no rows with swt_average, rwt_average, and zone heat-call data "
+                f"in the last {n} day(s)"
+            )
+
+        rwt_df = rwt_df.copy()
+        rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
+        rwt_df = rwt_df.drop(columns=heatcall_cols)
+
+        rwt_intercept, rwt_slope = self._fit_rwt_vs_swt(rwt_df)
+        chc_mask = rwt_df["max_zone_heatcall_fraction"] > self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
+        rwt_intercept_chc, rwt_slope_chc = self._fit_rwt_vs_swt(rwt_df.loc[chc_mask])
+
+        if "dist_water_kg" not in window_df.columns:
+            raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
+        dist_water_kg = window_df["dist_water_kg"].dropna()
+        if dist_water_kg.empty:
+            raise ValueError(f"{self.house_alias}: no dist_water_kg values in the last {n} day(s)")
+        water_kg_hour_chc = float(dist_water_kg.max())
+
+        return HouseRswtParams(
+            rwt_min=50.0,
+            rwt_intercept=round(rwt_intercept, 6),
+            rwt_slope=round(rwt_slope, 6),
+            rwt_intercept_chc=round(rwt_intercept_chc, 6),
+            rwt_slope_chc=round(rwt_slope_chc, 6),
+            water_kg_hour_chc=round(water_kg_hour_chc, 2),
+        )
+
+    def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:
+        """OLS fit: rwt_average = intercept + slope * swt_average."""
+        if len(df) < 2:
+            raise ValueError(
+                f"{self.house_alias}: need at least 2 rows to fit RSWT vs SWT (got {len(df)})"
+            )
+        swt = df["swt_average"].to_numpy(dtype=float)
+        rwt = df["rwt_average"].to_numpy(dtype=float)
+        X = np.column_stack([np.ones(len(df)), swt])
+        coefficients, *_ = np.linalg.lstsq(X, rwt, rcond=None)
+        return float(coefficients[0]), float(coefficients[1])
 
     # ---------------------------------------------------------
     # Evaluate the accuracy of the recursive horizon forecasts

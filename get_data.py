@@ -36,6 +36,12 @@ ENERGY_CHANNELS = [
     "store-flow",
 ]
 
+DIST_FLOW_CHANNELS = ["dist-swt", "dist-rwt", "dist-flow"]
+DIST_FLOW_ONLY_CHANNELS = ["dist-flow"]
+DIST_FLOW_ONSET_DELAY = timedelta(seconds=30)
+# US gallon water ≈ 1 kg/L × 3.785 L/gal; per 1s bucket: kg += (gpm / 60) * kg_per_gallon
+KG_PER_US_GALLON = 3.785411784
+
 # -----------------
 # Querries
 # -----------------
@@ -76,6 +82,93 @@ FROM (
     ) AS per_second
 ) AS with_kw
 GROUP BY time_bucket
+ORDER BY time_bucket
+""")
+
+# Duration-weighted average dist SWT/RWT while dist-flow > 0 (after 30s in each flow run)
+DIST_FLOW_WT_SQL = text("""
+WITH per_second AS (
+    SELECT
+        time_bucket AS time_bucket_1s,
+        (AVG(value) FILTER (WHERE channel_name = 'dist-flow' AND unit = 'GpmTimes100') / 100)
+            AS dist_flow_gpm,
+        (AVG(value) FILTER (WHERE channel_name = 'dist-swt' AND unit = 'WaterTempCTimes1000') / 1000)
+            AS dist_swt_c,
+        (AVG(value) FILTER (WHERE channel_name = 'dist-rwt' AND unit = 'WaterTempCTimes1000') / 1000)
+            AS dist_rwt_c
+    FROM gridworks.retrieve_readings_1s(
+        t_start => :t_start,
+        t_end => :t_end_inclusive,
+        channels => :dist_flow_channels
+    )
+    WHERE terminal_asset_alias ILIKE :house_alias
+    GROUP BY time_bucket
+),
+positive AS (
+    SELECT
+        time_bucket_1s,
+        dist_swt_c,
+        dist_rwt_c,
+        time_bucket_1s
+            - (ROW_NUMBER() OVER (ORDER BY time_bucket_1s))::bigint * INTERVAL '1 second'
+            AS grp_key
+    FROM per_second
+    WHERE dist_flow_gpm > 0
+),
+segment_bounds AS (
+    SELECT
+        grp_key,
+        MIN(time_bucket_1s) AS seg_start,
+        MAX(time_bucket_1s) AS seg_end
+    FROM positive
+    GROUP BY grp_key
+),
+eligible_seconds AS (
+    SELECT
+        p.time_bucket_1s,
+        p.dist_swt_c,
+        p.dist_rwt_c
+    FROM positive p
+    INNER JOIN segment_bounds s ON p.grp_key = s.grp_key
+    WHERE s.seg_start + :dist_flow_onset_delay < s.seg_end + INTERVAL '1 second'
+      AND p.time_bucket_1s >= s.seg_start + :dist_flow_onset_delay
+),
+hourly AS (
+    SELECT
+        time_bucket(INTERVAL '1 hour', time_bucket_1s, :local_tz) AS time_bucket,
+        AVG(dist_swt_c) AS avg_swt_c,
+        AVG(dist_rwt_c) AS avg_rwt_c
+    FROM eligible_seconds
+    GROUP BY 1
+)
+SELECT
+    time_bucket,
+    ROUND((avg_swt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS swt_average,
+    ROUND((avg_rwt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS rwt_average
+FROM hourly
+ORDER BY time_bucket
+""")
+
+# Hourly distribution loop water mass (kg) from 1s average GPM
+DIST_WATER_KG_SQL = text("""
+WITH per_second AS (
+    SELECT
+        time_bucket AS time_bucket_1s,
+        (AVG(value) FILTER (WHERE channel_name = 'dist-flow' AND unit = 'GpmTimes100') / 100)
+            AS dist_flow_gpm
+    FROM gridworks.retrieve_readings_1s(
+        t_start => :t_start,
+        t_end => :t_end_inclusive,
+        channels => :dist_flow_only_channels
+    )
+    WHERE terminal_asset_alias ILIKE :house_alias
+    GROUP BY time_bucket
+)
+SELECT
+    time_bucket(INTERVAL '1 hour', time_bucket_1s, :local_tz) AS time_bucket,
+    ROUND((SUM(dist_flow_gpm) * :kg_per_us_gallon / 60.0)::numeric, 2) AS dist_water_kg
+FROM per_second
+GROUP BY 1
 ORDER BY time_bucket
 """)
 
@@ -152,11 +245,17 @@ class HouseParamsDataFetcher:
             "local_tz": str(self.local_tz),
             "oil_boiler_channel": OIL_BOILER_CHANNEL,
             "energy_channels": ENERGY_CHANNELS,
+            "dist_flow_channels": DIST_FLOW_CHANNELS,
+            "dist_flow_onset_delay": DIST_FLOW_ONSET_DELAY,
+            "dist_flow_only_channels": DIST_FLOW_ONLY_CHANNELS,
+            "kg_per_us_gallon": KG_PER_US_GALLON,
         }
 
         # Execute queries
         with self.engine.connect() as conn:
             energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
+            dist_flow_wt_rows = conn.execute(DIST_FLOW_WT_SQL, params).mappings().all()
+            dist_water_kg_rows = conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
             oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
             zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
 
@@ -174,6 +273,19 @@ class HouseParamsDataFetcher:
             bucket = channel_data_by_hour_start.setdefault(key, {})
             bucket["dist_kwh"] = 0.0 if row["dist_kwh"] is None else round(float(row["dist_kwh"]), 2)
             bucket["hp_kwh_th"] = 0.0 if row["hp_kwh_th"] is None else round(float(row["hp_kwh_th"]), 2)
+
+        for row in dist_flow_wt_rows:
+            key = self.hour_start_key(row["time_bucket"])
+            bucket = channel_data_by_hour_start.setdefault(key, {})
+            for field in ("swt_average", "rwt_average"):
+                val = row[field]
+                bucket[field] = round(float(val), 2) if val is not None else None
+
+        for row in dist_water_kg_rows:
+            key = self.hour_start_key(row["time_bucket"])
+            bucket = channel_data_by_hour_start.setdefault(key, {})
+            val = row["dist_water_kg"]
+            bucket["dist_water_kg"] = round(float(val), 2) if val is not None else None
 
         # Populate by-hour dictionary with oil boiler power data
         for row in oil_rows:
@@ -228,6 +340,9 @@ class HouseParamsDataFetcher:
             "solar_w_m2",
             "dist_kwh",
             "hp_kwh_th",
+            "swt_average",
+            "rwt_average",
+            "dist_water_kg",
             "oil_boiler_pwr",
         ]
         for zone in zone_numbers:
@@ -266,6 +381,9 @@ def main() -> None:
                 "solar_w_m2": "",
                 "dist_kwh": data.get("dist_kwh", 0.0),
                 "hp_kwh_th": data.get("hp_kwh_th", 0.0),
+                "swt_average": data.get("swt_average", ""),
+                "rwt_average": data.get("rwt_average", ""),
+                "dist_water_kg": data.get("dist_water_kg", ""),
                 "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
             }
             for zone in zone_numbers:

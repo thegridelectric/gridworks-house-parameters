@@ -24,5 +24,9 @@ HOUSE_ALIASES = [
 for house in HOUSE_ALIASES:
     print(f"\n[{house.capitalize()}]")
     h = HouseEnergyParamsComputer(house, START_TIME, END_TIME)
-    h.trailing_n_day_fits(n=50)
+    energy_params = h.energy_fit_on_last_n_days(n=10)
+    rswt_params = h.rswt_fit_on_last_n_days(n=10)
+    print(f"Energy params:\n{energy_params}")
+    print(f"RSWT params:\n{rswt_params}")
+    # h.trailing_n_day_fits(n=50)
     # h.sweep_n(min_n=5, max_n=200)
