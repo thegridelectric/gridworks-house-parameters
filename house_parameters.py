@@ -107,6 +107,8 @@ class HouseEnergyParamsComputer:
     FORECAST_HORIZON_HOURS = 48
     ROLLING_AVG_HOURS = 4
     RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
+    RSWT_CHC_MIN_FIT_ROWS = 20
+    RSWT_CHC_HEATCALL_FLOOR = 0.7
 
     def __init__(
         self,
@@ -621,7 +623,7 @@ class HouseEnergyParamsComputer:
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
 
         Uses ``rwt_average_f ~ rwt_intercept + rwt_slope * swt_average_f`` on all complete rows,
-        and the same model on hours with max zone heat-call fraction above 80% for the ``_chc`` params.
+        and the same model on high heat-call hours for the ``_chc`` params (threshold, or top-k fallback).
         ``water_kg_hour_chc`` is the mean hourly ``dist_water_kg`` over those CHC training rows.
         """
         days = np.unique(self.df["day"].to_numpy())
@@ -646,10 +648,38 @@ class HouseEnergyParamsComputer:
         rwt_df["dist_water_kg"] = window_df.loc[rwt_df.index, "dist_water_kg"]
 
         rwt_intercept, rwt_slope = self._fit_rwt_vs_swt(rwt_df)
-        chc_mask = rwt_df["max_zone_heatcall_fraction"] > self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
-        rwt_intercept_chc, rwt_slope_chc = self._fit_rwt_vs_swt(rwt_df.loc[chc_mask])
 
-        chc_dist_water_kg = rwt_df.loc[chc_mask, "dist_water_kg"].dropna()
+        threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
+        min_rows = self.RSWT_CHC_MIN_FIT_ROWS
+        floor = self.RSWT_CHC_HEATCALL_FLOOR
+        above_threshold = rwt_df.loc[rwt_df["max_zone_heatcall_fraction"] > threshold]
+        if len(above_threshold) >= min_rows:
+            chc_df = above_threshold
+            self._log_info(
+                f"CHC fit: {len(chc_df)} hour(s) with max zone heat-call > {threshold}"
+            )
+        else:
+            n_above = len(above_threshold)
+            k = min(min_rows, len(rwt_df))
+            floored = rwt_df.loc[rwt_df["max_zone_heatcall_fraction"] >= floor]
+            if len(floored) >= k:
+                pool = floored
+                pool_label = f"heat-call >= {floor}"
+            else:
+                pool = rwt_df
+                pool_label = "all hours"
+            chc_df = pool.nlargest(k, "max_zone_heatcall_fraction")
+            min_hc = float(chc_df["max_zone_heatcall_fraction"].min())
+            max_hc = float(chc_df["max_zone_heatcall_fraction"].max())
+            self._log_info(
+                f"CHC fit: only {n_above} hour(s) above {threshold}, "
+                f"using top {len(chc_df)} by heat-call from {pool_label} "
+                f"(heat-call {min_hc:.2f}–{max_hc:.2f})"
+            )
+
+        rwt_intercept_chc, rwt_slope_chc = self._fit_rwt_vs_swt(chc_df)
+
+        chc_dist_water_kg = chc_df["dist_water_kg"].dropna()
         if chc_dist_water_kg.empty:
             raise ValueError(
                 f"{self.house_alias}: no dist_water_kg values on CHC regression training rows "
