@@ -49,6 +49,9 @@ class HouseEnergyParamsComputer:
         "solar_w_m2": (0, 1361),
         "dist_kwh": (0, 25),
         "hp_kwh_th": (0, 25),
+        "swt_average_f": (40, 200),
+        "rwt_average_f": (40, 200),
+        "dist_water_kg": (0, int(3.785 * 60 * 10)),
         "zone_set_or_temp_f": (40, 90),
         "zone_heatcall_fraction": (0, 1),
     }
@@ -58,7 +61,11 @@ class HouseEnergyParamsComputer:
 
     # Data cleaning - missing data
     MAX_DATA_GAP_HOURS = 4
-    NON_INTERPOLATED_OPTIONAL_COLUMNS = ("swt_average", "rwt_average", "dist_water_kg")
+    NON_INTERPOLATED_OPTIONAL_COLUMNS = (
+        "swt_average_f",
+        "rwt_average_f",
+        "dist_water_kg",
+    )
 
     # Data cleaning - known bad data
     OIL_BOILER_POWER_THRESHOLD_WATTS = 50
@@ -164,8 +171,8 @@ class HouseEnergyParamsComputer:
                     "solar_w_m2": data.get("solar_w_m2", np.nan),
                     "dist_kwh": data.get("dist_kwh", 0.0),
                     "hp_kwh_th": data.get("hp_kwh_th", 0.0),
-                    "swt_average": data.get("swt_average", np.nan),
-                    "rwt_average": data.get("rwt_average", np.nan),
+                    "swt_average_f": data.get("swt_average_f", np.nan),
+                    "rwt_average_f": data.get("rwt_average_f", np.nan),
                     "dist_water_kg": data.get("dist_water_kg", np.nan),
                     "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
                 }
@@ -274,6 +281,8 @@ class HouseEnergyParamsComputer:
 
         nans_added_range = 0
         for channel, (min_value, max_value) in range_of_valid_values_per_channel.items():
+            if channel not in df.columns:
+                continue
             out_of_range = df[channel].notna() & ~df[channel].between(min_value, max_value)
             nans_added_range += int(out_of_range.sum())
             reason = f"valid range [{min_value}, {max_value}]"
@@ -596,7 +605,7 @@ class HouseEnergyParamsComputer:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
 
-        Uses ``rwt_average ~ rwt_intercept + rwt_slope * swt_average`` on all complete rows,
+        Uses ``rwt_average_f ~ rwt_intercept + rwt_slope * swt_average_f`` on all complete rows,
         and the same model on hours with max zone heat-call fraction above 80% for the ``_chc`` params.
         ``water_kg_hour_chc`` is the maximum hourly ``dist_water_kg`` in the window.
         """
@@ -605,11 +614,11 @@ class HouseEnergyParamsComputer:
         window_df = self.df.loc[self.df["day"].isin(window_days)]
 
         heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
-        rwt_cols = ["swt_average", "rwt_average", *heatcall_cols]
+        rwt_cols = ["swt_average_f", "rwt_average_f", *heatcall_cols]
         rwt_df = window_df[rwt_cols].dropna()
         if rwt_df.empty:
             raise ValueError(
-                f"{self.house_alias}: no rows with swt_average, rwt_average, and zone heat-call data "
+                f"{self.house_alias}: no rows with swt_average_f, rwt_average_f, and zone heat-call data "
                 f"in the last {n} day(s)"
             )
 
@@ -638,13 +647,13 @@ class HouseEnergyParamsComputer:
         )
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:
-        """OLS fit: rwt_average = intercept + slope * swt_average."""
+        """OLS fit: rwt_average_f = intercept + slope * swt_average_f."""
         if len(df) < 2:
             raise ValueError(
                 f"{self.house_alias}: need at least 2 rows to fit RSWT vs SWT (got {len(df)})"
             )
-        swt = df["swt_average"].to_numpy(dtype=float)
-        rwt = df["rwt_average"].to_numpy(dtype=float)
+        swt = df["swt_average_f"].to_numpy(dtype=float)
+        rwt = df["rwt_average_f"].to_numpy(dtype=float)
         X = np.column_stack([np.ones(len(df)), swt])
         coefficients, *_ = np.linalg.lstsq(X, rwt, rcond=None)
         return float(coefficients[0]), float(coefficients[1])

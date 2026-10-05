@@ -143,8 +143,8 @@ hourly AS (
 )
 SELECT
     time_bucket,
-    ROUND((avg_swt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS swt_average,
-    ROUND((avg_rwt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS rwt_average
+    ROUND((avg_swt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS swt_average_f,
+    ROUND((avg_rwt_c * 9.0 / 5.0 + 32.0)::numeric, 2) AS rwt_average_f
 FROM hourly
 ORDER BY time_bucket
 """)
@@ -277,7 +277,7 @@ class HouseParamsDataFetcher:
         for row in dist_flow_wt_rows:
             key = self.hour_start_key(row["time_bucket"])
             bucket = channel_data_by_hour_start.setdefault(key, {})
-            for field in ("swt_average", "rwt_average"):
+            for field in ("swt_average_f", "rwt_average_f"):
                 val = row[field]
                 bucket[field] = round(float(val), 2) if val is not None else None
 
@@ -340,8 +340,8 @@ class HouseParamsDataFetcher:
             "solar_w_m2",
             "dist_kwh",
             "hp_kwh_th",
-            "swt_average",
-            "rwt_average",
+            "swt_average_f",
+            "rwt_average_f",
             "dist_water_kg",
             "oil_boiler_pwr",
         ]
@@ -381,8 +381,8 @@ def main() -> None:
                 "solar_w_m2": "",
                 "dist_kwh": data.get("dist_kwh", 0.0),
                 "hp_kwh_th": data.get("hp_kwh_th", 0.0),
-                "swt_average": data.get("swt_average", ""),
-                "rwt_average": data.get("rwt_average", ""),
+                "swt_average_f": data.get("swt_average_f", ""),
+                "rwt_average_f": data.get("rwt_average_f", ""),
                 "dist_water_kg": data.get("dist_water_kg", ""),
                 "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
             }
