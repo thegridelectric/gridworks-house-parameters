@@ -13,6 +13,7 @@ from plots import (
     plot_oos_residual_by_hour_of_day,
     plot_oos_rmse_by_lead,
     plot_pred_vs_actual,
+    plot_rswt_fit,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,7 @@ class HouseRswtParams:
 
 class HouseEnergyParamsComputer:
     # Data source
-    DATA_SOURCE: Literal["database", "csv"] = "csv"
+    DATA_SOURCE: Literal["database", "csv"] = "database"
 
     # Data cleaning - erroneous data
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
@@ -185,8 +186,22 @@ class HouseEnergyParamsComputer:
                     row[f"zone{zone}_avg_temp"] = data.get(f"zone{zone}_avg_temp", np.nan)
                 rows.append(row)
             df = pd.DataFrame(rows, columns=csv_fieldnames)
+            # Temporary: weather is not in the database yet; take oat/ws/solar from CSV.
+            weather_csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
+            weather_df = pd.read_csv(
+                weather_csv_path,
+                usecols=["hour_start", "oat_f", "ws_mph", "solar_w_m2"],
+            )
+            weather_df["hour_start"] = pd.to_datetime(weather_df["hour_start"])
+            df["hour_start"] = pd.to_datetime(df["hour_start"])
+            df = df.drop(columns=["oat_f", "ws_mph", "solar_w_m2"]).merge(
+                weather_df, on="hour_start", how="left"
+            )
+            self._log_info(
+                f"Loaded data from database ({len(df)} rows); "
+                f"weather from {weather_csv_path}"
+            )
             df.to_csv(Path("data") / f"{self.house_alias}_input_data.csv", index=False)
-            self._log_info(f"Loaded data from database ({len(df)} rows)")
 
         else:
             raise ValueError(f"Unsupported DATA_SOURCE: {self.DATA_SOURCE!r}")
@@ -607,7 +622,7 @@ class HouseEnergyParamsComputer:
 
         Uses ``rwt_average_f ~ rwt_intercept + rwt_slope * swt_average_f`` on all complete rows,
         and the same model on hours with max zone heat-call fraction above 80% for the ``_chc`` params.
-        ``water_kg_hour_chc`` is the maximum hourly ``dist_water_kg`` in the window.
+        ``water_kg_hour_chc`` is the mean hourly ``dist_water_kg`` over those CHC training rows.
         """
         days = np.unique(self.df["day"].to_numpy())
         window_days = (days[-n:] if len(days) >= n else days).tolist()
@@ -626,16 +641,39 @@ class HouseEnergyParamsComputer:
         rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
         rwt_df = rwt_df.drop(columns=heatcall_cols)
 
+        if "dist_water_kg" not in window_df.columns:
+            raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
+        rwt_df["dist_water_kg"] = window_df.loc[rwt_df.index, "dist_water_kg"]
+
         rwt_intercept, rwt_slope = self._fit_rwt_vs_swt(rwt_df)
         chc_mask = rwt_df["max_zone_heatcall_fraction"] > self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
         rwt_intercept_chc, rwt_slope_chc = self._fit_rwt_vs_swt(rwt_df.loc[chc_mask])
 
-        if "dist_water_kg" not in window_df.columns:
-            raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
-        dist_water_kg = window_df["dist_water_kg"].dropna()
-        if dist_water_kg.empty:
-            raise ValueError(f"{self.house_alias}: no dist_water_kg values in the last {n} day(s)")
-        water_kg_hour_chc = float(dist_water_kg.max())
+        chc_dist_water_kg = rwt_df.loc[chc_mask, "dist_water_kg"].dropna()
+        if chc_dist_water_kg.empty:
+            raise ValueError(
+                f"{self.house_alias}: no dist_water_kg values on CHC regression training rows "
+                f"in the last {n} day(s)"
+            )
+        water_kg_hour_chc = float(chc_dist_water_kg.mean())
+        self._log_info(
+            f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg "
+            f"(mean dist_water_kg over {len(chc_dist_water_kg)} CHC training hour(s))"
+        )
+
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        plot_rswt_fit(
+            rwt_df["swt_average_f"].to_numpy(),
+            rwt_df["rwt_average_f"].to_numpy(),
+            rwt_df["max_zone_heatcall_fraction"].to_numpy(),
+            rwt_intercept=rwt_intercept,
+            rwt_slope=rwt_slope,
+            rwt_intercept_chc=rwt_intercept_chc,
+            rwt_slope_chc=rwt_slope_chc,
+            house_alias=self.house_alias,
+            n_days=n,
+            savepath=self.results_dir / f"{self.house_alias}_rswt_fit_N{n}.png",
+        )
 
         return HouseRswtParams(
             rwt_min=50.0,

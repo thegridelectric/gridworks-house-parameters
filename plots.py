@@ -273,3 +273,70 @@ def plot_data_distribution(
     savepath = results_dir / f"{house_alias}_channel_boxplots.png"
     fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_rswt_fit(
+    swt: np.ndarray,
+    rwt: np.ndarray,
+    max_zone_heatcall_fraction: np.ndarray,
+    *,
+    rwt_intercept: float,
+    rwt_slope: float,
+    rwt_intercept_chc: float,
+    rwt_slope_chc: float,
+    house_alias: str,
+    n_days: int,
+    savepath: Path | None = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    swt = np.asarray(swt, dtype=float)
+    rwt = np.asarray(rwt, dtype=float)
+    heatcall = np.asarray(max_zone_heatcall_fraction, dtype=float)
+    heatcall_norm = Normalize(vmin=0.0, vmax=1.0)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    sc = ax.scatter(
+        swt,
+        rwt,
+        c=heatcall,
+        cmap=plt.cm.coolwarm,
+        s=22,
+        alpha=0.65,
+        norm=heatcall_norm,
+        label="Hourly data",
+    )
+
+    swt_line = np.linspace(float(np.min(swt)), float(np.max(swt)), num=100)
+    ax.plot(
+        swt_line,
+        rwt_intercept + rwt_slope * swt_line,
+        color="tab:blue",
+        linewidth=2,
+        label="All hours (OLS)",
+    )
+    ax.plot(
+        swt_line,
+        rwt_intercept_chc + rwt_slope_chc * swt_line,
+        color="tab:red",
+        linewidth=2,
+        label="CHC hours (OLS)",
+    )
+
+    ax.set_xlabel("Supply water temperature SWT (°F)")
+    ax.set_ylabel("Return water temperature RWT (°F)")
+    ax.set_title(
+        f"{house_alias.capitalize()}: RWT vs SWT (last {n_days} day(s))"
+    )
+    ax.legend(loc="upper left")
+
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("max zone heat-call fraction")
+
+    fig.tight_layout()
+    if savepath is not None:
+        savepath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.show()
+    plt.close(fig)
