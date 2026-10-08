@@ -1,4 +1,5 @@
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +31,7 @@ class HouseEnergyParams:
 
 
 @dataclass(frozen=True)
-class RswtHeatcallBucketFit:
+class RswtLoadBucketFit:
     rwt_intercept: float
     rwt_slope: float
 
@@ -39,11 +40,11 @@ class RswtHeatcallBucketFit:
 class HouseRswtParams:
     rwt_min: float
     water_kg_hour_chc: float
-    hc_0_20: RswtHeatcallBucketFit | None
-    hc_20_40: RswtHeatcallBucketFit | None
-    hc_40_60: RswtHeatcallBucketFit | None
-    hc_60_80: RswtHeatcallBucketFit | None
-    hc_80_100: RswtHeatcallBucketFit | None
+    load_0_2: RswtLoadBucketFit | None
+    load_2_4: RswtLoadBucketFit | None
+    load_4_6: RswtLoadBucketFit | None
+    load_6_8: RswtLoadBucketFit | None
+    load_8_plus: RswtLoadBucketFit | None
 
 
 class HouseEnergyParamsComputer:
@@ -115,13 +116,15 @@ class HouseEnergyParamsComputer:
     MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
     ROLLING_AVG_HOURS = 4
-    RSWT_HEATCALL_BUCKET_BOUNDS: tuple[tuple[float, float, str], ...] = (
-        (0.0, 0.2, "0-20%"),
-        (0.2, 0.4, "20-40%"),
-        (0.4, 0.6, "40-60%"),
-        (0.6, 0.8, "60-80%"),
-        (0.8, 1.0, "80-100%"),
+    RSWT_LOAD_BUCKET_BOUNDS: tuple[tuple[float, float, str], ...] = (
+        (0.0, 2.0, "0-2 kWh"),
+        (2.0, 4.0, "2-4 kWh"),
+        (4.0, 6.0, "4-6 kWh"),
+        (6.0, 8.0, "6-8 kWh"),
+        (8.0, math.inf, "8+ kWh"),
     )
+    RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
+    RSWT_CHC_HEATCALL_FLOOR = 0.7
     RSWT_BUCKET_MIN_FIT_ROWS = 20
 
     def __init__(
@@ -684,48 +687,57 @@ class HouseEnergyParamsComputer:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
 
-        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each max zone
-        heat-call band (see ``RSWT_HEATCALL_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
-        ``dist_water_kg`` in the highest heat-call band when fitted, otherwise
-        scaled from the highest fitted band through (0, 0) to that band's midpoint HCF.
-        Bands with fewer than
-        ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None`` in ``HouseRswtParams``).
+        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
+        ``dist_kwh`` band (see ``RSWT_LOAD_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
+        ``dist_water_kg`` on hours with max zone heat-call above
+        ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or top-k by heat-call if too few.
+        Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None``).
         """
         days = np.unique(self.df["day"].to_numpy())
         window_days = (days[-n:] if len(days) >= n else days).tolist()
         window_df = self.df.loc[self.df["day"].isin(window_days)]
 
         heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
-        rwt_cols = ["swt_average_f", "rwt_average_f", *heatcall_cols]
+        rwt_cols = ["swt_average_f", "rwt_average_f", "dist_kwh", *heatcall_cols]
         rwt_df = window_df[rwt_cols].dropna()
         if rwt_df.empty:
             raise ValueError(
-                f"{self.house_alias}: no rows with swt_average_f, rwt_average_f, and zone heat-call data "
-                f"in the last {n} day(s)"
+                f"{self.house_alias}: no rows with swt_average_f, rwt_average_f, dist_kwh, "
+                f"and zone heat-call data in the last {n} day(s)"
             )
-
-        rwt_df = rwt_df.copy()
-        rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
-        rwt_df = rwt_df.drop(columns=heatcall_cols)
 
         if "dist_water_kg" not in window_df.columns:
             raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
+        rwt_df = rwt_df.copy()
         rwt_df["dist_water_kg"] = window_df.loc[rwt_df.index, "dist_water_kg"]
+        rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
+        rwt_df = rwt_df.drop(columns=heatcall_cols)
 
-        bucket_fits: list[RswtHeatcallBucketFit | None] = []
+        bucket_fits: list[RswtLoadBucketFit | None] = []
         bucket_n_hours: list[int] = []
-        bucket_water_kg_hour: list[float | None] = []
+        bucket_mid_load_kwh: list[float] = []
         min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
-        bounds = self.RSWT_HEATCALL_BUCKET_BOUNDS
-        high_lo, high_hi, high_label = bounds[-1]
-        chc_reference_hcf = (high_lo + high_hi) / 2
+        bounds = self.RSWT_LOAD_BUCKET_BOUNDS
+        high_lo, high_hi, _high_load_label = bounds[-1]
+        prev_lo = bounds[-2][0]
+        chc_reference_load_kwh = (
+            high_lo + (high_lo - prev_lo) / 2
+            if not math.isfinite(high_hi)
+            else (high_lo + high_hi) / 2
+        )
         for idx, (lo, hi, label) in enumerate(bounds):
             is_last = idx == len(bounds) - 1
-            hc = rwt_df["max_zone_heatcall_fraction"]
-            if is_last:
-                mask = (hc >= lo) & (hc <= hi)
+            if is_last and not math.isfinite(hi):
+                mid_load = chc_reference_load_kwh
             else:
-                mask = (hc >= lo) & (hc < hi)
+                mid_load = (lo + hi) / 2
+            bucket_mid_load_kwh.append(mid_load)
+
+            load = rwt_df["dist_kwh"]
+            if is_last:
+                mask = load >= lo
+            else:
+                mask = (load >= lo) & (load < hi)
             bucket_df = rwt_df.loc[mask]
             n_bucket = len(bucket_df)
             bucket_n_hours.append(n_bucket)
@@ -734,70 +746,84 @@ class HouseEnergyParamsComputer:
                     f"RSWT {label}: skipped ({n_bucket} hour(s), need {min_rows})"
                 )
                 bucket_fits.append(None)
-                bucket_water_kg_hour.append(None)
                 continue
 
             intercept, slope = self._fit_rwt_vs_swt(bucket_df)
-            dist_water = bucket_df["dist_water_kg"].dropna()
-            if dist_water.empty:
-                raise ValueError(
-                    f"{self.house_alias}: no dist_water_kg values in heat-call band {label} "
-                    f"in the last {n} day(s)"
-                )
-            water_kg_hour = float(dist_water.mean())
             self._log_info(
                 f"RSWT {label}: {n_bucket} hour(s), "
-                f"intercept={intercept:.4f}, slope={slope:.4f}, "
-                f"water_kg_hour={water_kg_hour:.2f}"
+                f"intercept={intercept:.4f}, slope={slope:.4f}"
             )
             bucket_fits.append(
-                RswtHeatcallBucketFit(
+                RswtLoadBucketFit(
                     rwt_intercept=round(intercept, 6),
                     rwt_slope=round(slope, 6),
                 )
             )
-            bucket_water_kg_hour.append(water_kg_hour)
 
         if all(f is None for f in bucket_fits):
             raise ValueError(
-                f"{self.house_alias}: no heat-call band had at least {min_rows} hour(s) "
+                f"{self.house_alias}: no load band had at least {min_rows} hour(s) "
                 f"for RSWT fit in the last {n} day(s)"
             )
 
-        band_measurements = [
-            (label, (lo + hi) / 2, water)
-            for (lo, hi, label), water in zip(bounds, bucket_water_kg_hour, strict=True)
-            if water is not None
-        ]
-        water_kg_hour_chc_raw: float | None = None
-        for label, _hcf_mid, water in band_measurements:
-            if label == high_label:
-                water_kg_hour_chc_raw = water
-                break
-        if water_kg_hour_chc_raw is None:
-            _label, hcf_mid, water = max(band_measurements, key=lambda m: m[1])
-            water_kg_hour_chc_raw = water * (chc_reference_hcf / hcf_mid)
-        water_kg_hour_chc = round(water_kg_hour_chc_raw, 2)
-        self._log_info(f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg")
+        threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
+        floor = self.RSWT_CHC_HEATCALL_FLOOR
+        hc = rwt_df["max_zone_heatcall_fraction"]
+        above_threshold = rwt_df.loc[hc > threshold]
+        if len(above_threshold) >= min_rows:
+            chc_df = above_threshold
+            self._log_info(
+                f"CHC water: {len(chc_df)} hour(s) with max zone heat-call > {threshold}"
+            )
+        else:
+            n_above = len(above_threshold)
+            k = min(min_rows, len(rwt_df))
+            floored = rwt_df.loc[hc >= floor]
+            if len(floored) >= k:
+                pool = floored
+                pool_label = f"heat-call >= {floor}"
+            else:
+                pool = rwt_df
+                pool_label = "all hours"
+            chc_df = pool.nlargest(k, "max_zone_heatcall_fraction")
+            min_hc = float(chc_df["max_zone_heatcall_fraction"].min())
+            max_hc = float(chc_df["max_zone_heatcall_fraction"].max())
+            self._log_info(
+                f"CHC water: only {n_above} hour(s) above {threshold}, "
+                f"using top {len(chc_df)} by heat-call from {pool_label} "
+                f"(heat-call {min_hc:.2f}–{max_hc:.2f})"
+            )
+
+        chc_dist_water = chc_df["dist_water_kg"].dropna()
+        if chc_dist_water.empty:
+            raise ValueError(
+                f"{self.house_alias}: no dist_water_kg on CHC training rows "
+                f"in the last {n} day(s)"
+            )
+        water_kg_hour_chc = round(float(chc_dist_water.mean()), 2)
+        water_chc_n_hours = len(chc_dist_water)
+        self._log_info(
+            f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg "
+            f"(mean over {water_chc_n_hours} CHC training hour(s))"
+        )
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
         plot_rswt_fit(
             rwt_df["swt_average_f"].to_numpy(),
             rwt_df["rwt_average_f"].to_numpy(),
-            rwt_df["max_zone_heatcall_fraction"].to_numpy(),
+            rwt_df["dist_kwh"].to_numpy(),
             bucket_fits=[
-                (label, fit, n_hours, (lo + hi) / 2, water)
-                for (lo, hi, label), fit, n_hours, water in zip(
+                (label, fit, n_hours, mid_load)
+                for (_, _, label), fit, n_hours, mid_load in zip(
                     bounds,
                     bucket_fits,
                     bucket_n_hours,
-                    bucket_water_kg_hour,
+                    bucket_mid_load_kwh,
                     strict=True,
                 )
             ],
             water_kg_hour_chc=water_kg_hour_chc,
-            chc_reference_hcf=chc_reference_hcf,
-            high_heatcall_band_label=high_label,
+            water_chc_n_hours=water_chc_n_hours,
             house_alias=self.house_alias,
             n_days=n,
             savepath=self.results_dir / f"{self.house_alias}_rswt_fit_N{n}.png",
@@ -806,11 +832,11 @@ class HouseEnergyParamsComputer:
         return HouseRswtParams(
             rwt_min=50.0,
             water_kg_hour_chc=water_kg_hour_chc,
-            hc_0_20=bucket_fits[0],
-            hc_20_40=bucket_fits[1],
-            hc_40_60=bucket_fits[2],
-            hc_60_80=bucket_fits[3],
-            hc_80_100=bucket_fits[4],
+            load_0_2=bucket_fits[0],
+            load_2_4=bucket_fits[1],
+            load_4_6=bucket_fits[2],
+            load_6_8=bucket_fits[3],
+            load_8_plus=bucket_fits[4],
         )
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:

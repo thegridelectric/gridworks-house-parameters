@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
-    from house_parameters import RswtHeatcallBucketFit
+    from house_parameters import RswtLoadBucketFit
 
 
 def _hourly_residual_mean_and_ci95(
@@ -282,12 +282,11 @@ def plot_data_distribution(
 def plot_rswt_fit(
     swt: np.ndarray,
     rwt: np.ndarray,
-    max_zone_heatcall_fraction: np.ndarray,
+    dist_kwh: np.ndarray,
     *,
-    bucket_fits: list[tuple[str, RswtHeatcallBucketFit | None, int, float, float | None]],
+    bucket_fits: list[tuple[str, RswtLoadBucketFit | None, int, float]],
     water_kg_hour_chc: float,
-    chc_reference_hcf: float,
-    high_heatcall_band_label: str,
+    water_chc_n_hours: int,
     house_alias: str,
     n_days: int,
     savepath: Path | None = None,
@@ -297,8 +296,9 @@ def plot_rswt_fit(
 
     swt = np.asarray(swt, dtype=float)
     rwt = np.asarray(rwt, dtype=float)
-    heatcall = np.asarray(max_zone_heatcall_fraction, dtype=float)
-    heatcall_norm = Normalize(vmin=0.0, vmax=1.0)
+    load_kwh = np.asarray(dist_kwh, dtype=float)
+    load_max = float(np.nanmax(load_kwh)) if load_kwh.size else 1.0
+    load_norm = Normalize(vmin=0.0, vmax=max(load_max, 1.0))
     n_buckets = len(bucket_fits)
     gray = np.linspace(0.78, 0.0, n_buckets) if n_buckets else np.array([])
     line_colors = [(float(g), float(g), float(g)) for g in gray]
@@ -307,16 +307,16 @@ def plot_rswt_fit(
     sc = ax_rwt.scatter(
         swt,
         rwt,
-        c=heatcall,
+        c=load_kwh,
         cmap=plt.cm.coolwarm,
         s=22,
         alpha=0.65,
-        norm=heatcall_norm,
+        norm=load_norm,
         label="Hourly data",
     )
 
     swt_line = np.linspace(float(np.min(swt)), float(np.max(swt)), num=100)
-    for color, (label, fit, n_hours, _hcf_mid, _water) in zip(
+    for color, (label, fit, n_hours, _load_mid) in zip(
         line_colors, bucket_fits, strict=True
     ):
         if fit is None:
@@ -335,61 +335,35 @@ def plot_rswt_fit(
     ax_rwt.legend(loc="upper left", fontsize=8)
 
     cbar = fig.colorbar(sc, ax=ax_rwt)
-    cbar.set_label("max zone heat-call fraction")
+    cbar.set_label("dist_kwh")
 
-    hcf_mids = [hcf_mid for *_rest, hcf_mid, _water in bucket_fits]
-    has_high_band_measured = False
+    chc_reference_hcf = 0.9
+    ax_water.scatter(
+        [chc_reference_hcf],
+        [water_kg_hour_chc],
+        color="0.35",
+        s=90,
+        zorder=4,
+        label=f"water_kg_hour_chc (n={water_chc_n_hours})",
+    )
 
-    for color, (label, fit, n_hours, hcf_mid, water_measured) in zip(
-        line_colors, bucket_fits, strict=True
-    ):
-        if water_measured is None:
-            continue
-        if label == high_heatcall_band_label:
-            has_high_band_measured = True
-        ax_water.scatter(
-            [hcf_mid],
-            [water_measured],
-            color=color,
-            s=70,
-            zorder=3,
-            label=f"{label} measured (n={n_hours})",
-        )
-
-    if not has_high_band_measured:
-        ax_water.scatter(
-            [chc_reference_hcf],
-            [water_kg_hour_chc],
-            facecolors="none",
-            edgecolors="0.15",
-            s=90,
-            linewidths=1.5,
-            zorder=4,
-            label=(
-                f"water_kg_hour_chc at {chc_reference_hcf:g} (extrapolated)"
-            ),
-        )
-
-    hcf_line = [0.0, *hcf_mids]
+    hcf_line = [0.0, chc_reference_hcf]
     scaled_water = [
         water_kg_hour_chc * (hcf / chc_reference_hcf) for hcf in hcf_line
     ]
-    ref_label = f"{chc_reference_hcf:g}"
     ax_water.plot(
         hcf_line,
         scaled_water,
         color="0.35",
         linestyle="--",
-        marker="o",
-        markersize=5,
         linewidth=1.5,
         zorder=2,
-        label=f"water_kg_hour_chc × hcf / {ref_label}",
+        label="water_kg_hour_chc × hcf / 0.9",
     )
 
-    ax_water.set_xlabel("Representative max zone heat-call (bucket midpoint)")
+    ax_water.set_xlabel("Max zone heat-call fraction")
     ax_water.set_ylabel("Water flow (kg/h)")
-    ax_water.set_title("dist_water_kg mean by heat-call band")
+    ax_water.set_title("CHC water flow vs heat-call")
     ax_water.set_xlim(-0.02, 1.02)
     ax_water.legend(loc="best", fontsize=8)
     ax_water.grid(True, alpha=0.3)
