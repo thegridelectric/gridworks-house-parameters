@@ -29,19 +29,28 @@ class HouseEnergyParams:
     is_baseline: bool = False
 
 
-@dataclass
-class HouseRswtParams:
-    rwt_min: float
+@dataclass(frozen=True)
+class RswtHeatcallBucketFit:
     rwt_intercept: float
     rwt_slope: float
-    rwt_intercept_chc: float
-    rwt_slope_chc: float
+
+
+@dataclass(frozen=True)
+class HouseRswtParams:
+    rwt_min: float
     water_kg_hour_chc: float
+    hc_0_20: RswtHeatcallBucketFit | None
+    hc_20_40: RswtHeatcallBucketFit | None
+    hc_40_60: RswtHeatcallBucketFit | None
+    hc_60_80: RswtHeatcallBucketFit | None
+    hc_80_100: RswtHeatcallBucketFit | None
 
 
 class HouseEnergyParamsComputer:
     # Data source
     DATA_SOURCE: Literal["database", "csv"] = "database"
+    HOURLY_DATA_DIR = Path("data")
+    FORCE_DATABASE_REFRESH: bool = False
 
     # Data cleaning - erroneous data
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
@@ -106,9 +115,14 @@ class HouseEnergyParamsComputer:
     MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
     ROLLING_AVG_HOURS = 4
-    RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
-    RSWT_CHC_MIN_FIT_ROWS = 20
-    RSWT_CHC_HEATCALL_FLOOR = 0.7
+    RSWT_HEATCALL_BUCKET_BOUNDS: tuple[tuple[float, float, str], ...] = (
+        (0.0, 0.2, "0-20%"),
+        (0.2, 0.4, "20-40%"),
+        (0.4, 0.6, "40-60%"),
+        (0.6, 0.8, "60-80%"),
+        (0.8, 1.0, "80-100%"),
+    )
+    RSWT_BUCKET_MIN_FIT_ROWS = 20
 
     def __init__(
         self,
@@ -152,65 +166,113 @@ class HouseEnergyParamsComputer:
         - Checks that all required columns are present
         """
         if self.DATA_SOURCE == "csv":
-            csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
+            csv_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
             df = pd.read_csv(csv_path)
             self._log_info(f"Loaded {csv_path}")
 
         elif self.DATA_SOURCE == "database":
-            fetcher = HouseParamsDataFetcher(
-                self.house_alias,
-                self.start_time,
-                self.end_time,
-                self.timezone,
+            range_start = pd.Timestamp(
+                self.start_time.astimezone(self.timezone).replace(tzinfo=None)
             )
-            channel_data_by_hour_start, csv_fieldnames, zone_numbers = fetcher.fetch()
-            rows: list[dict[str, object]] = []
-            for hour in sorted(channel_data_by_hour_start.keys()):
-                data = channel_data_by_hour_start[hour]
-                row: dict[str, object] = {
-                    "hour_start": hour,
-                    "oat_f": data.get("oat_f", np.nan),
-                    "ws_mph": data.get("ws_mph", np.nan),
-                    "solar_w_m2": data.get("solar_w_m2", np.nan),
-                    "dist_kwh": data.get("dist_kwh", 0.0),
-                    "hp_kwh_th": data.get("hp_kwh_th", 0.0),
-                    "swt_average_f": data.get("swt_average_f", np.nan),
-                    "rwt_average_f": data.get("rwt_average_f", np.nan),
-                    "dist_water_kg": data.get("dist_water_kg", np.nan),
-                    "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
-                }
-                for zone in zone_numbers:
-                    row[f"zone{zone}_heatcall_fraction"] = data.get(
-                        f"zone{zone}_heatcall_fraction", 0.0
+            range_end = pd.Timestamp(
+                self.end_time.astimezone(self.timezone).replace(tzinfo=None)
+            )
+            cache_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_input_data.csv"
+            df = None
+            if not self.FORCE_DATABASE_REFRESH and cache_path.is_file():
+                cached = pd.read_csv(cache_path)
+                cached["hour_start"] = pd.to_datetime(cached["hour_start"])
+                expected_hours = pd.date_range(
+                    start=range_start,
+                    end=range_end,
+                    freq="h",
+                    inclusive="left",
+                )
+                in_range = cached.loc[
+                    (cached["hour_start"] >= range_start)
+                    & (cached["hour_start"] < range_end),
+                    "hour_start",
+                ]
+                cache_ok = expected_hours.empty or (
+                    len(in_range) == len(expected_hours)
+                    and set(in_range) == set(expected_hours)
+                )
+                if cache_ok:
+                    df = cached
+                    self._log_info(f"Loaded hourly data from cache {cache_path}")
+                else:
+                    self._log_info(
+                        f"Cache {cache_path} missing hours for "
+                        f"{range_start.isoformat()}–{range_end.isoformat()}; "
+                        f"querying database"
                     )
-                for zone in zone_numbers:
-                    row[f"zone{zone}_avg_set"] = data.get(f"zone{zone}_avg_set", np.nan)
-                    row[f"zone{zone}_avg_temp"] = data.get(f"zone{zone}_avg_temp", np.nan)
-                rows.append(row)
-            df = pd.DataFrame(rows, columns=csv_fieldnames)
-            # Temporary: weather is not in the database yet; take oat/ws/solar from CSV.
-            weather_csv_path = Path("data") / f"{self.house_alias}_house_params_data.csv"
+            loaded_from_cache = df is not None
+            if df is None:
+                self.HOURLY_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                fetcher = HouseParamsDataFetcher(
+                    self.house_alias,
+                    self.start_time,
+                    self.end_time,
+                    self.timezone,
+                )
+                (
+                    channel_data_by_hour_start,
+                    csv_fieldnames,
+                    zone_numbers,
+                ) = fetcher.fetch()
+                rows: list[dict[str, object]] = []
+                for hour in sorted(channel_data_by_hour_start.keys()):
+                    data = channel_data_by_hour_start[hour]
+                    row: dict[str, object] = {
+                        "hour_start": hour,
+                        "oat_f": data.get("oat_f", np.nan),
+                        "ws_mph": data.get("ws_mph", np.nan),
+                        "solar_w_m2": data.get("solar_w_m2", np.nan),
+                        "dist_kwh": data.get("dist_kwh", 0.0),
+                        "hp_kwh_th": data.get("hp_kwh_th", 0.0),
+                        "swt_average_f": data.get("swt_average_f", np.nan),
+                        "rwt_average_f": data.get("rwt_average_f", np.nan),
+                        "dist_water_kg": data.get("dist_water_kg", np.nan),
+                        "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
+                    }
+                    for zone in zone_numbers:
+                        row[f"zone{zone}_heatcall_fraction"] = data.get(
+                            f"zone{zone}_heatcall_fraction", 0.0
+                        )
+                    for zone in zone_numbers:
+                        row[f"zone{zone}_avg_set"] = data.get(
+                            f"zone{zone}_avg_set", np.nan
+                        )
+                        row[f"zone{zone}_avg_temp"] = data.get(
+                            f"zone{zone}_avg_temp", np.nan
+                        )
+                    rows.append(row)
+                df = pd.DataFrame(rows, columns=csv_fieldnames)
+                self._log_info(f"Loaded data from database ({len(df)} rows)")
+
+            weather_csv_path = (
+                self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
+            )
             weather_df = pd.read_csv(
                 weather_csv_path,
                 usecols=["hour_start", "oat_f", "ws_mph", "solar_w_m2"],
             )
             weather_df["hour_start"] = pd.to_datetime(weather_df["hour_start"])
             df["hour_start"] = pd.to_datetime(df["hour_start"])
-            df = df.drop(columns=["oat_f", "ws_mph", "solar_w_m2"]).merge(
-                weather_df, on="hour_start", how="left"
-            )
-            self._log_info(
-                f"Loaded data from database ({len(df)} rows); "
-                f"weather from {weather_csv_path}"
-            )
-            df.to_csv(Path("data") / f"{self.house_alias}_input_data.csv", index=False)
+            df = df.drop(
+                columns=["oat_f", "ws_mph", "solar_w_m2"], errors="ignore"
+            ).merge(weather_df, on="hour_start", how="left")
+            self._log_info(f"Weather from {weather_csv_path}")
+            if not loaded_from_cache:
+                df.to_csv(cache_path, index=False)
+                self._log_info(f"Wrote hourly data cache to {cache_path}")
 
         else:
             raise ValueError(f"Unsupported DATA_SOURCE: {self.DATA_SOURCE!r}")
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
-        range_start = self.start_time.astimezone(self.timezone).replace(tzinfo=None)
-        range_end = self.end_time.astimezone(self.timezone).replace(tzinfo=None)
+        range_start = pd.Timestamp(self.start_time.astimezone(self.timezone).replace(tzinfo=None))
+        range_end = pd.Timestamp(self.end_time.astimezone(self.timezone).replace(tzinfo=None))
         df = df.loc[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
         self._log_info(
             f"Cropped datafrom {range_start.isoformat()} to "
@@ -622,9 +684,12 @@ class HouseEnergyParamsComputer:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
 
-        Uses ``rwt_average_f ~ rwt_intercept + rwt_slope * swt_average_f`` on all complete rows,
-        and the same model on high heat-call hours for the ``_chc`` params (threshold, or top-k fallback).
-        ``water_kg_hour_chc`` is the mean hourly ``dist_water_kg`` over those CHC training rows.
+        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each max zone
+        heat-call band (see ``RSWT_HEATCALL_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
+        ``dist_water_kg`` in the highest heat-call band when fitted, otherwise
+        scaled from the highest fitted band through (0, 0) to that band's midpoint HCF.
+        Bands with fewer than
+        ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None`` in ``HouseRswtParams``).
         """
         days = np.unique(self.df["day"].to_numpy())
         window_days = (days[-n:] if len(days) >= n else days).tolist()
@@ -647,59 +712,92 @@ class HouseEnergyParamsComputer:
             raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
         rwt_df["dist_water_kg"] = window_df.loc[rwt_df.index, "dist_water_kg"]
 
-        rwt_intercept, rwt_slope = self._fit_rwt_vs_swt(rwt_df)
-
-        threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
-        min_rows = self.RSWT_CHC_MIN_FIT_ROWS
-        floor = self.RSWT_CHC_HEATCALL_FLOOR
-        above_threshold = rwt_df.loc[rwt_df["max_zone_heatcall_fraction"] > threshold]
-        if len(above_threshold) >= min_rows:
-            chc_df = above_threshold
-            self._log_info(
-                f"CHC fit: {len(chc_df)} hour(s) with max zone heat-call > {threshold}"
-            )
-        else:
-            n_above = len(above_threshold)
-            k = min(min_rows, len(rwt_df))
-            floored = rwt_df.loc[rwt_df["max_zone_heatcall_fraction"] >= floor]
-            if len(floored) >= k:
-                pool = floored
-                pool_label = f"heat-call >= {floor}"
+        bucket_fits: list[RswtHeatcallBucketFit | None] = []
+        bucket_n_hours: list[int] = []
+        bucket_water_kg_hour: list[float | None] = []
+        min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
+        bounds = self.RSWT_HEATCALL_BUCKET_BOUNDS
+        high_lo, high_hi, high_label = bounds[-1]
+        chc_reference_hcf = (high_lo + high_hi) / 2
+        for idx, (lo, hi, label) in enumerate(bounds):
+            is_last = idx == len(bounds) - 1
+            hc = rwt_df["max_zone_heatcall_fraction"]
+            if is_last:
+                mask = (hc >= lo) & (hc <= hi)
             else:
-                pool = rwt_df
-                pool_label = "all hours"
-            chc_df = pool.nlargest(k, "max_zone_heatcall_fraction")
-            min_hc = float(chc_df["max_zone_heatcall_fraction"].min())
-            max_hc = float(chc_df["max_zone_heatcall_fraction"].max())
+                mask = (hc >= lo) & (hc < hi)
+            bucket_df = rwt_df.loc[mask]
+            n_bucket = len(bucket_df)
+            bucket_n_hours.append(n_bucket)
+            if n_bucket < min_rows:
+                self._log_info(
+                    f"RSWT {label}: skipped ({n_bucket} hour(s), need {min_rows})"
+                )
+                bucket_fits.append(None)
+                bucket_water_kg_hour.append(None)
+                continue
+
+            intercept, slope = self._fit_rwt_vs_swt(bucket_df)
+            dist_water = bucket_df["dist_water_kg"].dropna()
+            if dist_water.empty:
+                raise ValueError(
+                    f"{self.house_alias}: no dist_water_kg values in heat-call band {label} "
+                    f"in the last {n} day(s)"
+                )
+            water_kg_hour = float(dist_water.mean())
             self._log_info(
-                f"CHC fit: only {n_above} hour(s) above {threshold}, "
-                f"using top {len(chc_df)} by heat-call from {pool_label} "
-                f"(heat-call {min_hc:.2f}–{max_hc:.2f})"
+                f"RSWT {label}: {n_bucket} hour(s), "
+                f"intercept={intercept:.4f}, slope={slope:.4f}, "
+                f"water_kg_hour={water_kg_hour:.2f}"
             )
+            bucket_fits.append(
+                RswtHeatcallBucketFit(
+                    rwt_intercept=round(intercept, 6),
+                    rwt_slope=round(slope, 6),
+                )
+            )
+            bucket_water_kg_hour.append(water_kg_hour)
 
-        rwt_intercept_chc, rwt_slope_chc = self._fit_rwt_vs_swt(chc_df)
-
-        chc_dist_water_kg = chc_df["dist_water_kg"].dropna()
-        if chc_dist_water_kg.empty:
+        if all(f is None for f in bucket_fits):
             raise ValueError(
-                f"{self.house_alias}: no dist_water_kg values on CHC regression training rows "
-                f"in the last {n} day(s)"
+                f"{self.house_alias}: no heat-call band had at least {min_rows} hour(s) "
+                f"for RSWT fit in the last {n} day(s)"
             )
-        water_kg_hour_chc = float(chc_dist_water_kg.mean())
-        self._log_info(
-            f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg "
-            f"(mean dist_water_kg over {len(chc_dist_water_kg)} CHC training hour(s))"
-        )
+
+        band_measurements = [
+            (label, (lo + hi) / 2, water)
+            for (lo, hi, label), water in zip(bounds, bucket_water_kg_hour, strict=True)
+            if water is not None
+        ]
+        water_kg_hour_chc_raw: float | None = None
+        for label, _hcf_mid, water in band_measurements:
+            if label == high_label:
+                water_kg_hour_chc_raw = water
+                break
+        if water_kg_hour_chc_raw is None:
+            _label, hcf_mid, water = max(band_measurements, key=lambda m: m[1])
+            water_kg_hour_chc_raw = water * (chc_reference_hcf / hcf_mid)
+        water_kg_hour_chc = round(water_kg_hour_chc_raw, 2)
+        self._log_info(f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg")
 
         self.results_dir.mkdir(parents=True, exist_ok=True)
         plot_rswt_fit(
             rwt_df["swt_average_f"].to_numpy(),
             rwt_df["rwt_average_f"].to_numpy(),
             rwt_df["max_zone_heatcall_fraction"].to_numpy(),
-            rwt_intercept=rwt_intercept,
-            rwt_slope=rwt_slope,
-            rwt_intercept_chc=rwt_intercept_chc,
-            rwt_slope_chc=rwt_slope_chc,
+            bucket_fits=[
+                (label, fit, n_hours, (lo + hi) / 2, water)
+                for (lo, hi, label), fit, n_hours, water in zip(
+                    bounds,
+                    bucket_fits,
+                    bucket_n_hours,
+                    bucket_water_kg_hour,
+                    strict=True,
+                )
+            ],
+            water_kg_hour_chc=water_kg_hour_chc,
+            chc_reference_hcf=chc_reference_hcf,
+            high_heatcall_band_label=high_label,
             house_alias=self.house_alias,
             n_days=n,
             savepath=self.results_dir / f"{self.house_alias}_rswt_fit_N{n}.png",
@@ -707,11 +805,12 @@ class HouseEnergyParamsComputer:
 
         return HouseRswtParams(
             rwt_min=50.0,
-            rwt_intercept=round(rwt_intercept, 6),
-            rwt_slope=round(rwt_slope, 6),
-            rwt_intercept_chc=round(rwt_intercept_chc, 6),
-            rwt_slope_chc=round(rwt_slope_chc, 6),
-            water_kg_hour_chc=round(water_kg_hour_chc, 2),
+            water_kg_hour_chc=water_kg_hour_chc,
+            hc_0_20=bucket_fits[0],
+            hc_20_40=bucket_fits[1],
+            hc_40_60=bucket_fits[2],
+            hc_60_80=bucket_fits[3],
+            hc_80_100=bucket_fits[4],
         )
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:
