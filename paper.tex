@@ -2,29 +2,24 @@
 How the house predicted heat load value is created using the following three steps.
 
 \begin{itemize}
-    \item Estimate hourly distribution energy using a simple regression based on weather data, as shown in Equation \ref{eq:distributed_predicted_regression} where $Q_\text{P, d}$ is the predicted delivered energy, $a$ is a regression coefficient, $b$ is a regression coefficient, $T_\text{O}$ is the OAT, $c$ is a regression coefficient, $\dot{V}_{\text{W}}$ is the wind speed, and 18 is the assumed indoor air temperature.
-    \item Find the ratio of losses between the heat pump and the distribution system. Because of the losses in the basement pipes, the above equation predicts the hourly distribution energy, not directly the full hourly house heating energy. To convert it, compute the scaling factor R as shown in Equation \ref{eq:scaling_factor}, where $Q_\text{HP}$ is the thermal heat provided by the AWHP.
-    \item Apply the scaling factor over each hour, providing the final hourly value as shown in Equation \ref{eq:house_predicted_energy} where $Q_\text{P, H}$ is the hourly predicted heating amount for the entire house.
+    \item Estimate hourly house heating energy using a multivariate linear regression based on weather and recent load, as shown in Equation \ref{eq:house_predicted_regression}. Here $Q_\text{P, H}$ is the predicted hourly house heating energy, $b_0,\ldots,b_6$ are regression coefficients, $\Delta T = \max(0, \bar{T}_\text{set} - T_\text{O})$ is the average zone setpoint minus OAT ($T_\text{O}$), $\dot{V}_\text{W}$ is wind speed, $I_\text{S}$ is solar irradiance, $\bar{T}_\text{O,4h}$ is the four-hour average OAT, and $Q_{\text{P,H},t-1}$ and $\bar{Q}_\text{P,H,4h}$ are the previous hour and four-hour average house energy use (distribution-side measurements scaled to house level; see below).
+    \item Define the scaling factor $R$ as shown in Equation \ref{eq:scaling_factor}, where $Q_\text{HP}$ is the thermal heat provided by the AWHP and $Q_{\text{m,d}}$ is the measured hourly distribution energy. Because of losses in the basement pipes, the regression is fit to $R\,Q_{\text{m,d}}$ each hour so that total scaled distribution energy matches total AWHP output over the monitoring period.
+    \item Apply the fitted regression each hour to obtain $Q_\text{P, H}$, setting the value to zero if negative.
 \end{itemize}
 
 
 \begin{equation}
-Q_\text{P, d} = a + b * T_\text{O} + c * \dot{V}_{\text{W}} * (18 - T_\text{O})
-\label{eq:distributed_predicted_regression}
+Q_\text{P, H} = b_0 + b_1 \Delta T + b_2 \dot{V}_\text{W} \Delta T + b_3 I_\text{S} + b_4 Q_{\text{P,H},t-1} + b_5 \bar{T}_\text{O,4h} + b_6 \bar{Q}_\text{P,H,4h}
+\label{eq:house_predicted_regression}
 \end{equation}
 
 
-The regression coefficients in Equation \ref{eq:distributed_predicted_regression}  are found by fitting the equation to all available hourly measurements so that the prediction matches the measured delivered energy as closely as possible overall. More precisely, they are chosen to minimize the sum of squared errors over the monitoring period. The regression finds the values of alpha, beta, and gamma that give the best overall match between measured hourly distribution energy and the weather-based prediction. For each hour, this predicted distribution-side energy is then used (and set to zero if negative).
+The regression coefficients in Equation \ref{eq:house_predicted_regression} are found by fitting the equation to all available cleaned hourly measurements so that the prediction matches $R\,Q_{\text{m,d}}$ as closely as possible overall. More precisely, they are chosen by ordinary least squares to minimize the sum of squared errors over the monitoring period. Coefficient values and standard errors for each house are given in Table \ref{tab:regression_results}.
 
 
 \begin{equation}
-R = \sum(Q_\text{HP}) / \sum(Q_\text{P, d})
+R = \sum(Q_\text{HP}) / \sum(Q_{\text{m,d}})
 \label{eq:scaling_factor}
-\end{equation}
-
-\begin{equation}
-Q_\text{P, H} = R * Q_\text{P, d}
-\label{eq:house_predicted_energy}
 \end{equation}
 
 \begin{table}[htbp]

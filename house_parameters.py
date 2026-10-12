@@ -11,6 +11,9 @@ import pandas as pd
 
 from get_data import HouseParamsDataFetcher
 from plots import (
+    EnergyVsSwtPanelData,
+    _coldest_hour_legend_label,
+    plot_estimated_energy_vs_swt as render_estimated_energy_vs_swt_plot,
     plot_oos_residual_by_hour_of_day,
     plot_oos_rmse_by_lead,
     plot_pred_vs_actual,
@@ -28,6 +31,211 @@ class HouseEnergyParams:
     r_squared: float
     energy_ratio: float
     is_baseline: bool = False
+
+
+def _house_table_column_title(house_alias: str) -> str:
+    return house_alias.replace("_", " ").title()
+
+
+_ENERGY_COEFFICIENT_DESCRIPTIONS: dict[str, str] = {
+    "deltaT": "Delta T (setpoint − OAT)",
+    "windspeed_times_deltaT": "Wind speed × delta T",
+    "solar_w_m2": "Solar irradiance (W/m²)",
+    "previous_dist_kwh_scaled": "Previous hour scaled distribution kWh",
+    "OAT_avg_4h": "Average OAT (4 h)",
+    "dist_kwh_scaled_avg_4h": "Average scaled distribution kWh (4 h)",
+    "oat_f": "Outdoor air temperature (OAT)",
+    "windspeed_times_65_minus_oat": "Wind speed × (65°F − OAT)",
+}
+
+
+def _energy_regression_term_description(
+    feature_names: tuple[str, ...], b_index: int
+) -> str:
+    if b_index == 0:
+        return "Intercept"
+    name = feature_names[b_index - 1]
+    if name in _ENERGY_COEFFICIENT_DESCRIPTIONS:
+        return _ENERGY_COEFFICIENT_DESCRIPTIONS[name]
+    if name.startswith("wd_hour_"):
+        hour = name.removeprefix("wd_hour_")
+        return f"Weekday occupancy hour {hour}"
+    if name.startswith("we_hour_"):
+        hour = name.removeprefix("we_hour_")
+        return f"Weekend occupancy hour {hour}"
+    return name
+
+
+def write_energy_regression_table_xlsx(
+    params_by_house_alias: dict[str, HouseEnergyParams],
+    path: Path,
+    *,
+    house_order: list[str] | None = None,
+) -> None:
+    """
+    Write one column per house: B0 (intercept), B1…Bn (features), then R².
+    Each coefficient has two rows (Coefficient, Std Error), matching the grid energy fit.
+    """
+    aliases = house_order or sorted(params_by_house_alias.keys())
+    columns: dict[str, list[float | None]] = {}
+    index_tuples: list[tuple[str, str]] = []
+    term_descriptions: list[str] = []
+    n_params: int | None = None
+    reference_feature_names: tuple[str, ...] = ()
+
+    for alias in aliases:
+        params = params_by_house_alias.get(alias)
+        if params is None or params.is_baseline:
+            continue
+        if n_params is None:
+            n_params = len(params.values)
+            reference_feature_names = params.feature_names
+            for i in range(n_params):
+                index_tuples.append((f"B{i}", "Coefficient"))
+                index_tuples.append((f"B{i}", "Std Error"))
+                term_descriptions.append(
+                    _energy_regression_term_description(reference_feature_names, i)
+                )
+                term_descriptions.append("")
+            index_tuples.append(("R²", "Coefficient"))
+            index_tuples.append(("R²", "Std Error"))
+            term_descriptions.append("R²")
+            term_descriptions.append("")
+
+        col_title = _house_table_column_title(alias)
+        cells: list[float | None] = []
+        for value, stderr in zip(params.values, params.std_errors, strict=True):
+            cells.append(float(value))
+            cells.append(float(stderr))
+        cells.append(float(params.r_squared))
+        cells.append(None)
+        columns[col_title] = cells
+
+    if not columns or n_params is None:
+        raise ValueError("No non-baseline energy regression results to export")
+
+    index = pd.MultiIndex.from_tuples(index_tuples, names=("Parameter", "Statistic"))
+    table = pd.DataFrame(columns, index=index)
+    table.insert(0, "Term", term_descriptions)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    table.to_excel(path, merge_cells=False)
+
+
+MAPLE_OAT_OPERATING_BINS_C: tuple[tuple[float, float, str], ...] = (
+    (-25.0, -15.0, "-25 to -15"),
+    (-15.0, -10.0, "-15 to -10"),
+    (-10.0, -5.0, "-10 to -5"),
+)
+
+
+def _fahrenheit_to_celsius(values: np.ndarray | pd.Series) -> np.ndarray:
+    return (np.asarray(values, dtype=float) - 32.0) * 5.0 / 9.0
+
+
+def maple_operating_stats_by_oat_bin(
+    computer: "HouseEnergyParamsComputer",
+) -> pd.DataFrame:
+    """
+    Operating metrics by outside-air temperature bin (°C), on cleaned hourly data.
+    """
+    df = computer.df
+    oat_c = _fahrenheit_to_celsius(df["oat_f"])
+    max_hc = computer._max_zone_heatcall_fraction(df)
+    rows: list[dict[str, object]] = []
+    for lo, hi, label in MAPLE_OAT_OPERATING_BINS_C:
+        mask = (oat_c >= lo) & (oat_c < hi)
+        sub = df.loc[mask]
+        n_hours = int(mask.sum())
+        swt_c = _fahrenheit_to_celsius(sub["swt_average_f"].dropna())
+        mean_swt_c = float(swt_c.mean()) if len(swt_c) else math.nan
+        hc_sub = max_hc.loc[mask]
+        if n_hours:
+            building_heat_call_pct = float(hc_sub.mean() * 100.0)
+            hours_ge_80_pct_heat_call_pct = float((hc_sub >= 0.8).mean() * 100.0)
+            heat_delivered_kwh = float(sub["dist_kwh"].mean())
+        else:
+            building_heat_call_pct = math.nan
+            hours_ge_80_pct_heat_call_pct = math.nan
+            heat_delivered_kwh = math.nan
+        rows.append(
+            {
+                "OAT (°C)": label,
+                "OAT lower (°C)": lo,
+                "OAT upper (°C)": hi,
+                "n_hours": n_hours,
+                "Mean SWT (°C)": mean_swt_c,
+                "Building heat-call time (%)": building_heat_call_pct,
+                "Hours ≥ 80% heat call (%)": hours_ge_80_pct_heat_call_pct,
+                "Heat delivered (kWh)": heat_delivered_kwh,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _before_after_numeric(before: float, after: float, *, decimals: int) -> str:
+    if not (math.isfinite(before) and math.isfinite(after)):
+        return ""
+    return f"{before:.{decimals}f} → {after:.{decimals}f}"
+
+
+def _before_after_percent(before: float, after: float) -> str:
+    if not (math.isfinite(before) and math.isfinite(after)):
+        return ""
+    return f"{round(before)}% → {round(after)}%"
+
+
+def write_maple_operating_characteristics_xlsx(
+    before_computer: "HouseEnergyParamsComputer",
+    after_computer: "HouseEnergyParamsComputer",
+    path: Path,
+) -> None:
+    """
+    Compare maple_before and maple_after operating metrics by OAT bin (Table 8 style).
+    """
+    before = maple_operating_stats_by_oat_bin(before_computer)
+    after = maple_operating_stats_by_oat_bin(after_computer)
+    comparison = pd.DataFrame(
+        {
+            "OAT (°C)": before["OAT (°C)"],
+            "Mean SWT (°C)": [
+                _before_after_numeric(b, a, decimals=1)
+                for b, a in zip(
+                    before["Mean SWT (°C)"],
+                    after["Mean SWT (°C)"],
+                    strict=True,
+                )
+            ],
+            "Building heat-call time": [
+                _before_after_percent(b, a)
+                for b, a in zip(
+                    before["Building heat-call time (%)"],
+                    after["Building heat-call time (%)"],
+                    strict=True,
+                )
+            ],
+            "Hours ≥ 80% heat call": [
+                _before_after_percent(b, a)
+                for b, a in zip(
+                    before["Hours ≥ 80% heat call (%)"],
+                    after["Hours ≥ 80% heat call (%)"],
+                    strict=True,
+                )
+            ],
+            "Heat delivered (kWh)": [
+                _before_after_numeric(b, a, decimals=2)
+                for b, a in zip(
+                    before["Heat delivered (kWh)"],
+                    after["Heat delivered (kWh)"],
+                    strict=True,
+                )
+            ],
+        }
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        comparison.to_excel(writer, sheet_name="Before vs after", index=False)
+        before.to_excel(writer, sheet_name="Maple before", index=False)
+        after.to_excel(writer, sheet_name="Maple after", index=False)
 
 
 @dataclass(frozen=True)
@@ -52,6 +260,13 @@ class HouseEnergyParamsComputer:
     DATA_SOURCE: Literal["database", "csv"] = "database"
     HOURLY_DATA_DIR = Path("data")
     FORCE_DATABASE_REFRESH: bool = False
+    MAPLE_ELECTRICITY_HOUSE_ALIASES = frozenset({"maple_before", "maple_after"})
+    MAPLE_ELECTRICITY_CSV = (
+        HOURLY_DATA_DIR / "maple_electricity_use_2025-11-01-04-00-2026-03-01-05-00.csv"
+    )
+    # Pre/post retrofit windows (hour_start is naive local time).
+    MAPLE_BEFORE_LAST_INCLUDED_HOUR = pd.Timestamp("2026-01-02 23:00:00")
+    MAPLE_AFTER_FIRST_INCLUDED_HOUR = pd.Timestamp("2026-01-05 00:00:00")
 
     # Data cleaning - erroneous data
     RANGE_OF_VALID_VALUES_PER_CHANNEL = {
@@ -63,7 +278,8 @@ class HouseEnergyParamsComputer:
         "swt_average_f": (40, 200),
         "rwt_average_f": (40, 200),
         "dist_water_kg": (0, int(3.785 * 60 * 10)),
-        "zone_set_or_temp_f": (40, 90),
+        "dist_flow_fraction": (0, 1),
+        "zone_set_or_temp_f": (-10, 110),
         "zone_heatcall_fraction": (0, 1),
     }
     MAX_ABS_RATE_OF_CHANGE_PER_CHANNEL = {
@@ -76,16 +292,32 @@ class HouseEnergyParamsComputer:
         "swt_average_f",
         "rwt_average_f",
         "dist_water_kg",
+        "dist_flow_fraction",
     )
 
     # Data cleaning - known bad data
     OIL_BOILER_POWER_THRESHOLD_WATTS = 50
+    # Max zone heat-call may exceed dist-flow on-time by at most this much (0–1 scale).
+    HEATCALL_DIST_FLOW_TOLERANCE = 0.25
+    # Only apply heat-call vs dist-flow check when max zone heat-call is at least this high.
+    MIN_HEATCALL_FOR_DIST_FLOW_CHECK = 0.05
+    REQUIRED_INPUT_CACHE_COLUMNS = ("dist_flow_fraction",)
     BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F = {
         'default': 3,
         'beech': {'zone2': 4.5,}
     }
     BELOW_SETPOINT_MIN_TEMP_SET_GAP_F = 1
     EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
+
+    # SWT / energy plot legend labels (override DB channel display names).
+    ZONE_LEGEND_NAME_OVERRIDES: dict[str, dict[int, str]] = {
+        "beech": {1: "Downstairs", 2: "Upstairs"},
+        "oak": {1: "Living room", 3: "Gear room"},
+        "fir": {2: "Master bedroom", 3: "Upstairs bedroom"},
+        "maple_before": {1: "Living room", 2: "Bedroom"},
+        "maple_after": {1: "Living room", 2: "Bedroom"},
+        "elm": {4: "Master bedroom"},
+    }
 
     # Regression features
     FEATURE_NAMES = (
@@ -133,13 +365,21 @@ class HouseEnergyParamsComputer:
         start_time: datetime,
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        *,
+        include_occupancy: bool | None = None,
+        prepare: bool = True,
     ) -> None:
         self.house_alias = house_alias
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = timezone
         self.results_dir = Path("results") / house_alias
-        self.prepare_data()
+        if include_occupancy is not None:
+            self.INCLUDE_OCCUPANCY = include_occupancy
+        if prepare:
+            self.prepare_data()
+        else:
+            self._load_data()
         
     def _log_info(self, message: str) -> None:
         logger.info(f"[{self.house_alias}] {message}")
@@ -161,6 +401,133 @@ class HouseEnergyParamsComputer:
         self._clean_data()
         self._engineer_features()
 
+    def _apply_maple_data_overrides(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Maple DB/cache exports are often incomplete. Merge house_params_data (zones, weather)
+        and the shared electricity CSV (dist/hp kWh, heat-call, OAT, SWT/RWT).
+        """
+        if self.house_alias not in self.MAPLE_ELECTRICITY_HOUSE_ALIASES:
+            return df
+
+        df["hour_start"] = pd.to_datetime(df["hour_start"])
+
+        params_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
+        if params_path.is_file():
+            params = pd.read_csv(params_path)
+            params["hour_start"] = pd.to_datetime(params["hour_start"])
+            params = params.drop(columns=["dist_kwh", "hp_kwh_th"], errors="ignore")
+            params = params.drop_duplicates(subset=["hour_start"], keep="last")
+            params_cols = [c for c in params.columns if c != "hour_start"]
+            df = df.drop(columns=[c for c in params_cols if c in df.columns], errors="ignore")
+            df = df.merge(params, on="hour_start", how="left")
+            self._log_info(f"Merged zone/weather columns from {params_path}")
+        else:
+            self._log_info(f"No house params CSV at {params_path}; using electricity export only")
+
+        elec_path = self.MAPLE_ELECTRICITY_CSV
+        if not elec_path.is_file():
+            raise FileNotFoundError(
+                f"{self.house_alias}: maple electricity CSV not found at {elec_path}"
+            )
+        elec_usecols = [
+            "hour_start",
+            "dist_kwh",
+            "hp_kwh_th",
+            "oat_f",
+            "ws_mph",
+            "dist_avg_swt",
+            "dist_avg_rwt",
+            "zone1_heatcall_fraction",
+            "zone2_heatcall_fraction",
+            "zone3_heatcall_fraction",
+            "zone4_heatcall_fraction",
+        ]
+        elec = pd.read_csv(elec_path, usecols=elec_usecols)
+        elec["hour_start"] = pd.to_datetime(elec["hour_start"])
+        elec = elec.rename(
+            columns={"dist_avg_swt": "swt_average_f", "dist_avg_rwt": "rwt_average_f"}
+        )
+        elec = elec.drop_duplicates(subset=["hour_start"], keep="last")
+        elec = elec.rename(
+            columns={
+                c: f"{c}__elec"
+                for c in elec.columns
+                if c != "hour_start"
+            }
+        )
+        df = df.merge(elec, on="hour_start", how="left")
+
+        df["dist_kwh"] = df["dist_kwh__elec"]
+        df["hp_kwh_th"] = df["hp_kwh_th__elec"]
+
+        oat_lo, oat_hi = self.RANGE_OF_VALID_VALUES_PER_CHANNEL["oat_f"]
+        params_oat = df["oat_f"] if "oat_f" in df.columns else pd.Series(np.nan, index=df.index)
+        valid_oat = params_oat.notna() & params_oat.between(oat_lo, oat_hi)
+        df["oat_f"] = np.where(valid_oat, params_oat, df["oat_f__elec"])
+
+        ws_lo, ws_hi = self.RANGE_OF_VALID_VALUES_PER_CHANNEL["ws_mph"]
+        params_ws = df["ws_mph"] if "ws_mph" in df.columns else pd.Series(np.nan, index=df.index)
+        valid_ws = params_ws.notna() & params_ws.between(ws_lo, ws_hi)
+        df["ws_mph"] = np.where(valid_ws, params_ws, df["ws_mph__elec"])
+
+        swt_lo, swt_hi = self.RANGE_OF_VALID_VALUES_PER_CHANNEL["swt_average_f"]
+        for target, elec_col in (
+            ("swt_average_f", "swt_average_f__elec"),
+            ("rwt_average_f", "rwt_average_f__elec"),
+        ):
+            base = df[target] if target in df.columns else pd.Series(np.nan, index=df.index)
+            valid = base.notna() & base.between(swt_lo, swt_hi)
+            from_elec = df[elec_col]
+            df[target] = np.where(valid, base, from_elec)
+
+        for col in df.columns:
+            if col.endswith("__elec"):
+                continue
+            elec_col = f"{col}__elec"
+            if elec_col not in df.columns:
+                continue
+            if col.endswith("_heatcall_fraction"):
+                if col in df.columns:
+                    df[col] = df[col].fillna(df[elec_col])
+                else:
+                    df[col] = df[elec_col]
+
+        df = df.drop(columns=[c for c in df.columns if c.endswith("__elec")])
+
+        for col in df.columns:
+            if str(col).startswith("zone") and str(col).endswith(("_avg_set", "_avg_temp")):
+                df[col] = df[col].ffill().bfill()
+
+        df["dist_kwh"] = df["dist_kwh"].fillna(0.0)
+        df["hp_kwh_th"] = df["hp_kwh_th"].fillna(0.0)
+        df["oat_f"] = df["oat_f"].fillna(0.0)
+        df["ws_mph"] = df["ws_mph"].fillna(0.0)
+        if "solar_w_m2" not in df.columns:
+            df["solar_w_m2"] = 0.0
+        else:
+            df["solar_w_m2"] = df["solar_w_m2"].fillna(0.0)
+        if "oil_boiler_pwr" not in df.columns:
+            df["oil_boiler_pwr"] = 0.0
+
+        self._log_info(f"Overrode dist_kwh, hp_kwh_th, and filled gaps from {elec_path}")
+        return df
+
+    def _filter_maple_analysis_window(self, df: pd.DataFrame) -> pd.DataFrame:
+        if self.house_alias == "maple_before":
+            mask = df["hour_start"] <= self.MAPLE_BEFORE_LAST_INCLUDED_HOUR
+            label = f"hour_start <= {self.MAPLE_BEFORE_LAST_INCLUDED_HOUR} (Jan 3, 2026 excluded)"
+        elif self.house_alias == "maple_after":
+            mask = df["hour_start"] >= self.MAPLE_AFTER_FIRST_INCLUDED_HOUR
+            label = f"hour_start >= {self.MAPLE_AFTER_FIRST_INCLUDED_HOUR} (Jan 4, 2026 excluded)"
+        else:
+            return df
+        n_before = len(df)
+        df = df.loc[mask].reset_index(drop=True)
+        self._log_info(
+            f"{self.house_alias}: kept {len(df)} of {n_before} hours ({label})"
+        )
+        return df
+
     def _load_data(self) -> None:
         """
         Loads house params data from CSV or the database and prepares it for analysis.
@@ -168,10 +535,17 @@ class HouseEnergyParamsComputer:
         - Finds the number of zones
         - Checks that all required columns are present
         """
+        zone_names_from_channels: dict[int, str] = {}
+
         if self.DATA_SOURCE == "csv":
             csv_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
             df = pd.read_csv(csv_path)
+            df["hour_start"] = pd.to_datetime(df["hour_start"])
+            df = self._apply_maple_data_overrides(df)
             self._log_info(f"Loaded {csv_path}")
+            zone_names_from_channels = HouseParamsDataFetcher.load_zone_display_names(
+                self.house_alias
+            )
 
         elif self.DATA_SOURCE == "database":
             range_start = pd.Timestamp(
@@ -182,6 +556,7 @@ class HouseEnergyParamsComputer:
             )
             cache_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_input_data.csv"
             df = None
+            cache_rejected_missing_columns = False
             if not self.FORCE_DATABASE_REFRESH and cache_path.is_file():
                 cached = pd.read_csv(cache_path)
                 cached["hour_start"] = pd.to_datetime(cached["hour_start"])
@@ -201,9 +576,25 @@ class HouseEnergyParamsComputer:
                     and set(in_range) == set(expected_hours)
                 )
                 if cache_ok:
+                    missing_cache_cols = [
+                        col
+                        for col in self.REQUIRED_INPUT_CACHE_COLUMNS
+                        if col not in cached.columns
+                    ]
+                    if missing_cache_cols:
+                        cache_ok = False
+                        cache_rejected_missing_columns = True
+                        self._log_info(
+                            f"Cache {cache_path} missing columns {missing_cache_cols}; "
+                            f"querying database"
+                        )
+                if cache_ok:
                     df = cached
                     self._log_info(f"Loaded hourly data from cache {cache_path}")
-                else:
+                    zone_names_from_channels = (
+                        HouseParamsDataFetcher.load_zone_display_names(self.house_alias)
+                    )
+                elif not cache_rejected_missing_columns:
                     self._log_info(
                         f"Cache {cache_path} missing hours for "
                         f"{range_start.isoformat()}–{range_end.isoformat()}; "
@@ -222,6 +613,7 @@ class HouseEnergyParamsComputer:
                     channel_data_by_hour_start,
                     csv_fieldnames,
                     zone_numbers,
+                    zone_names_from_channels,
                 ) = fetcher.fetch()
                 rows: list[dict[str, object]] = []
                 for hour in sorted(channel_data_by_hour_start.keys()):
@@ -236,6 +628,7 @@ class HouseEnergyParamsComputer:
                         "swt_average_f": data.get("swt_average_f", np.nan),
                         "rwt_average_f": data.get("rwt_average_f", np.nan),
                         "dist_water_kg": data.get("dist_water_kg", np.nan),
+                        "dist_flow_fraction": data.get("dist_flow_fraction", np.nan),
                         "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
                     }
                     for zone in zone_numbers:
@@ -266,6 +659,7 @@ class HouseEnergyParamsComputer:
                 columns=["oat_f", "ws_mph", "solar_w_m2"], errors="ignore"
             ).merge(weather_df, on="hour_start", how="left")
             self._log_info(f"Weather from {weather_csv_path}")
+            df = self._apply_maple_data_overrides(df)
             if not loaded_from_cache:
                 df.to_csv(cache_path, index=False)
                 self._log_info(f"Wrote hourly data cache to {cache_path}")
@@ -281,6 +675,7 @@ class HouseEnergyParamsComputer:
             f"Cropped datafrom {range_start.isoformat()} to "
             f"{range_end.isoformat()} ({self.timezone})"
         )
+        df = self._filter_maple_analysis_window(df)
         df = df.sort_values("hour_start").reset_index(drop=True)
         df["day"] = df["hour_start"].dt.normalize()
 
@@ -289,6 +684,16 @@ class HouseEnergyParamsComputer:
             for c in df.columns
             if str(c).startswith("zone") and str(c).endswith("_avg_set")
         )
+        self.zone_names = {
+            z: zone_names_from_channels[z]
+            for z in self.zones
+            if z in zone_names_from_channels
+        }
+        for zone, display in self.ZONE_LEGEND_NAME_OVERRIDES.get(
+            self.house_alias, {}
+        ).items():
+            if zone in self.zones:
+                self.zone_names[zone] = display
 
         self.required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"]
         for z in self.zones:
@@ -321,11 +726,18 @@ class HouseEnergyParamsComputer:
         (OAT_avg_4h and dist_kwh_avg_4h are built during missing-data handling in _clean_data.)
         """
         df = self.df.copy()
-        setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
+        if self.zones:
+            set_cols = [f"zone{z}_avg_set" for z in self.zones]
+            setpoint_avg = df[set_cols].mean(axis=1)
+            for col in set_cols:
+                df[col] = df[col].ffill().bfill()
+            setpoint_avg = setpoint_avg.fillna(df[set_cols].mean(axis=1))
+        else:
+            setpoint_avg = pd.Series(68.0, index=df.index)
         df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
-        df = df.drop(0).reset_index(drop=True)
+        df = df.iloc[1:].reset_index(drop=True)
         df["windspeed_times_65_minus_oat"] = df["ws_mph"] * (65.0 - df["oat_f"])
         if self.INCLUDE_OCCUPANCY:
             hour = df["hour_start"].dt.hour
@@ -474,16 +886,18 @@ class HouseEnergyParamsComputer:
     def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Filters out hours which include known-bad data:
+        - Zone below setpoint (and the prior consecutive hour)
         - Used oil boiler
-        - Zone below setpoint
         - Zone setpoint change
         - Broken thermostat
+        - Zone heat-call fraction higher than dist-flow on-time (shared pump)
         - External heat source (voluntarily excluded for now)
         """
-        df = self._used_oil_boiler(df)
         df = self._zone_below_setpoint(df)
+        df = self._used_oil_boiler(df)
         df = self._setpoint_change(df)
         df = self._broken_thermostat(df)
+        df = self._heat_call_exceeds_dist_flow(df)
         # df = self._external_heat_source(df)
         return df
     
@@ -499,16 +913,31 @@ class HouseEnergyParamsComputer:
         return df.loc[~used].reset_index(drop=True)
     
     def _zone_below_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Drop hours when any zone's average temperature is well below its average setpoint."""
+        """
+        Drop hours when any zone's average temperature is well below its average setpoint,
+        and the hour immediately before such an hour when it is consecutive in time.
+        """
         min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
         drop_rows = pd.Series(False, index=df.index)
+        next_hour = df["hour_start"].shift(-1)
+        consecutive_to_next = (next_hour - df["hour_start"]) == pd.Timedelta(hours=1)
         for z in self.zones:
             temp_col = f"zone{z}_avg_temp"
             setpoint_col = f"zone{z}_avg_set"
             below_setpoint = (df[setpoint_col] - df[temp_col]) >= min_gap
-            drop_rows |= below_setpoint
+            below_next = below_setpoint.shift(-1).fillna(False).astype(bool)
+            hour_before_below = below_next & consecutive_to_next
+            drop_rows |= below_setpoint | hour_before_below
             for hour_start, temp, setpoint in df.loc[below_setpoint, ["hour_start", temp_col, setpoint_col]].itertuples(index=False):
                 self._log_debug(f"Below setpoint (zone {z}): hour_start={hour_start} set={setpoint} - temp={temp} >= {min_gap}°F")
+            for hour_start, temp, setpoint in df.loc[
+                hour_before_below & ~below_setpoint,
+                ["hour_start", temp_col, setpoint_col],
+            ].itertuples(index=False):
+                self._log_debug(
+                    f"Before below setpoint (zone {z}): hour_start={hour_start} "
+                    f"(next consecutive hour below setpoint); set={setpoint} temp={temp}"
+                )
         self._log_info(f"Below setpoint: dropped {int(drop_rows.sum())} rows")
         return df.loc[~drop_rows].reset_index(drop=True)
 
@@ -572,6 +1001,42 @@ class HouseEnergyParamsComputer:
         self._log_info(f"Broken thermostat: dropped {int(drop_rows.sum())} rows")
         return df.loc[~drop_rows].reset_index(drop=True)
 
+    def _heat_call_exceeds_dist_flow(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Drop hours when max zone heat-call fraction exceeds dist-flow on-time fraction
+        (beyond tolerance). Several zones share one dist pump, so flow on-time may be
+        much higher than any single zone's heat-call; the reverse is not physical.
+        """
+        if "dist_flow_fraction" not in df.columns:
+            raise ValueError(
+                f"{self.house_alias}: dist_flow_fraction is required for heat-call vs "
+                f"dist-flow filtering; refresh input data from the database "
+                f"(delete {self.HOURLY_DATA_DIR / f'{self.house_alias}_input_data.csv'} "
+                f"or set FORCE_DATABASE_REFRESH)"
+            )
+        max_hc = self._max_zone_heatcall_fraction(df)
+        flow_on = df["dist_flow_fraction"]
+        tolerance = self.HEATCALL_DIST_FLOW_TOLERANCE
+        min_hc = self.MIN_HEATCALL_FOR_DIST_FLOW_CHECK
+        bad = (
+            (max_hc >= min_hc)
+            & flow_on.notna()
+            & (max_hc > flow_on + tolerance)
+        )
+        for hour_start, hc, flow_frac in zip(
+            df.loc[bad, "hour_start"],
+            max_hc.loc[bad],
+            flow_on.loc[bad],
+            strict=True,
+        ):
+            self._log_debug(
+                f"Heat-call > dist-flow: hour_start={hour_start} "
+                f"max_zone_heatcall={hc:.2f} > dist_flow_fraction={flow_frac:.2f} "
+                f"+ tolerance={tolerance:.2f}"
+            )
+        self._log_info(f"Heat-call > dist-flow: dropped {int(bad.sum())} rows")
+        return df.loc[~bad].reset_index(drop=True)
+
     def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Drop hours that suggest heating without a heat call (e.g. sun, fireplace):
@@ -614,8 +1079,16 @@ class HouseEnergyParamsComputer:
         - Fits the model and returns the parameters.
         - Can be called for the baseline model (alpha/beta/gamma) too.
         """
+        if len(df) == 0:
+            raise ValueError(f"{self.house_alias}: no rows to fit energy model")
         dist_kwh = df["dist_kwh"].to_numpy()
-        energy_ratio = float(np.sum(df["hp_kwh_th"].to_numpy())) / float(np.sum(dist_kwh))
+        dist_kwh_total = float(np.sum(dist_kwh))
+        if dist_kwh_total <= 0:
+            raise ValueError(
+                f"{self.house_alias}: total dist_kwh is {dist_kwh_total}; "
+                "cannot compute energy ratio (check cached/database energy data)"
+            )
+        energy_ratio = float(np.sum(df["hp_kwh_th"].to_numpy())) / dist_kwh_total
         dist_kwh_scaled = dist_kwh * energy_ratio
         y = dist_kwh_scaled
         X = self.design_matrix(df, baseline=baseline, energy_ratio=energy_ratio)
@@ -670,14 +1143,31 @@ class HouseEnergyParamsComputer:
     # Get energy parameters for the last N days of data
     # --------------------------------------------------
 
+    def _df_for_last_n_calendar_days(self, n: int) -> pd.DataFrame:
+        days = np.unique(self.df["day"].to_numpy())
+        window_days = (days[-n:] if len(days) >= n else days).tolist()
+        return self.df.loc[self.df["day"].isin(window_days)]
+
+    def _max_zone_heatcall_fraction(self, df: pd.DataFrame) -> pd.Series:
+        """Max hourly heat-call duty cycle across zones (each zone is one fraction in [0, 1])."""
+        heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
+        return df[heatcall_cols].max(axis=1)
+
+    def _dominant_zone_at_max_heatcall(self, df: pd.DataFrame) -> pd.Series:
+        """Zone index (per ``self.zones``) with the highest heat-call fraction each hour (ties: first zone)."""
+        heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
+        argmax = np.nanargmax(df[heatcall_cols].to_numpy(dtype=float), axis=1)
+        return pd.Series([self.zones[i] for i in argmax], index=df.index)
+
     def energy_fit_on_last_n_days(self, n: int) -> HouseEnergyParams:
         """
         Fits the model on the last ``n`` calendar days of data.
         """
-        days = np.unique(self.df["day"].to_numpy())
-        window_days = (days[-n:] if len(days) >= n else days).tolist()
-        window_df = self.df.loc[self.df["day"].isin(window_days)]
-        return self.fit(window_df)
+        return self.fit(self._df_for_last_n_calendar_days(n))
+
+    def energy_fit_on_all_cleaned_data(self) -> HouseEnergyParams:
+        """Fits the model on every hour in ``self.df`` (post clean + feature engineering)."""
+        return self.fit(self.df)
 
     # ----------------------------------------------------
     # Get rswt parameters for the last N days of data
@@ -710,7 +1200,7 @@ class HouseEnergyParamsComputer:
             raise ValueError(f"{self.house_alias}: dist_water_kg column is missing")
         rwt_df = rwt_df.copy()
         rwt_df["dist_water_kg"] = window_df.loc[rwt_df.index, "dist_water_kg"]
-        rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
+        rwt_df["max_zone_heatcall_fraction"] = self._max_zone_heatcall_fraction(rwt_df)
         rwt_df = rwt_df.drop(columns=heatcall_cols)
 
         bucket_fits: list[RswtLoadBucketFit | None] = []
@@ -1190,3 +1680,117 @@ class HouseEnergyParamsComputer:
             dpi=150, bbox_inches="tight",
         )
         plt.close(fig)
+
+    def energy_vs_swt_panel_data(self, params: HouseEnergyParams) -> EnergyVsSwtPanelData:
+        """Arrays for SWT vs energy scatter plots (valid cleaned hours only)."""
+        df = self.df
+        estimated_kwh = self.predict(params, df)
+        swt_f = df["swt_average_f"].to_numpy(dtype=float)
+        max_zone_heatcall = self._max_zone_heatcall_fraction(df).to_numpy(dtype=float)
+        dominant_zone = self._dominant_zone_at_max_heatcall(df).to_numpy(dtype=int)
+        valid = np.isfinite(swt_f) & np.isfinite(estimated_kwh)
+        if not np.any(valid):
+            raise ValueError(
+                f"{self.house_alias}: no hours with both swt_average_f and estimated energy"
+            )
+
+        oat = df["oat_f"].to_numpy(dtype=float)
+        dist_kwh = df["dist_kwh"].to_numpy(dtype=float)
+        coldest_oat_estimated_kwh: float | None = None
+        coldest_oat_dist_kwh: float | None = None
+        coldest_oat_swt_f: float | None = None
+        coldest_oat_date_label: str | None = None
+        coldest_oat_panel_index: int | None = None
+        coldest_i: int | None = None
+        if np.any(np.isfinite(oat)):
+            coldest_i = int(np.nanargmin(oat))
+            if valid[coldest_i]:
+                coldest_oat_estimated_kwh = float(estimated_kwh[coldest_i])
+                coldest_oat_dist_kwh = float(dist_kwh[coldest_i])
+                coldest_oat_swt_f = float(swt_f[coldest_i])
+                coldest_oat_date_label = _coldest_hour_legend_label(float(oat[coldest_i]))
+                valid_row_indices = np.flatnonzero(valid)
+                coldest_pos = np.where(valid_row_indices == coldest_i)[0]
+                if len(coldest_pos):
+                    coldest_oat_panel_index = int(coldest_pos[0])
+
+        zone_avg_set_f: dict[int, float] = {}
+        coldest_hour_zone_set_f: dict[int, float] = {}
+        zone_set_f_by_hour: dict[int, np.ndarray] = {}
+        for z in self.zones:
+            set_col = f"zone{z}_avg_set"
+            sets_valid = df.loc[valid, set_col].to_numpy(dtype=float)
+            zone_set_f_by_hour[z] = sets_valid
+            zone_avg_set_f[z] = float(np.nanmean(sets_valid))
+            if coldest_i is not None and valid[coldest_i]:
+                coldest_hour_zone_set_f[z] = float(df[set_col].iloc[coldest_i])
+
+        return EnergyVsSwtPanelData(
+            house_alias=self.house_alias,
+            estimated_kwh=estimated_kwh[valid],
+            dist_kwh=dist_kwh[valid],
+            swt_f=swt_f[valid],
+            max_zone_heatcall=max_zone_heatcall[valid],
+            dominant_zone=dominant_zone[valid],
+            zone_numbers=tuple(self.zones),
+            coldest_oat_estimated_kwh=coldest_oat_estimated_kwh,
+            coldest_oat_dist_kwh=coldest_oat_dist_kwh,
+            coldest_oat_swt_f=coldest_oat_swt_f,
+            coldest_oat_panel_index=coldest_oat_panel_index,
+            coldest_oat_date_label=coldest_oat_date_label,
+            oat_f=oat[valid],
+            hour_start=df["hour_start"].to_numpy()[valid],
+            zone_avg_set_f=zone_avg_set_f,
+            coldest_hour_zone_set_f=coldest_hour_zone_set_f,
+            zone_set_f_by_hour=zone_set_f_by_hour,
+            zone_names=self.zone_names,
+        )
+
+    def plot_estimated_energy_vs_swt(self, params: HouseEnergyParams) -> None:
+        """
+        Interactive scatter of model-estimated scaled distribution energy (x) vs measured
+        SWT (y) for hours in ``self.df`` (post ``_clean_data`` and feature engineering)
+        with SWT data, colored by the zone with the highest heat-call fraction that hour.
+        ``params`` should be fit on the same cleaned frame (e.g. ``energy_fit_on_all_cleaned_data``).
+        A slider filters to hours with
+        max zone heat-call fraction ≥ the chosen value; the OLS regression line updates
+        with the filter.
+        """
+        df = self.df
+        max_zone_heatcall = self._max_zone_heatcall_fraction(df).to_numpy(dtype=float)
+        dominant_zone = self._dominant_zone_at_max_heatcall(df).to_numpy(dtype=int)
+        high_heatcall = max_zone_heatcall > 0.8
+        n_high_heatcall = int(high_heatcall.sum())
+        self._log_info(
+            f"Hours with max zone heat-call > 80%: {n_high_heatcall} "
+            f"(of {len(df)} cleaned hours)"
+        )
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        zone_hc_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
+        high_hc_df = df.loc[high_heatcall, ["hour_start", "oat_f", *zone_hc_cols]].copy()
+        high_hc_df["max_zone_heatcall_fraction"] = max_zone_heatcall[high_heatcall]
+        high_hc_df["dominant_zone"] = dominant_zone[high_heatcall]
+        high_hc_df = high_hc_df.sort_values("hour_start")
+        high_hc_csv = self.results_dir / f"{self.house_alias}_high_heatcall_hours.csv"
+        high_hc_df.to_csv(high_hc_csv, index=False)
+        self._log_info(f"Wrote high heat-call hours to {high_hc_csv}")
+
+        panel = self.energy_vs_swt_panel_data(params)
+        savepath = self.results_dir / f"{self.house_alias}_energy_vs_swt.png"
+        render_estimated_energy_vs_swt_plot(
+            panel.estimated_kwh,
+            panel.dist_kwh,
+            panel.swt_f,
+            panel.max_zone_heatcall,
+            panel.dominant_zone,
+            zone_numbers=panel.zone_numbers,
+            house_alias=panel.house_alias,
+            savepath=savepath,
+            zone_names=panel.zone_names,
+            coldest_oat_estimated_kwh=panel.coldest_oat_estimated_kwh,
+            coldest_oat_dist_kwh=panel.coldest_oat_dist_kwh,
+            coldest_oat_swt_f=panel.coldest_oat_swt_f,
+            coldest_oat_panel_index=panel.coldest_oat_panel_index,
+            coldest_oat_date_label=panel.coldest_oat_date_label,
+        )
+        self._log_info(f"Wrote energy vs SWT plot to {savepath}")

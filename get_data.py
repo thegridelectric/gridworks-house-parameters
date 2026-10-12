@@ -10,18 +10,48 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from sqlalchemy import Engine, create_engine, text
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 # -----------------
 # Channel names
 # -----------------
 
-ZONE_CHANNEL = re.compile(r"^zone(\d+)-.+-(temp|set|heat-call)$")
+ZONE_CHANNEL = re.compile(r"^zone(\d+)-(.+)-(temp|set|heat-call)$")
+
+
+def zone_heatcall_fraction_from_readings(readings: list[tuple[str, float]]) -> float:
+    """
+    Collapse all heat-call channels for one zone in one hour to a single [0, 1] fraction.
+    When both *-rm-* and non-rm channels exist, use whichever reports the higher duty cycle.
+    """
+    rm_vals = [value for name, value in readings if "-rm-" in name]
+    non_rm_vals = [value for name, value in readings if "-rm-" not in name]
+    if rm_vals and non_rm_vals:
+        return max(max(rm_vals), max(non_rm_vals))
+    if rm_vals:
+        return max(rm_vals)
+    if non_rm_vals:
+        return max(non_rm_vals)
+    raise ValueError("zone_heatcall_fraction_from_readings requires at least one reading")
+
+
+def zone_display_names_from_channel_names(names: set[str] | list[str]) -> dict[int, str]:
+    """Map zone index to a label parsed from channel names (e.g. zone1-living-temp → Living)."""
+    zone_names: dict[int, str] = {}
+    for name in names:
+        parsed = ZONE_CHANNEL.match(name)
+        if not parsed:
+            continue
+        zone = int(parsed.group(1))
+        slug = parsed.group(2)
+        kind = parsed.group(3)
+        if kind == "heat-call" and "-rm-" in name:
+            continue
+        if "-rm-" in name:
+            continue
+        display = slug.replace("-", " ").title()
+        zone_names.setdefault(zone, display)
+    return zone_names
 OIL_BOILER_CHANNEL = "oil-boiler-pwr"
 ENERGY_CHANNELS = [
     "hp-ewt",
@@ -41,6 +71,8 @@ DIST_FLOW_ONLY_CHANNELS = ["dist-flow"]
 DIST_FLOW_ONSET_DELAY = timedelta(seconds=30)
 # US gallon water ≈ 1 kg/L × 3.785 L/gal; per 1s bucket: kg += (gpm / 60) * kg_per_gallon
 KG_PER_US_GALLON = 3.785411784
+# GPM above this threshold counts as distribution flow "on" for hourly on-time fraction.
+DIST_FLOW_ON_GPM = 0.05
 
 # -----------------
 # Querries
@@ -166,7 +198,11 @@ WITH per_second AS (
 )
 SELECT
     time_bucket(INTERVAL '1 hour', time_bucket_1s, :local_tz) AS time_bucket,
-    ROUND((SUM(dist_flow_gpm) * :kg_per_us_gallon / 60.0)::numeric, 2) AS dist_water_kg
+    ROUND((SUM(dist_flow_gpm) * :kg_per_us_gallon / 60.0)::numeric, 2) AS dist_water_kg,
+    ROUND(
+        (AVG(CASE WHEN dist_flow_gpm > :dist_flow_on_gpm THEN 1.0 ELSE 0.0 END))::numeric,
+        4
+    ) AS dist_flow_fraction
 FROM per_second
 GROUP BY 1
 ORDER BY time_bucket
@@ -209,8 +245,23 @@ GROUP BY rc.name, rc.unit, time_bucket
 ORDER BY time_bucket, rc.name
 """)
 
+ZONE_CHANNEL_NAMES_SQL = text("""
+SELECT DISTINCT rc.name
+FROM gridworks.reading_channels rc
+WHERE rc.terminal_asset_alias ILIKE :house_alias
+  AND (
+    rc.name ~ '^zone[0-9]+-.+-(temp|set)$'
+    OR rc.name ~ '^zone[0-9]+-.+-heat-call$'
+  )
+  AND rc.name NOT ILIKE '%gw-temp%'
+ORDER BY rc.name
+""")
+
 
 class HouseParamsDataFetcher:
+    # 1s-resolution energy queries OOM on multi-month ranges; fetch in smaller windows.
+    FETCH_CHUNK_DAYS = 7
+
     def __init__(self, house_alias: str, t_start: datetime, t_end: datetime, local_tz: ZoneInfo) -> None:
         dotenv.load_dotenv()
         db_url = os.environ.get("GW_DATA_DB_URL")
@@ -229,19 +280,45 @@ class HouseParamsDataFetcher:
             tb = tb.replace(tzinfo=ZoneInfo("UTC"))
         local = tb.astimezone(self.local_tz)
         return local.replace(tzinfo=None).isoformat(timespec="seconds")
-    
-    def fetch(self) -> tuple[dict[str, dict[str, float | None]], list[str], list[int]]:
+
+    def _iter_fetch_chunks(self) -> list[tuple[datetime, datetime]]:
+        chunks: list[tuple[datetime, datetime]] = []
+        cursor = self.t_start
+        while cursor < self.t_end:
+            chunk_end = min(
+                cursor + timedelta(days=self.FETCH_CHUNK_DAYS),
+                self.t_end,
+            )
+            chunks.append((cursor, chunk_end))
+            cursor = chunk_end
+        return chunks
+
+    @staticmethod
+    def load_zone_display_names(house_alias: str) -> dict[int, str]:
+        dotenv.load_dotenv()
+        db_url = os.environ.get("GW_DATA_DB_URL")
+        if not db_url:
+            return {}
+        db_echo = os.environ.get("GW_DATA_DB_ECHO", "").lower() in ("1", "true", "yes")
+        engine = create_engine(db_url, echo=db_echo)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                ZONE_CHANNEL_NAMES_SQL,
+                {"house_alias": f"%{house_alias}%"},
+            ).scalars()
+            names = list(rows)
+        return zone_display_names_from_channel_names(names)
+
+    def fetch(
+        self,
+    ) -> tuple[dict[str, dict[str, float | None]], list[str], list[int], dict[int, str]]:
         logger.info(
             f"{self.house_alias} - Exporting from {self.t_start.isoformat()} "
             f"to {self.t_end.isoformat()} ({self.local_tz})"
         )
 
-        # Prepare query parameters
-        params = {
+        base_params = {
             "house_alias": f"%{self.house_alias}%",
-            "t_start": self.t_start,
-            "t_end": self.t_end,
-            "t_end_inclusive": self.t_end - timedelta(microseconds=1),
             "local_tz": str(self.local_tz),
             "oil_boiler_channel": OIL_BOILER_CHANNEL,
             "energy_channels": ENERGY_CHANNELS,
@@ -249,15 +326,37 @@ class HouseParamsDataFetcher:
             "dist_flow_onset_delay": DIST_FLOW_ONSET_DELAY,
             "dist_flow_only_channels": DIST_FLOW_ONLY_CHANNELS,
             "kg_per_us_gallon": KG_PER_US_GALLON,
+            "dist_flow_on_gpm": DIST_FLOW_ON_GPM,
         }
 
-        # Execute queries
+        chunks = self._iter_fetch_chunks()
+        energy_rows: list = []
+        dist_flow_wt_rows: list = []
+        dist_water_kg_rows: list = []
+        oil_rows: list = []
+        zone_rows: list = []
+
         with self.engine.connect() as conn:
-            energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
-            dist_flow_wt_rows = conn.execute(DIST_FLOW_WT_SQL, params).mappings().all()
-            dist_water_kg_rows = conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
-            oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
-            zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
+            for chunk_start, chunk_end in chunks:
+                params = {
+                    **base_params,
+                    "t_start": chunk_start,
+                    "t_end": chunk_end,
+                    "t_end_inclusive": chunk_end - timedelta(microseconds=1),
+                }
+                logger.info(
+                    f"{self.house_alias} - Query chunk "
+                    f"{chunk_start.isoformat()} to {chunk_end.isoformat()}"
+                )
+                energy_rows.extend(conn.execute(ENERGY_SQL, params).mappings().all())
+                dist_flow_wt_rows.extend(
+                    conn.execute(DIST_FLOW_WT_SQL, params).mappings().all()
+                )
+                dist_water_kg_rows.extend(
+                    conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
+                )
+                oil_rows.extend(conn.execute(OIL_PWR_SQL, params).mappings().all())
+                zone_rows.extend(conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all())
 
         # Initialize by-hour dictionary
         channel_data_by_hour_start: dict[str, dict[str, float | None]] = {}
@@ -286,6 +385,10 @@ class HouseParamsDataFetcher:
             bucket = channel_data_by_hour_start.setdefault(key, {})
             val = row["dist_water_kg"]
             bucket["dist_water_kg"] = round(float(val), 2) if val is not None else None
+            flow_frac = row.get("dist_flow_fraction")
+            bucket["dist_flow_fraction"] = (
+                round(float(flow_frac), 4) if flow_frac is not None else None
+            )
 
         # Populate by-hour dictionary with oil boiler power data
         for row in oil_rows:
@@ -297,6 +400,7 @@ class HouseParamsDataFetcher:
         # Populate by-hour dictionary with zone data
         zone_ids: set[int] = set()
         zone_accum: dict[str, list[float]] = {}
+        heatcall_accum: dict[str, list[tuple[str, float]]] = {}
 
         for row in zone_rows:
             name = row["channel_name"]
@@ -304,7 +408,7 @@ class HouseParamsDataFetcher:
             if not parsed:
                 continue
             zone = int(parsed.group(1))
-            kind = parsed.group(2)
+            kind = parsed.group(3)
             zone_ids.add(zone)
 
             unit = row["unit"]
@@ -318,19 +422,32 @@ class HouseParamsDataFetcher:
 
             key = self.hour_start_key(row["time_bucket"])
             if kind == "heat-call":
-                field = f"zone{zone}_heatcall_fraction"
-            elif kind == "temp":
+                heatcall_accum.setdefault(f"{key}|zone{zone}", []).append((name, value))
+                continue
+            if kind == "temp":
                 field = f"zone{zone}_avg_temp"
             else:
                 field = f"zone{zone}_avg_set"
             zone_accum.setdefault(f"{key}|{field}", []).append(value)
 
+        for compound, readings in heatcall_accum.items():
+            hour_key, zone_label = compound.split("|", 1)
+            zone = int(zone_label.removeprefix("zone"))
+            bucket = channel_data_by_hour_start.setdefault(hour_key, {})
+            fraction = zone_heatcall_fraction_from_readings(readings)
+            bucket[f"zone{zone}_heatcall_fraction"] = round(fraction, 2)
+
         for compound, values in zone_accum.items():
             hour_key, field = compound.split("|", 1)
             bucket = channel_data_by_hour_start.setdefault(hour_key, {})
-            bucket[field] = round(sum(values) / len(values), 1 if "avg_" in field else 2)
+            if "avg_" in field:
+                bucket[field] = round(sum(values) / len(values), 1)
+            else:
+                bucket[field] = round(sum(values) / len(values), 2)
 
         zone_numbers = sorted(zone_ids)
+        zone_channel_names = {row["channel_name"] for row in zone_rows}
+        zone_names = zone_display_names_from_channel_names(zone_channel_names)
 
         # Build CSV column order
         csv_fieldnames = [
@@ -343,6 +460,7 @@ class HouseParamsDataFetcher:
             "swt_average_f",
             "rwt_average_f",
             "dist_water_kg",
+            "dist_flow_fraction",
             "oil_boiler_pwr",
         ]
         for zone in zone_numbers:
@@ -350,7 +468,7 @@ class HouseParamsDataFetcher:
         for zone in zone_numbers:
             csv_fieldnames.extend([f"zone{zone}_avg_set", f"zone{zone}_avg_temp"])
 
-        return channel_data_by_hour_start, csv_fieldnames, zone_numbers
+        return channel_data_by_hour_start, csv_fieldnames, zone_numbers, zone_names
 
 
 def main() -> None:
@@ -365,7 +483,7 @@ def main() -> None:
     )
 
     fetcher = HouseParamsDataFetcher(HOUSE_ALIAS, T_START, T_END, LOCAL_TZ)
-    channel_data_by_hour_start, csv_fieldnames, zone_numbers = fetcher.fetch()
+    channel_data_by_hour_start, csv_fieldnames, zone_numbers, _zone_names = fetcher.fetch()
 
     # Write to CSV
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +502,7 @@ def main() -> None:
                 "swt_average_f": data.get("swt_average_f", ""),
                 "rwt_average_f": data.get("rwt_average_f", ""),
                 "dist_water_kg": data.get("dist_water_kg", ""),
+                "dist_flow_fraction": data.get("dist_flow_fraction", ""),
                 "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
             }
             for zone in zone_numbers:
@@ -396,4 +515,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     main()
