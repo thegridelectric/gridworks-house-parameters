@@ -1,0 +1,64 @@
+
+How the house predicted heat load value is created using the following three steps.
+
+\begin{itemize}
+    \item Estimate hourly distribution energy using a simple regression based on weather data, as shown in Equation \ref{eq:distributed_predicted_regression} where $Q_\text{P, d}$ is the predicted delivered energy, $a$ is a regression coefficient, $b$ is a regression coefficient, $T_\text{O}$ is the OAT, $c$ is a regression coefficient, $\dot{V}_{\text{W}}$ is the wind speed, and 18 is the assumed indoor air temperature.
+    \item Find the ratio of losses between the heat pump and the distribution system. Because of the losses in the basement pipes, the above equation predicts the hourly distribution energy, not directly the full hourly house heating energy. To convert it, compute the scaling factor R as shown in Equation \ref{eq:scaling_factor}, where $Q_\text{HP}$ is the thermal heat provided by the AWHP.
+    \item Apply the scaling factor over each hour, providing the final hourly value as shown in Equation \ref{eq:house_predicted_energy} where $Q_\text{P, H}$ is the hourly predicted heating amount for the entire house.
+\end{itemize}
+
+
+\begin{equation}
+Q_\text{P, d} = a + b * T_\text{O} + c * \dot{V}_{\text{W}} * (18 - T_\text{O})
+\label{eq:distributed_predicted_regression}
+\end{equation}
+
+
+The regression coefficients in Equation \ref{eq:distributed_predicted_regression}  are found by fitting the equation to all available hourly measurements so that the prediction matches the measured delivered energy as closely as possible overall. More precisely, they are chosen to minimize the sum of squared errors over the monitoring period. The regression finds the values of alpha, beta, and gamma that give the best overall match between measured hourly distribution energy and the weather-based prediction. For each hour, this predicted distribution-side energy is then used (and set to zero if negative).
+
+
+\begin{equation}
+R = \sum(Q_\text{HP}) / \sum(Q_\text{P, d})
+\label{eq:scaling_factor}
+\end{equation}
+
+\begin{equation}
+Q_\text{P, H} = R * Q_\text{P, d}
+\label{eq:house_predicted_energy}
+\end{equation}
+
+\begin{table}[htbp]
+  \centering
+  \caption{House energy regression parameters}
+  \label{tab:regression_results}
+  \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llrrrrrr}
+      \hline
+      \textbf{Term} & \textbf{Statistic} & \textbf{Beech} & \textbf{Oak} & \textbf{Fir} & \textbf{Maple before} & \textbf{Maple after} & \textbf{Elm} \\
+      \hline
+      B0: Intercept & Value & 3.01 & 2.68 & -2.18 & 1.56 & 0.97 & 1.88 \\
+       & Std Error & 0.72 & 0.81 & 0.63 & 0.76 & 0.74 & 0.65 \\
+      \hline
+      B1: Delta T = average zone & Value & 0.06 & 0.09 & 0.06 & 0.03 & 0.02 & 0.08 \\
+      setpoint -- OAT (\degree F) & Std Error & 0.01 & 0.01 & 0.01 & 0.01 & 0.01 & 0.01 \\
+      \hline
+      B2: Wind speed * Delta T & Value & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+      (mph x \degree F) & Std Error & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+      \hline
+      B3: Solar irradiance (W/m$^2$) & Value & -0.01 & -0.01 & -0.00 & -0.00 & -0.00 & -0.01 \\
+      & Std Error & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 \\
+      \hline
+      B4: Previous house energy & Value & -0.07 & -0.23 & 0.39 & 0.27 & -0.06 & 0.13 \\
+      use (kWh) & Std Error & 0.02 & 0.02 & 0.02 & 0.03 & 0.03 & 0.02 \\
+      \hline
+      B5: 4-hour average outside & Value & -0.06 & -0.06 & 0.03 & -0.02 & -0.01 & -0.03 \\
+      temperature (\degree F) & Std Error & 0.01 & 0.02 & 0.01 & 0.01 & 0.01 & 0.01 \\
+      \hline
+      B6: 4-hour average house & Value & 0.41 & 0.44 & 0.41 & 0.28 & 0.63 & 0.12 \\
+      energy use (kWh) & Std Error & 0.03 & 0.04 & 0.03 & 0.04 & 0.05 & 0.03 \\
+      \hline
+      \textbf{R$^2$} & & \textbf{0.73} & \textbf{0.66} & \textbf{0.75} & \textbf{0.62} & \textbf{0.49} & \textbf{0.71} \\
+      \hline
+    \end{tabular}%
+  }
+\end{table}
