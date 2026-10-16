@@ -55,6 +55,7 @@ def main() -> None:
     ]
     plot_heat_calls(
         zones,
+        title="Heat call activity",
         xlim=(window_start, window_end),
         savepath=DEFAULT_SAVEPATH,
         show=True,

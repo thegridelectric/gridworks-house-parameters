@@ -12,7 +12,8 @@ import pandas as pd
 from get_data import HouseParamsDataFetcher
 from plots import (
     EnergyVsSwtPanelData,
-    _coldest_hour_legend_label,
+    _oat_coldest_hour_legend_label,
+    _swt_f_to_c,
     plot_estimated_energy_vs_swt as render_estimated_energy_vs_swt_plot,
     plot_oos_residual_by_hour_of_day,
     plot_oos_rmse_by_lead,
@@ -121,6 +122,51 @@ def write_energy_regression_table_xlsx(
     table.to_excel(path, merge_cells=False)
 
 
+CLEANING_DROP_REASON_ROLLING_4H = "rolling_4h_window"
+CLEANING_DROP_REASON_LONG_GAP = "long_missing_gap"
+CLEANING_DROP_REASON_MISSING_REQUIRED = "missing_required_values"
+CLEANING_DROP_REASON_BELOW_SETPOINT = "below_setpoint"
+CLEANING_DROP_REASON_OIL_BOILER = "oil_boiler"
+CLEANING_DROP_REASON_SETPOINT_CHANGE = "setpoint_change"
+CLEANING_DROP_REASON_BROKEN_THERMOSTAT = "broken_thermostat"
+CLEANING_DROP_REASON_HEATCALL_DIST_FLOW = "heat_call_exceeds_dist_flow"
+
+CLEANING_DROP_REASON_ORDER: tuple[str, ...] = (
+    CLEANING_DROP_REASON_ROLLING_4H,
+    CLEANING_DROP_REASON_LONG_GAP,
+    CLEANING_DROP_REASON_MISSING_REQUIRED,
+    CLEANING_DROP_REASON_BELOW_SETPOINT,
+    CLEANING_DROP_REASON_OIL_BOILER,
+    CLEANING_DROP_REASON_SETPOINT_CHANGE,
+    CLEANING_DROP_REASON_BROKEN_THERMOSTAT,
+    CLEANING_DROP_REASON_HEATCALL_DIST_FLOW,
+)
+
+CLEANING_DROP_REASON_LABELS: dict[str, str] = {
+    CLEANING_DROP_REASON_ROLLING_4H: "4h rolling average unavailable",
+    CLEANING_DROP_REASON_LONG_GAP: "Long missing-data gap",
+    CLEANING_DROP_REASON_MISSING_REQUIRED: "Missing or invalid required values",
+    CLEANING_DROP_REASON_BELOW_SETPOINT: "Below setpoint",
+    CLEANING_DROP_REASON_OIL_BOILER: "Oil boiler used",
+    CLEANING_DROP_REASON_SETPOINT_CHANGE: "Setpoint change",
+    CLEANING_DROP_REASON_BROKEN_THERMOSTAT: "Broken thermostat",
+    CLEANING_DROP_REASON_HEATCALL_DIST_FLOW: "Heat-call > dist-flow",
+}
+
+
+def _record_cleaning_hour_drops(
+    drop_reasons: dict[pd.Timestamp, str],
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    reason: str,
+) -> None:
+    after_set = set(pd.to_datetime(after["hour_start"]))
+    for hour_start in pd.to_datetime(before["hour_start"]):
+        ts = pd.Timestamp(hour_start)
+        if ts not in after_set and ts not in drop_reasons:
+            drop_reasons[ts] = reason
+
+
 MAPLE_OAT_OPERATING_BINS_C: tuple[tuple[float, float, str], ...] = (
     (-25.0, -15.0, "-25 to -15"),
     (-15.0, -10.0, "-15 to -10"),
@@ -194,6 +240,14 @@ def write_maple_operating_characteristics_xlsx(
     """
     before = maple_operating_stats_by_oat_bin(before_computer)
     after = maple_operating_stats_by_oat_bin(after_computer)
+    write_maple_operating_characteristics_tables_xlsx(before, after, path)
+
+
+def write_maple_operating_characteristics_tables_xlsx(
+    before: pd.DataFrame,
+    after: pd.DataFrame,
+    path: Path,
+) -> None:
     comparison = pd.DataFrame(
         {
             "OAT (°C)": before["OAT (°C)"],
@@ -368,12 +422,17 @@ class HouseEnergyParamsComputer:
         *,
         include_occupancy: bool | None = None,
         prepare: bool = True,
+        drop_oil_boiler_hours: bool = True,
     ) -> None:
         self.house_alias = house_alias
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = timezone
+        self.drop_oil_boiler_hours = drop_oil_boiler_hours
         self.results_dir = Path("results") / house_alias
+        self._raw_df: pd.DataFrame | None = None
+        self._cleaning_drop_reasons_cache: dict[pd.Timestamp, str] | None = None
+        self._engineered_before_known_bad_cache: pd.DataFrame | None = None
         if include_occupancy is not None:
             self.INCLUDE_OCCUPANCY = include_occupancy
         if prepare:
@@ -400,6 +459,170 @@ class HouseEnergyParamsComputer:
         self._load_data()
         self._clean_data()
         self._engineer_features()
+
+    @classmethod
+    def hour_starts_removed_by_clean_data(
+        cls,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        *,
+        drop_oil_boiler_hours: bool = True,
+    ) -> frozenset[pd.Timestamp]:
+        """Hour starts present after load but dropped during ``_clean_data`` (not feature engineering)."""
+        return frozenset(
+            cls.cleaning_drop_reasons_by_hour(
+                house_alias,
+                start_time,
+                end_time,
+                timezone=timezone,
+                drop_oil_boiler_hours=drop_oil_boiler_hours,
+            )
+        )
+
+    @classmethod
+    def cleaning_drop_reasons_by_hour(
+        cls,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        *,
+        drop_oil_boiler_hours: bool = True,
+    ) -> dict[pd.Timestamp, str]:
+        """First ``_clean_data`` step that removed each hour (post-load hour starts only)."""
+        computer = cls(
+            house_alias,
+            start_time,
+            end_time,
+            timezone=timezone,
+            prepare=False,
+            drop_oil_boiler_hours=drop_oil_boiler_hours,
+        )
+        return computer.compute_cleaning_drop_reasons()
+
+    def loaded_raw_df(self) -> pd.DataFrame:
+        """Hourly frame after load and crop (before ``_clean_data``)."""
+        if self._raw_df is None:
+            raise RuntimeError(
+                f"{self.house_alias}: raw data not loaded; call _load_data() first"
+            )
+        return self._raw_df
+
+    def compute_cleaning_drop_reasons(self) -> dict[pd.Timestamp, str]:
+        """First ``_clean_data`` step that removed each hour (cached per instance)."""
+        if self._cleaning_drop_reasons_cache is not None:
+            return self._cleaning_drop_reasons_cache
+        drop_reasons: dict[pd.Timestamp, str] = {}
+        df = self._remove_erroneous_data(self.loaded_raw_df().copy())
+        df = self._handle_missing_data(df, drop_reasons=drop_reasons)
+        df = self._filter_out_known_bad_data(df, drop_reasons=drop_reasons)
+        self._cleaning_drop_reasons_cache = drop_reasons
+        return drop_reasons
+
+    def _engineered_df_before_known_bad_filter(self) -> pd.DataFrame:
+        """Features for all hours that survive missing-data handling (cached)."""
+        if self._engineered_before_known_bad_cache is not None:
+            return self._engineered_before_known_bad_cache
+        df = self._remove_erroneous_data(self.loaded_raw_df().copy())
+        df = self._handle_missing_data(df, drop_reasons=None)
+        saved_df = self.df
+        saved_feature_names = getattr(self, "feature_names", None)
+        self.df = df
+        self._engineer_features()
+        out = self.df.copy()
+        self.df = saved_df
+        if saved_feature_names is not None:
+            self.feature_names = saved_feature_names
+        self._engineered_before_known_bad_cache = out
+        return out
+
+    def cleaning_excluded_oil_below_setpoint_energy_vs_swt(
+        self,
+        params: HouseEnergyParams,
+        *,
+        heatcall_threshold: float = 0.9,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        dict[int, np.ndarray],
+        dict[int, np.ndarray],
+    ]:
+        """
+        Estimated energy and SWT for hours whose first clean-data drop reason is
+        below setpoint or oil boiler, among rows that survive missing-data handling.
+        Also returns parallel below-setpoint OAT (°F) and per-zone heat-call / below flags.
+        """
+        drop_reasons = self.compute_cleaning_drop_reasons()
+        highlight = {CLEANING_DROP_REASON_BELOW_SETPOINT}
+        if self.drop_oil_boiler_hours:
+            highlight.add(CLEANING_DROP_REASON_OIL_BOILER)
+        highlight_ts = frozenset(
+            pd.Timestamp(ts) for ts, reason in drop_reasons.items() if reason in highlight
+        )
+        empty = np.empty(0, dtype=float)
+        empty_zone: dict[int, np.ndarray] = {z: empty.copy() for z in self.zones}
+        if not highlight_ts:
+            return empty, empty, empty, empty, empty, empty_zone, empty_zone
+
+        df = self._engineered_df_before_known_bad_filter()
+        hour_ts = pd.to_datetime(df["hour_start"])
+        sub = df.loc[hour_ts.isin(highlight_ts)]
+        if sub.empty:
+            return empty, empty, empty, empty, empty, empty_zone, empty_zone
+
+        reason_by_hour = {
+            pd.Timestamp(ts): reason for ts, reason in drop_reasons.items()
+        }
+        reasons = np.array(
+            [reason_by_hour[pd.Timestamp(h)] for h in sub["hour_start"]],
+            dtype=object,
+        )
+        max_hc = self._max_zone_heatcall_fraction(sub).to_numpy(dtype=float)
+        swt_f = sub["swt_average_f"].to_numpy(dtype=float)
+        estimated_kwh = self.predict(params, sub)
+        valid = (
+            (max_hc >= heatcall_threshold)
+            & np.isfinite(swt_f)
+            & np.isfinite(estimated_kwh)
+        )
+        sub_valid = sub.loc[valid].reset_index(drop=True)
+        est = estimated_kwh[valid]
+        swt = swt_f[valid]
+        reasons = reasons[valid]
+        below = reasons == CLEANING_DROP_REASON_BELOW_SETPOINT
+        oil = reasons == CLEANING_DROP_REASON_OIL_BOILER
+        ex_below_oat_f = sub_valid["oat_f"].to_numpy(dtype=float)[below]
+        min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
+        zone_heatcall: dict[int, np.ndarray] = {}
+        zone_was_below: dict[int, np.ndarray] = {}
+        for z in self.zones:
+            set_col = f"zone{z}_avg_set"
+            temp_col = f"zone{z}_avg_temp"
+            hc_col = f"zone{z}_heatcall_fraction"
+            below_setpoint = (sub_valid[set_col] - sub_valid[temp_col]) >= min_gap
+            next_hour = sub_valid["hour_start"].shift(-1)
+            consecutive = (next_hour - sub_valid["hour_start"]) == pd.Timedelta(hours=1)
+            hour_before_below = (
+                below_setpoint.shift(-1).fillna(False).astype(bool) & consecutive
+            )
+            zone_was_below[z] = (below_setpoint | hour_before_below).to_numpy(dtype=bool)[
+                below
+            ]
+            zone_heatcall[z] = sub_valid[hc_col].to_numpy(dtype=float)[below]
+        return (
+            est[below],
+            swt[below],
+            est[oil],
+            swt[oil],
+            ex_below_oat_f,
+            zone_heatcall,
+            zone_was_below,
+        )
 
     def _apply_maple_data_overrides(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -707,18 +930,22 @@ class HouseEnergyParamsComputer:
         missing_columns = [col for col in self.required if col not in df.columns]
         if missing_columns:
             raise ValueError(f"Missing required columns for {self.house_alias}: {missing_columns}")
-        
+
+        self._raw_df = df.copy()
         self.df = df
 
-    def _clean_data(self) -> None:
+    def _clean_data(
+        self,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> None:
         """
         - Removes erroneous data
         - Handles missing data
         - Filters out known bad data
         """
         self.df = self._remove_erroneous_data(self.df)
-        self.df = self._handle_missing_data(self.df)
-        self.df = self._filter_out_known_bad_data(self.df)
+        self.df = self._handle_missing_data(self.df, drop_reasons=drop_reasons)
+        self.df = self._filter_out_known_bad_data(self.df, drop_reasons=drop_reasons)
 
     def _engineer_features(self) -> None:
         """
@@ -801,7 +1028,11 @@ class HouseEnergyParamsComputer:
 
         return df
 
-    def _handle_missing_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _handle_missing_data(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """
         Handles missing data:
         - Ensures there is one row per hour
@@ -865,10 +1096,26 @@ class HouseEnergyParamsComputer:
             dist_kwh_window_ok &= first_dist_kwh_observed.shift(lag)
         df["dist_kwh_avg_4h"] = dist_kwh_mean.where(dist_kwh_window_ok)
 
+        before_roll = df.reset_index(names="hour_start")
         df = df.loc[df["OAT_avg_4h"].notna() & df["dist_kwh_avg_4h"].notna()]
- 
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                before_roll,
+                df.reset_index(names="hour_start"),
+                CLEANING_DROP_REASON_ROLLING_4H,
+            )
+
         # Drop rows inside missing-data gaps
+        before_gap = df.reset_index(names="hour_start")
         df = df.loc[~drop_rows]
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                before_gap,
+                df.reset_index(names="hour_start"),
+                CLEANING_DROP_REASON_LONG_GAP,
+            )
         df = df.reset_index(names="hour_start")
         self._log_info(f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
 
@@ -878,12 +1125,24 @@ class HouseEnergyParamsComputer:
         self._log_info(f"NaNs remaining (excl. dist SWT/RWT): {remaining_nans}")
         if remaining_nans > 0:
             n_before = len(df)
+            before_na = df.copy()
             df = df.dropna(subset=required_for_dropna).reset_index(drop=True)
+            if drop_reasons is not None:
+                _record_cleaning_hour_drops(
+                    drop_reasons,
+                    before_na,
+                    df,
+                    CLEANING_DROP_REASON_MISSING_REQUIRED,
+                )
             self._log_info(f"Dropped {n_before - len(df)} rows with NaNs")
 
         return df
 
-    def _filter_out_known_bad_data(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _filter_out_known_bad_data(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """
         Filters out hours which include known-bad data:
         - Zone below setpoint (and the prior consecutive hour)
@@ -893,16 +1152,22 @@ class HouseEnergyParamsComputer:
         - Zone heat-call fraction higher than dist-flow on-time (shared pump)
         - External heat source (voluntarily excluded for now)
         """
-        df = self._zone_below_setpoint(df)
-        df = self._used_oil_boiler(df)
-        df = self._setpoint_change(df)
-        df = self._broken_thermostat(df)
-        df = self._heat_call_exceeds_dist_flow(df)
+        df = self._zone_below_setpoint(df, drop_reasons=drop_reasons)
+        df = self._used_oil_boiler(df, drop_reasons=drop_reasons)
+        df = self._setpoint_change(df, drop_reasons=drop_reasons)
+        df = self._broken_thermostat(df, drop_reasons=drop_reasons)
+        df = self._heat_call_exceeds_dist_flow(df, drop_reasons=drop_reasons)
         # df = self._external_heat_source(df)
         return df
     
-    def _used_oil_boiler(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _used_oil_boiler(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """Drop hours when the oil boiler power indicates it was used."""
+        if not self.drop_oil_boiler_hours:
+            return df
         threshold = self.OIL_BOILER_POWER_THRESHOLD_WATTS
         if "oil_boiler_pwr" not in df.columns:
             return df
@@ -910,9 +1175,21 @@ class HouseEnergyParamsComputer:
         for hour_start, pwr in df.loc[used, ["hour_start", "oil_boiler_pwr"]].itertuples(index=False):
             self._log_debug(f"Oil boiler used: hour_start={hour_start} oil_boiler_pwr={pwr}W > {threshold}W")
         self._log_info(f"Oil boiler: dropped {int(used.sum())} rows")
-        return df.loc[~used].reset_index(drop=True)
+        after = df.loc[~used].reset_index(drop=True)
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                df,
+                after,
+                CLEANING_DROP_REASON_OIL_BOILER,
+            )
+        return after
     
-    def _zone_below_setpoint(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _zone_below_setpoint(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """
         Drop hours when any zone's average temperature is well below its average setpoint,
         and the hour immediately before such an hour when it is consecutive in time.
@@ -939,9 +1216,21 @@ class HouseEnergyParamsComputer:
                     f"(next consecutive hour below setpoint); set={setpoint} temp={temp}"
                 )
         self._log_info(f"Below setpoint: dropped {int(drop_rows.sum())} rows")
-        return df.loc[~drop_rows].reset_index(drop=True)
+        after = df.loc[~drop_rows].reset_index(drop=True)
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                df,
+                after,
+                CLEANING_DROP_REASON_BELOW_SETPOINT,
+            )
+        return after
 
-    def _setpoint_change(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _setpoint_change(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """Drop hours when any zone's setpoint changed from the prior hour."""
         drop_rows = pd.Series(False, index=df.index)
         for z in self.zones:
@@ -964,9 +1253,21 @@ class HouseEnergyParamsComputer:
             ):
                 self._log_debug(f"Setpoint change (zone {z}): hour_start={hour_start} {setpoint_col} {previous} -> {new_set}")
         self._log_info(f"Setpoint change: dropped {int(drop_rows.sum())} rows")
-        return df.loc[~drop_rows].reset_index(drop=True)
+        after = df.loc[~drop_rows].reset_index(drop=True)
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                df,
+                after,
+                CLEANING_DROP_REASON_SETPOINT_CHANGE,
+            )
+        return after
     
-    def _broken_thermostat(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _broken_thermostat(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """
         Drop hours when the thermostat is broken (one of the following conditions is met):
         - Heat off while cold: heatcall_fraction == 0 and avg_set - avg_temp >= min gap.
@@ -999,9 +1300,21 @@ class HouseEnergyParamsComputer:
             ].itertuples(index=False):
                 self._log_debug(f"Broken thermostat (zone {z}): hour_start={hour_start} set={setpoint} < temp={temp}, heatcall={heatcall}")
         self._log_info(f"Broken thermostat: dropped {int(drop_rows.sum())} rows")
-        return df.loc[~drop_rows].reset_index(drop=True)
+        after = df.loc[~drop_rows].reset_index(drop=True)
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                df,
+                after,
+                CLEANING_DROP_REASON_BROKEN_THERMOSTAT,
+            )
+        return after
 
-    def _heat_call_exceeds_dist_flow(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _heat_call_exceeds_dist_flow(
+        self,
+        df: pd.DataFrame,
+        drop_reasons: dict[pd.Timestamp, str] | None = None,
+    ) -> pd.DataFrame:
         """
         Drop hours when max zone heat-call fraction exceeds dist-flow on-time fraction
         (beyond tolerance). Several zones share one dist pump, so flow on-time may be
@@ -1035,7 +1348,15 @@ class HouseEnergyParamsComputer:
                 f"+ tolerance={tolerance:.2f}"
             )
         self._log_info(f"Heat-call > dist-flow: dropped {int(bad.sum())} rows")
-        return df.loc[~bad].reset_index(drop=True)
+        after = df.loc[~bad].reset_index(drop=True)
+        if drop_reasons is not None:
+            _record_cleaning_hour_drops(
+                drop_reasons,
+                df,
+                after,
+                CLEANING_DROP_REASON_HEATCALL_DIST_FLOW,
+            )
+        return after
 
     def _external_heat_source(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1702,28 +2023,48 @@ class HouseEnergyParamsComputer:
         coldest_oat_date_label: str | None = None
         coldest_oat_panel_index: int | None = None
         coldest_i: int | None = None
-        if np.any(np.isfinite(oat)):
-            coldest_i = int(np.nanargmin(oat))
-            if valid[coldest_i]:
-                coldest_oat_estimated_kwh = float(estimated_kwh[coldest_i])
-                coldest_oat_dist_kwh = float(dist_kwh[coldest_i])
-                coldest_oat_swt_f = float(swt_f[coldest_i])
-                coldest_oat_date_label = _coldest_hour_legend_label(float(oat[coldest_i]))
-                valid_row_indices = np.flatnonzero(valid)
-                coldest_pos = np.where(valid_row_indices == coldest_i)[0]
-                if len(coldest_pos):
-                    coldest_oat_panel_index = int(coldest_pos[0])
+        # Coldest OAT among cleaned hours that are plottable (finite SWT + estimated energy).
+        oat_for_coldest = np.where(valid, oat, np.nan)
+        if np.any(np.isfinite(oat_for_coldest)):
+            coldest_i = int(np.nanargmin(oat_for_coldest))
+            coldest_oat_estimated_kwh = float(estimated_kwh[coldest_i])
+            coldest_oat_dist_kwh = float(dist_kwh[coldest_i])
+            coldest_oat_swt_f = float(swt_f[coldest_i])
+            oat_c_coldest = float(_swt_f_to_c(np.array([oat[coldest_i]]))[0])
+            coldest_oat_date_label = _oat_coldest_hour_legend_label(
+                pd.Timestamp(df["hour_start"].iloc[coldest_i]),
+                oat_c_coldest,
+            )
+            valid_row_indices = np.flatnonzero(valid)
+            coldest_pos = np.where(valid_row_indices == coldest_i)[0]
+            if len(coldest_pos):
+                coldest_oat_panel_index = int(coldest_pos[0])
 
         zone_avg_set_f: dict[int, float] = {}
         coldest_hour_zone_set_f: dict[int, float] = {}
         zone_set_f_by_hour: dict[int, np.ndarray] = {}
+        zone_heatcall_fraction_by_hour: dict[int, np.ndarray] = {}
         for z in self.zones:
             set_col = f"zone{z}_avg_set"
+            heatcall_col = f"zone{z}_heatcall_fraction"
             sets_valid = df.loc[valid, set_col].to_numpy(dtype=float)
             zone_set_f_by_hour[z] = sets_valid
+            zone_heatcall_fraction_by_hour[z] = df.loc[
+                valid, heatcall_col
+            ].to_numpy(dtype=float)
             zone_avg_set_f[z] = float(np.nanmean(sets_valid))
-            if coldest_i is not None and valid[coldest_i]:
+            if coldest_i is not None:
                 coldest_hour_zone_set_f[z] = float(df[set_col].iloc[coldest_i])
+
+        (
+            ex_below_est,
+            ex_below_swt,
+            ex_oil_est,
+            ex_oil_swt,
+            ex_below_oat_f,
+            ex_below_zone_hc,
+            ex_below_zone_was_below,
+        ) = self.cleaning_excluded_oil_below_setpoint_energy_vs_swt(params)
 
         return EnergyVsSwtPanelData(
             house_alias=self.house_alias,
@@ -1743,7 +2084,15 @@ class HouseEnergyParamsComputer:
             zone_avg_set_f=zone_avg_set_f,
             coldest_hour_zone_set_f=coldest_hour_zone_set_f,
             zone_set_f_by_hour=zone_set_f_by_hour,
+            zone_heatcall_fraction_by_hour=zone_heatcall_fraction_by_hour,
             zone_names=self.zone_names,
+            cleaning_excluded_below_setpoint_estimated_kwh=ex_below_est,
+            cleaning_excluded_below_setpoint_swt_f=ex_below_swt,
+            cleaning_excluded_below_setpoint_oat_f=ex_below_oat_f,
+            cleaning_excluded_below_setpoint_zone_heatcall=ex_below_zone_hc,
+            cleaning_excluded_below_setpoint_zone_was_below=ex_below_zone_was_below,
+            cleaning_excluded_oil_boiler_estimated_kwh=ex_oil_est,
+            cleaning_excluded_oil_boiler_swt_f=ex_oil_swt,
         )
 
     def plot_estimated_energy_vs_swt(self, params: HouseEnergyParams) -> None:
