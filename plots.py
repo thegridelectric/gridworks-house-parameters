@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 
 if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+
     from house_parameters import RswtLoadBucketFit
 
 
@@ -28,7 +30,7 @@ def _hourly_residual_mean_and_ci95(
 
 
 def _plot_hourly_residual_bars_on_ax(
-    ax,
+    ax: Axes,
     residuals: np.ndarray,
     hour_of_day: pd.Series,
     *,
