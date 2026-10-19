@@ -258,7 +258,7 @@ class HouseEnergyParamsComputer:
     def _load_data(self) -> None:
         """
         Loads house params data and prepares it for analysis.
-        Local CSVs first, then database for missing hours.
+        Local hourly cache first, then database for missing hours.
         - Sorts by hour_start, and adds a day column.
         - Finds the number of zones
         - Checks that all required columns are present
@@ -276,33 +276,48 @@ class HouseEnergyParamsComputer:
             inclusive="left",
         )
         cache_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_input_data.csv"
-        legacy_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
 
-        # Load local hourly tables
+        # Load local hourly cache
         if self.FORCE_DATABASE_REFRESH:
             self._log_info("FORCE_DATABASE_REFRESH: re-querying entire requested range")
             local = pd.DataFrame()
             missing_hours = expected_hours
         else:
-            local_frames: list[pd.DataFrame] = []
-            for path in (legacy_path, cache_path):
-                if not path.is_file():
-                    continue
-                part = pd.read_csv(path)
-                part["hour_start"] = pd.to_datetime(part["hour_start"])
-                local_frames.append(part)
-                self._log_info(f"Loaded local hourly data from {path}")
-            local = (
-                pd.concat(local_frames, ignore_index=True).drop_duplicates(
-                    subset=["hour_start"], keep="last"
+            local = pd.DataFrame()
+            if cache_path.is_file():
+                local = pd.read_csv(cache_path)
+                local["hour_start"] = pd.to_datetime(local["hour_start"])
+                cache_zones = sorted(
+                    int(str(c).removeprefix("zone").removesuffix("_avg_set"))
+                    for c in local.columns
+                    if str(c).startswith("zone") and str(c).endswith("_avg_set")
                 )
-                if local_frames
-                else pd.DataFrame()
-            )
+                cache_fieldnames = [
+                    "hour_start",
+                    "oat_f",
+                    "ws_mph",
+                    "solar_w_m2",
+                    "dist_kwh",
+                    "hp_kwh_th",
+                    "swt_average_f",
+                    "rwt_average_f",
+                    "dist_water_kg",
+                    "oil_boiler_pwr",
+                ]
+                for zone in cache_zones:
+                    cache_fieldnames.append(f"zone{zone}_heatcall_fraction")
+                for zone in cache_zones:
+                    cache_fieldnames.extend(
+                        [f"zone{zone}_avg_set", f"zone{zone}_avg_temp"]
+                    )
+                extra = [c for c in local.columns if c not in cache_fieldnames]
+                if extra:
+                    self._log_info(f"Dropping non-cache columns: {extra}")
+                local = local.reindex(columns=cache_fieldnames)
+                self._log_info(f"Loaded local hourly data from {cache_path}")
             if local.empty:
                 missing_hours = expected_hours
             else:
-                local["hour_start"] = pd.to_datetime(local["hour_start"])
                 present = pd.DatetimeIndex(
                     local.loc[
                         (local["hour_start"] >= range_start)
@@ -389,13 +404,48 @@ class HouseEnergyParamsComputer:
                 local = pd.concat([local, fetched], ignore_index=True)
                 local = local.drop_duplicates(subset=["hour_start"], keep="last")
                 self.HOURLY_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                if cache_path.is_file():
+                cache_fieldnames = list(fetched.columns)
+                if self.FORCE_DATABASE_REFRESH or not cache_path.is_file():
+                    merged = fetched
+                else:
                     existing = pd.read_csv(cache_path)
                     existing["hour_start"] = pd.to_datetime(existing["hour_start"])
+                    existing_zones = sorted(
+                        int(str(c).removeprefix("zone").removesuffix("_avg_set"))
+                        for c in existing.columns
+                        if str(c).startswith("zone") and str(c).endswith("_avg_set")
+                    )
+                    fetched_zones = sorted(
+                        int(str(c).removeprefix("zone").removesuffix("_avg_set"))
+                        for c in fetched.columns
+                        if str(c).startswith("zone") and str(c).endswith("_avg_set")
+                    )
+                    cache_zones = sorted(set(existing_zones) | set(fetched_zones))
+                    cache_fieldnames = [
+                        "hour_start",
+                        "oat_f",
+                        "ws_mph",
+                        "solar_w_m2",
+                        "dist_kwh",
+                        "hp_kwh_th",
+                        "swt_average_f",
+                        "rwt_average_f",
+                        "dist_water_kg",
+                        "oil_boiler_pwr",
+                    ]
+                    for zone in cache_zones:
+                        cache_fieldnames.append(f"zone{zone}_heatcall_fraction")
+                    for zone in cache_zones:
+                        cache_fieldnames.extend(
+                            [f"zone{zone}_avg_set", f"zone{zone}_avg_temp"]
+                        )
+                    extra = [c for c in existing.columns if c not in cache_fieldnames]
+                    if extra:
+                        self._log_info(f"Dropping non-cache columns: {extra}")
+                    existing = existing.reindex(columns=cache_fieldnames)
                     merged = pd.concat([existing, fetched], ignore_index=True)
-                else:
-                    merged = fetched
                 merged = merged.drop_duplicates(subset=["hour_start"], keep="last")
+                merged = merged.reindex(columns=cache_fieldnames)
                 merged.sort_values("hour_start").reset_index(drop=True).to_csv(
                     cache_path, index=False
                 )

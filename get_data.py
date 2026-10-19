@@ -426,8 +426,8 @@ def main() -> None:
     T_START = datetime(2025, 11, 1, tzinfo=LOCAL_TZ)
     T_END = datetime(2025, 11, 3, tzinfo=LOCAL_TZ)
     OUTPUT_CSV = (
-        Path(__file__).resolve().parent / "results"
-        / f"{HOUSE_ALIAS}_house_params_data.csv"
+        Path(__file__).resolve().parent / "data"
+        / f"{HOUSE_ALIAS}_input_data.csv"
     )
 
     fetcher = HouseParamsDataFetcher(HOUSE_ALIAS, T_START, T_END, LOCAL_TZ)
