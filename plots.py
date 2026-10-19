@@ -276,7 +276,7 @@ def plot_data_distribution(
     fig.suptitle(f"{house_alias.capitalize()}: channel distributions")
     fig.tight_layout()
     results_dir.mkdir(parents=True, exist_ok=True)
-    savepath = results_dir / f"{house_alias}_channel_boxplots.png"
+    savepath = results_dir / "channel_boxplots.png"
     fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -379,5 +379,5 @@ def plot_rswt_fit(
     if savepath is not None:
         savepath.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
-    plt.show()
+    # plt.show()
     plt.close(fig)

@@ -1,5 +1,7 @@
+import json
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -52,6 +54,17 @@ class HouseRswtParams:
     load_4_6: RswtLoadBucketFit | None
     load_6_8: RswtLoadBucketFit | None
     load_8_plus: RswtLoadBucketFit | None
+
+    def __repr__(self) -> str:
+        return_string = "HouseRswtParams:\n"
+        return_string += f"- rwt_min: {self.rwt_min}\n"
+        return_string += f"- water_kg_hour_chc: {self.water_kg_hour_chc}\n"
+        return_string += f"- load_0_2: {self.load_0_2}\n"
+        return_string += f"- load_2_4: {self.load_2_4}\n"
+        return_string += f"- load_4_6: {self.load_4_6}\n"
+        return_string += f"- load_6_8: {self.load_6_8}\n"
+        return_string += f"- load_8_plus: {self.load_8_plus}\n"
+        return return_string
 
 
 class HouseEnergyParamsComputer:
@@ -133,6 +146,37 @@ class HouseEnergyParamsComputer:
     RSWT_CHC_HEATCALL_FLOOR = 0.7
     RSWT_BUCKET_MIN_FIT_ROWS = 20
 
+    RUN_PARAMETERS_JSON = "run_parameters.json"
+    _SERIALIZED_CLASS_ATTRS = (
+        "HOURLY_DATA_DIR",
+        "SOLAR_DATA_CSV",
+        "FORCE_DATABASE_REFRESH",
+        "RANGE_OF_VALID_VALUES_PER_CHANNEL",
+        "MAX_ABS_RATE_OF_CHANGE_PER_CHANNEL",
+        "MAX_DATA_GAP_HOURS",
+        "NON_INTERPOLATED_OPTIONAL_COLUMNS",
+        "OIL_BOILER_POWER_THRESHOLD_WATTS",
+        "BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F",
+        "BELOW_SETPOINT_MIN_TEMP_SET_GAP_F",
+        "EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F",
+        "FEATURE_NAMES",
+        "FEATURE_NAMES_BASELINE",
+        "INCLUDE_OCCUPANCY",
+        "OCCUPANCY_INDIVIDUAL_HOURS",
+        "WEEKDAY_OCCUPANCY_FEATURE_NAMES",
+        "WEEKEND_OCCUPANCY_FEATURE_NAMES",
+        "OCCUPANCY_FEATURE_NAMES",
+        "TRAINING_FREQUENCY",
+        "GROW_WINDOW_TO_N",
+        "MIN_FIT_WINDOW_DAYS",
+        "FORECAST_HORIZON_HOURS",
+        "ROLLING_AVG_HOURS",
+        "RSWT_LOAD_BUCKET_BOUNDS",
+        "RSWT_CHC_HEATCALL_FRACTION_THRESHOLD",
+        "RSWT_CHC_HEATCALL_FLOOR",
+        "RSWT_BUCKET_MIN_FIT_ROWS",
+    )
+
     def __init__(
         self,
         house_alias: str,
@@ -144,9 +188,53 @@ class HouseEnergyParamsComputer:
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = timezone
-        self.results_dir = Path("results") / house_alias
+        run_ms = int(time.time() * 1000)
+        self.results_dir = Path("results") / house_alias / f"result_{run_ms}"
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self._log_info(f"Results directory: {self.results_dir}")
+        self._write_run_parameters_json(run_ms)
         self.prepare_data()
-        
+
+    @classmethod
+    def _to_json_safe(cls, value: object) -> object:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, ZoneInfo):
+            return value.key
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, tuple):
+            return [cls._to_json_safe(v) for v in value]
+        if isinstance(value, list):
+            return [cls._to_json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): cls._to_json_safe(v) for k, v in value.items()}
+        if isinstance(value, float) and math.isinf(value):
+            return "inf"
+        return value
+
+    def _write_run_parameters_json(self, run_ms: int) -> None:
+        parameters = {
+            name: self._to_json_safe(getattr(self.__class__, name))
+            for name in self._SERIALIZED_CLASS_ATTRS
+        }
+        payload = {
+            "run": {
+                "house_alias": self.house_alias,
+                "start_time": self.start_time.isoformat(),
+                "end_time": self.end_time.isoformat(),
+                "timezone": self.timezone.key,
+                "run_ms": run_ms,
+                "results_dir": str(self.results_dir),
+            },
+            "parameters": parameters,
+        }
+        path = self.results_dir / self.RUN_PARAMETERS_JSON
+        with path.open("w", encoding="utf-8") as out:
+            json.dump(payload, out, indent=2)
+            out.write("\n")
+        self._log_info(f"Wrote run parameters to {path}")
+
     def _log_info(self, message: str) -> None:
         logger.info(f"[{self.house_alias}] {message}")
 
@@ -902,10 +990,10 @@ class HouseEnergyParamsComputer:
             water_chc_n_hours=water_chc_n_hours,
             house_alias=self.house_alias,
             n_days=n,
-            savepath=self.results_dir / f"{self.house_alias}_rswt_fit_N{n}.png",
+            savepath=self.results_dir / "rswt_fit.png",
         )
 
-        return HouseRswtParams(
+        params = HouseRswtParams(
             rwt_min=50.0,
             water_kg_hour_chc=water_kg_hour_chc,
             load_0_2=bucket_fits[0],
@@ -914,6 +1002,26 @@ class HouseEnergyParamsComputer:
             load_6_8=bucket_fits[3],
             load_8_plus=bucket_fits[4],
         )
+        rswt_row: dict[str, float] = {
+            "rwt_min": params.rwt_min,
+            "water_kg_hour_chc": params.water_kg_hour_chc,
+        }
+        for bucket in (
+            "load_0_2",
+            "load_2_4",
+            "load_4_6",
+            "load_6_8",
+            "load_8_plus",
+        ):
+            fit = getattr(params, bucket)
+            if fit is None:
+                rswt_row[f"{bucket}_rwt_intercept"] = np.nan
+                rswt_row[f"{bucket}_rwt_slope"] = np.nan
+            else:
+                rswt_row[f"{bucket}_rwt_intercept"] = fit.rwt_intercept
+                rswt_row[f"{bucket}_rwt_slope"] = fit.rwt_slope
+        pd.DataFrame([rswt_row]).to_csv(self.results_dir / "params_rswt.csv", index=False)
+        return params
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:
         """OLS fit: rwt_average_f = intercept + slope * swt_average_f."""
@@ -983,9 +1091,7 @@ class HouseEnergyParamsComputer:
             },
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
-        params_table.to_csv(
-            self.results_dir / f"{self.house_alias}_params_N{n}_{self._artifact_label}.csv"
-        )
+        params_table.to_csv(self.results_dir / "params_energy.csv")
 
         self._log_info(
             f"{oos_label.capitalize()} out-of-sample over {oos['n_forecast_points']} "
@@ -1004,11 +1110,7 @@ class HouseEnergyParamsComputer:
                 "rmse_baseline_kwh": rmse_baseline_by_lead,
             }
         )
-        rmse_by_lead_df.to_csv(
-            self.results_dir
-            / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.csv",
-            index=False,
-        )
+        rmse_by_lead_df.to_csv(self.results_dir / "rmse_by_lead.csv", index=False)
 
         # Plots
         plot_pred_vs_actual(
@@ -1021,7 +1123,7 @@ class HouseEnergyParamsComputer:
                 float(np.min(self.df["oat_f"].to_numpy())),
                 float(np.max(self.df["oat_f"].to_numpy())),
             ),
-            savepath=self.results_dir / f"{self.house_alias}_pred_vs_actual_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / "pred_vs_actual.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
             oos_period_label=oos_label,
@@ -1030,7 +1132,7 @@ class HouseEnergyParamsComputer:
             oos["oos_lead1_errors"],
             oos["oos_lead1_hour_start"],
             house_alias=self.house_alias,
-            savepath=self.results_dir / f"{self.house_alias}_oos_residual_by_hour_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / "oos_residual_by_hour.png",
             subtitle="first forecast hour (lead 1) only",
         )
         plot_oos_rmse_by_lead(
@@ -1038,7 +1140,7 @@ class HouseEnergyParamsComputer:
             rmse_baseline_by_lead,
             house_alias=self.house_alias,
             forecast_horizon_hours=self.FORECAST_HORIZON_HOURS,
-            savepath=self.results_dir / f"{self.house_alias}_rmse_by_lead_N{n}_{self._artifact_label}.png",
+            savepath=self.results_dir / "rmse_by_lead.png",
         )
 
     def predict_recursive_horizon(self, params: HouseEnergyParams, origin_index: int, horizon: int) -> np.ndarray:
@@ -1189,17 +1291,6 @@ class HouseEnergyParamsComputer:
             "oos_lead1_hour_start": oos_lead1_hour_start,
         }
 
-    @property
-    def _artifact_label(self) -> str:
-        window = "_growing" if self.GROW_WINDOW_TO_N else ""
-        min_window = (
-            f"_min{self.MIN_FIT_WINDOW_DAYS}"
-            if self.GROW_WINDOW_TO_N and self.MIN_FIT_WINDOW_DAYS > 1
-            else ""
-        )
-        occupancy = "_occupancy" if self.INCLUDE_OCCUPANCY else ""
-        return f"{self.TRAINING_FREQUENCY}{window}{min_window}{occupancy}_recursive{self.FORECAST_HORIZON_HOURS}h"
-
     # ---------------------------------------------------------
     # Sweep the number of trailing days
     # ---------------------------------------------------------
@@ -1261,8 +1352,5 @@ class HouseEnergyParamsComputer:
             f"({self.TRAINING_FREQUENCY} training, {window_mode})"
         )
         fig.tight_layout()
-        fig.savefig(
-            self.results_dir / f"{self.house_alias}_sweep_N_{self.TRAINING_FREQUENCY}.png",
-            dpi=150, bbox_inches="tight",
-        )
+        fig.savefig(self.results_dir / "sweep_n.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
