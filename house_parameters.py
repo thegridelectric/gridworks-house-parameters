@@ -35,7 +35,7 @@ class HouseEnergyParams:
         return_string = "HouseEnergyParams:\n"
         for i,param in enumerate(self.feature_names):
             return_string += f"- {param}: {self.values[i]} ± {self.std_errors[i]}\n"
-        return_string += f"- R²: {self.r_squared}\n"
+        return_string += f"- R²: {self.r_squared}"
         return return_string
 
 
@@ -63,7 +63,7 @@ class HouseRswtParams:
         return_string += f"- load_2_4: {self.load_2_4}\n"
         return_string += f"- load_4_6: {self.load_4_6}\n"
         return_string += f"- load_6_8: {self.load_6_8}\n"
-        return_string += f"- load_8_plus: {self.load_8_plus}\n"
+        return_string += f"- load_8_plus: {self.load_8_plus}"
         return return_string
 
 
