@@ -65,7 +65,7 @@ DEFAULT_MONOCHROME_COLD_OAT_NO_OAT_SAVEPATH = (
     Path("results")
     / "all_houses_energy_vs_swt_grid_monochrome_cold_oat_house_panels_only.pdf"
 )
-COLD_OAT_HIGHLIGHT_THRESHOLD_C = -20.6
+COLD_OAT_HIGHLIGHT_THRESHOLD_C = -20.0
 DEFAULT_PER_ZONE_SAVEPATH = (
     Path("results") / "all_houses_energy_vs_swt_grid_per_zone_heatcall.pdf"
 )
@@ -86,7 +86,7 @@ DEFAULT_OAT_CLEANING_DIR = Path("results") / "oat_cleaning_removed"
 PLOT_CACHE_DIR = Path("results") / "plot_energy_vs_swt_grid_cache"
 PLOT_CACHE_META_PATH = PLOT_CACHE_DIR / "meta.json"
 PLOT_CACHE_BUNDLE_PATH = PLOT_CACHE_DIR / "bundle.pkl"
-PLOT_CACHE_VERSION = 13
+PLOT_CACHE_VERSION = 14
 
 # Per-site OAT cleaning PDFs under DEFAULT_OAT_CLEANING_DIR (not the 2×3 grid figures).
 MAKE_INDIVIDUAL_PLOTS = False
@@ -96,6 +96,8 @@ DROP_OIL_BOILER_HOURS = False
 
 # Elm main grid (dominant-zone coloring): omit garage from zones and legend.
 ELM_MAIN_GRID_EXCLUDED_ZONES = frozenset({3})
+# House-panels-only figure: show master bedroom as Zone 3 (physical zone 4).
+ELM_NO_OAT_ZONE_RENUMBER = {4: 3}
 
 
 @dataclass
@@ -413,6 +415,69 @@ def _panel_excluding_zones(
     )
 
 
+def _remap_zone_keys(
+    d: dict[int, _T] | None,
+    zone_map: dict[int, int],
+) -> dict[int, _T] | None:
+    if d is None:
+        return None
+    out: dict[int, _T] = {}
+    for k, v in d.items():
+        out[zone_map.get(k, k)] = v
+    return out
+
+
+def _remap_zone_number_array(arr: np.ndarray, zone_map: dict[int, int]) -> np.ndarray:
+    out = np.asarray(arr, dtype=int).copy()
+    for old, new in zone_map.items():
+        out[out == old] = new
+    return out
+
+
+def _panel_renumber_display_zones(
+    panel: EnergyVsSwtPanelData,
+    zone_map: dict[int, int],
+) -> EnergyVsSwtPanelData:
+    if not zone_map:
+        return panel
+    new_zone_numbers = tuple(
+        zone_map.get(z, z) for z in panel.zone_numbers
+    )
+    return replace(
+        panel,
+        zone_numbers=new_zone_numbers,
+        dominant_zone=_remap_zone_number_array(panel.dominant_zone, zone_map),
+        zone_names=_remap_zone_keys(panel.zone_names, zone_map),
+        zone_avg_set_f=_remap_zone_keys(panel.zone_avg_set_f, zone_map),
+        coldest_hour_zone_set_f=_remap_zone_keys(
+            panel.coldest_hour_zone_set_f, zone_map
+        ),
+        zone_set_f_by_hour=_remap_zone_keys(panel.zone_set_f_by_hour, zone_map),
+        zone_heatcall_fraction_by_hour=_remap_zone_keys(
+            panel.zone_heatcall_fraction_by_hour, zone_map
+        ),
+        cleaning_excluded_below_setpoint_zone_heatcall=_remap_zone_keys(
+            panel.cleaning_excluded_below_setpoint_zone_heatcall, zone_map
+        ),
+        cleaning_excluded_below_setpoint_zone_was_below=_remap_zone_keys(
+            panel.cleaning_excluded_below_setpoint_zone_was_below, zone_map
+        ),
+        zone_legend_hour_percent_override=_remap_zone_keys(
+            panel.zone_legend_hour_percent_override, zone_map
+        ),
+    )
+
+
+def _elm_main_grid_no_oat_panel(panel: EnergyVsSwtPanelData) -> EnergyVsSwtPanelData:
+    """Garage omitted; master bedroom labeled Zone 3; legend % among displayed zones."""
+    trimmed = _panel_excluding_zones(
+        panel,
+        ELM_MAIN_GRID_EXCLUDED_ZONES,
+        preserve_zone_legend_hour_percent=False,
+    )
+    return _panel_renumber_display_zones(trimmed, ELM_NO_OAT_ZONE_RENUMBER)
+
+
 def _panels_for_main_energy_grid(
     panels: list[EnergyVsSwtPanelData],
 ) -> list[EnergyVsSwtPanelData]:
@@ -429,6 +494,17 @@ def _panels_for_main_energy_grid(
         else:
             out.append(panel)
     return out
+
+
+def _panels_for_main_energy_grid_no_oat(
+    panels: list[EnergyVsSwtPanelData],
+) -> list[EnergyVsSwtPanelData]:
+    return [
+        _elm_main_grid_no_oat_panel(panel)
+        if panel.house_alias == "elm"
+        else panel
+        for panel in panels
+    ]
 
 
 def _panels_by_alias(
@@ -461,7 +537,7 @@ def render_all_outputs(
         **_figure1_kw,
     )
     plot_estimated_energy_vs_swt_grid(
-        _main_energy_grid_panels,
+        _panels_for_main_energy_grid_no_oat(bundle.panels),
         savepath=DEFAULT_MAIN_GRID_NO_OAT_SAVEPATH,
         **_figure1_kw,
     )

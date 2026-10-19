@@ -34,6 +34,7 @@ class EnergyVsSwtPanelData:
     cleaning_excluded_below_setpoint_estimated_kwh: np.ndarray | None = None
     cleaning_excluded_below_setpoint_swt_f: np.ndarray | None = None
     cleaning_excluded_below_setpoint_oat_f: np.ndarray | None = None
+    cleaning_excluded_below_setpoint_hour_start: np.ndarray | None = None
     cleaning_excluded_below_setpoint_zone_heatcall: dict[int, np.ndarray] | None = None
     cleaning_excluded_below_setpoint_zone_was_below: dict[int, np.ndarray] | None = None
     cleaning_excluded_oil_boiler_estimated_kwh: np.ndarray | None = None
@@ -524,6 +525,7 @@ def _oat_timeseries_legend_handles(
     show_max_swt_markers: bool,
     maple_transition_label: str | None,
     highlight_oat_at_or_below_c: float | None = None,
+    show_design_day_below_setpoint_line: bool = False,
 ) -> list:
     from matplotlib.lines import Line2D
 
@@ -545,6 +547,17 @@ def _oat_timeseries_legend_handles(
                 color="red",
                 linewidth=1.5,
                 label="Design day or colder",
+            )
+        )
+    if show_design_day_below_setpoint_line:
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=DESIGN_DAY_BELOW_SETPOINT_SCATTER_COLOR,
+                linewidth=1.5,
+                linestyle="--",
+                label="Design day or colder, below setpoint",
             )
         )
     if maple_transition_label:
@@ -725,11 +738,15 @@ def _draw_oat_timeseries_on_ax(
     maple_transition_vline: pd.Timestamp | None = None,
     maple_transition_vline_label: str | None = "Maple retrofit",
     highlight_oat_at_or_below_c: float | None = None,
+    scatter_monochrome: bool = False,
+    highlight_design_day_below_setpoint: bool = False,
+    zone_scatter_filters: list[int] | None = None,
 ) -> None:
     """Hourly OAT (°C), red = coldest hour, green = max-SWT hour per house."""
     oat_times = pd.to_datetime(hour_start)
     oat_f_arr = np.asarray(oat_f, dtype=float)
     oat_vals = _swt_f_to_c(oat_f_arr)
+    purple_hours: frozenset[pd.Timestamp] = frozenset()
 
     if highlight_oat_at_or_below_c is not None:
         ax.plot(
@@ -752,6 +769,35 @@ def _draw_oat_timeseries_on_ax(
             alpha=0.95,
             zorder=2,
         )
+        if scatter_monochrome:
+            purple_hours = _design_day_below_setpoint_hours_for_oat_strip(
+                panels,
+                oat_at_or_below_c=float(highlight_oat_at_or_below_c),
+                heatcall_threshold=heatcall_threshold,
+                scatter_monochrome=True,
+                highlight_design_day_below_setpoint=highlight_design_day_below_setpoint,
+                zone_scatter_filters=zone_scatter_filters,
+            )
+        if purple_hours:
+            purple_mask = np.asarray(
+                pd.DatetimeIndex(oat_times).isin(list(purple_hours)),
+                dtype=bool,
+            )
+            y_purple = np.where(
+                purple_mask & np.isfinite(oat_vals),
+                oat_vals,
+                np.nan,
+            )
+            ax.plot(
+                oat_times,
+                y_purple,
+                color=DESIGN_DAY_BELOW_SETPOINT_SCATTER_COLOR,
+                linewidth=1.8,
+                linestyle="--",
+                dashes=(5, 3),
+                alpha=0.95,
+                zorder=3,
+            )
     else:
         ax.plot(oat_times, oat_vals, color="tab:blue", linewidth=1.5, alpha=0.6, zorder=1)
 
@@ -816,12 +862,14 @@ def _draw_oat_timeseries_on_ax(
         if maple_transition_vline is not None and maple_transition_vline_label
         else None
     )
+    show_purple_oat_line = bool(purple_hours)
     legend_handles = _oat_timeseries_legend_handles(
         show_coldest_marker=False,
         coldest_legend_label=None,
         show_max_swt_markers=bool(green_markers),
         maple_transition_label=transition_legend,
         highlight_oat_at_or_below_c=highlight_oat_at_or_below_c,
+        show_design_day_below_setpoint_line=show_purple_oat_line,
     )
     ax.legend(
         handles=legend_handles,
@@ -1351,6 +1399,72 @@ def _design_day_below_setpoint_excluded_scatter_xy(
             & np.asarray(zbelow, dtype=bool)
         )
     return bx[keep], by[keep]
+
+
+def _design_day_below_setpoint_hour_starts(
+    panel: EnergyVsSwtPanelData,
+    *,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float,
+    zone_scatter_only: int | None,
+) -> list[pd.Timestamp]:
+    hours = panel.cleaning_excluded_below_setpoint_hour_start
+    oats = panel.cleaning_excluded_below_setpoint_oat_f
+    if hours is None or oats is None:
+        return []
+    hours_arr = np.asarray(hours)
+    oats_arr = np.asarray(oats, dtype=float)
+    if hours_arr.size == 0 or oats_arr.size != hours_arr.size:
+        return []
+    oat_c = _swt_f_to_c(oats_arr)
+    keep = np.isfinite(oat_c) & (oat_c <= float(oat_at_or_below_c))
+    if zone_scatter_only is not None:
+        z = int(zone_scatter_only)
+        zhc = (panel.cleaning_excluded_below_setpoint_zone_heatcall or {}).get(z)
+        zbelow = (panel.cleaning_excluded_below_setpoint_zone_was_below or {}).get(z)
+        if (
+            zhc is None
+            or zbelow is None
+            or zhc.size != hours_arr.size
+            or zbelow.size != hours_arr.size
+        ):
+            return []
+        keep &= (
+            np.isfinite(zhc)
+            & (zhc >= float(heatcall_threshold))
+            & np.asarray(zbelow, dtype=bool)
+        )
+    return [pd.Timestamp(t) for t in hours_arr[keep]]
+
+
+def _design_day_below_setpoint_hours_for_oat_strip(
+    panels: list[EnergyVsSwtPanelData],
+    *,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float,
+    scatter_monochrome: bool,
+    highlight_design_day_below_setpoint: bool,
+    zone_scatter_filters: list[int] | None,
+) -> frozenset[pd.Timestamp]:
+    hours: set[pd.Timestamp] = set()
+    for index, panel in enumerate(panels):
+        if not _panel_show_design_day_below_setpoint(
+            panel,
+            highlight_design_day_below_setpoint=highlight_design_day_below_setpoint,
+            scatter_monochrome=scatter_monochrome,
+        ):
+            continue
+        zone_scatter_only = (
+            zone_scatter_filters[index] if zone_scatter_filters is not None else None
+        )
+        for ts in _design_day_below_setpoint_hour_starts(
+            panel,
+            oat_at_or_below_c=oat_at_or_below_c,
+            heatcall_threshold=heatcall_threshold,
+            zone_scatter_only=zone_scatter_only,
+        ):
+            hours.add(ts)
+    return frozenset(hours)
 
 
 def _design_day_colder_swt_legend_label(cold_swt_c: np.ndarray) -> str:
@@ -2863,6 +2977,9 @@ def plot_estimated_energy_vs_swt_grid(
             highlight_oat_at_or_below_c=(
                 highlight_oat_at_or_below_c if scatter_monochrome else None
             ),
+            scatter_monochrome=scatter_monochrome,
+            highlight_design_day_below_setpoint=highlight_design_day_below_setpoint,
+            zone_scatter_filters=zone_scatter_filters,
         )
 
     if fig_suptitle:
@@ -3197,6 +3314,7 @@ def plot_heat_calls(
     *,
     title: str | None = None,
     xlim: tuple[datetime | pd.Timestamp, datetime | pd.Timestamp] | None = None,
+    figsize: tuple[float, float] | None = None,
     savepath: Path | None = None,
     show: bool = False,
 ) -> None:
@@ -3213,7 +3331,11 @@ def plot_heat_calls(
     y_max = max(row_idx for _, _, row_idx, _ in parsed) + 1
     title_pad = 0.45 if title else 0.0
     fig_h = 1.25 + 0.62 * y_max + title_pad
-    fig, ax = plt.subplots(figsize=(11, fig_h))
+    if figsize is not None:
+        fig_w, fig_h = figsize
+    else:
+        fig_w = 11.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 

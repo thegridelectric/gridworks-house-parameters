@@ -549,6 +549,7 @@ class HouseEnergyParamsComputer:
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        np.ndarray,
         dict[int, np.ndarray],
         dict[int, np.ndarray],
     ]:
@@ -567,13 +568,13 @@ class HouseEnergyParamsComputer:
         empty = np.empty(0, dtype=float)
         empty_zone: dict[int, np.ndarray] = {z: empty.copy() for z in self.zones}
         if not highlight_ts:
-            return empty, empty, empty, empty, empty, empty_zone, empty_zone
+            return empty, empty, empty, empty, empty, empty, empty_zone, empty_zone
 
         df = self._engineered_df_before_known_bad_filter()
         hour_ts = pd.to_datetime(df["hour_start"])
         sub = df.loc[hour_ts.isin(highlight_ts)]
         if sub.empty:
-            return empty, empty, empty, empty, empty, empty_zone, empty_zone
+            return empty, empty, empty, empty, empty, empty, empty_zone, empty_zone
 
         reason_by_hour = {
             pd.Timestamp(ts): reason for ts, reason in drop_reasons.items()
@@ -597,6 +598,7 @@ class HouseEnergyParamsComputer:
         below = reasons == CLEANING_DROP_REASON_BELOW_SETPOINT
         oil = reasons == CLEANING_DROP_REASON_OIL_BOILER
         ex_below_oat_f = sub_valid["oat_f"].to_numpy(dtype=float)[below]
+        ex_below_hour_start = sub_valid["hour_start"].to_numpy()[below]
         min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
         zone_heatcall: dict[int, np.ndarray] = {}
         zone_was_below: dict[int, np.ndarray] = {}
@@ -620,6 +622,7 @@ class HouseEnergyParamsComputer:
             est[oil],
             swt[oil],
             ex_below_oat_f,
+            ex_below_hour_start,
             zone_heatcall,
             zone_was_below,
         )
@@ -2062,6 +2065,7 @@ class HouseEnergyParamsComputer:
             ex_oil_est,
             ex_oil_swt,
             ex_below_oat_f,
+            ex_below_hour_start,
             ex_below_zone_hc,
             ex_below_zone_was_below,
         ) = self.cleaning_excluded_oil_below_setpoint_energy_vs_swt(params)
@@ -2089,6 +2093,7 @@ class HouseEnergyParamsComputer:
             cleaning_excluded_below_setpoint_estimated_kwh=ex_below_est,
             cleaning_excluded_below_setpoint_swt_f=ex_below_swt,
             cleaning_excluded_below_setpoint_oat_f=ex_below_oat_f,
+            cleaning_excluded_below_setpoint_hour_start=ex_below_hour_start,
             cleaning_excluded_below_setpoint_zone_heatcall=ex_below_zone_hc,
             cleaning_excluded_below_setpoint_zone_was_below=ex_below_zone_was_below,
             cleaning_excluded_oil_boiler_estimated_kwh=ex_oil_est,
