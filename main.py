@@ -26,7 +26,7 @@ for house in HOUSE_ALIASES:
     try:
         h = HouseEnergyParamsComputer(house, START_TIME, END_TIME)
         energy_params = h.energy_fit_on_last_n_days(n=20)
-        # print(f"Energy params:\n{energy_params}")
+        print(energy_params)
         # rswt_params = h.rswt_fit_on_last_n_days(n=20)
         # print(f"RSWT params:\n{rswt_params}")
         # h.trailing_n_day_fits(n=50)

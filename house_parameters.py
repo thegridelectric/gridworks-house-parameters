@@ -29,6 +29,13 @@ class HouseEnergyParams:
     energy_ratio: float
     is_baseline: bool = False
 
+    def __repr__(self) -> str:
+        return_string = "HouseEnergyParams:\n"
+        for i,param in enumerate(self.feature_names):
+            return_string += f"- {param}: {self.values[i]} ± {self.std_errors[i]}\n"
+        return_string += f"- R²: {self.r_squared}\n"
+        return return_string
+
 
 @dataclass(frozen=True)
 class RswtLoadBucketFit:
@@ -104,7 +111,7 @@ class HouseEnergyParamsComputer:
     )
 
     # Occupancy features
-    INCLUDE_OCCUPANCY: bool = True
+    INCLUDE_OCCUPANCY: bool = False
     OCCUPANCY_INDIVIDUAL_HOURS = (6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21)
     WEEKDAY_OCCUPANCY_FEATURE_NAMES = tuple(f"wd_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
     WEEKEND_OCCUPANCY_FEATURE_NAMES = tuple(f"we_hour_{hour}" for hour in OCCUPANCY_INDIVIDUAL_HOURS)
