@@ -34,9 +34,9 @@ $$
 
 ## What the code includes
 
-We load hourly data from the database or from `data/{house}_house_params_data.csv` (depending on the `DATA_SOURCE` variable). We then crop to `[start_time, end_time)`.
+We load hourly data from local files first (`data/{house}_input_data.csv`, then legacy `data/{house}_house_params_data.csv`), fetch any missing hours from the database, and merge into the cache. We then crop to `[start_time, end_time)`.
 
-Note: When loading from the database, `oat_f` and `ws_mph` come from the first hour of each `weather.forecast` message for that house. `solar_w_m2` is set to 0 until we have a database source for solar.
+Note: Database fetches populate `oat_f` and `ws_mph` from the first hour of each `weather.forecast` message for that house. `solar_w_m2` is set to 0 until we have a database source for solar.
 
 After data cleaning, we either fit the model on the last N calendar days ending that day (or all days so far if `GROW_WINDOW_TO_N` is True). This gives the parameters that we will use to make 48-hour predictions.
 

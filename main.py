@@ -10,7 +10,7 @@ logging.basicConfig(
 )
 
 START_TIME = datetime(2025, 11, 1, tzinfo=ZoneInfo("America/New_York"))
-END_TIME = datetime(2025, 12, 30, tzinfo=ZoneInfo("America/New_York"))
+END_TIME = datetime(2025, 11, 20, tzinfo=ZoneInfo("America/New_York"))
 
 HOUSE_ALIASES = [
     "beech",

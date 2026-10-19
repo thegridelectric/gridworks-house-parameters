@@ -55,8 +55,6 @@ class HouseRswtParams:
 
 
 class HouseEnergyParamsComputer:
-    # Data source
-    DATA_SOURCE: Literal["database", "csv"] = "database"
     HOURLY_DATA_DIR = Path("data")
     FORCE_DATABASE_REFRESH: bool = False
 
@@ -170,71 +168,97 @@ class HouseEnergyParamsComputer:
 
     def _load_data(self) -> None:
         """
-        Loads house params data from CSV or the database and prepares it for analysis.
+        Loads house params data and prepares it for analysis.
+        Local CSVs first, then database for missing hours.
         - Sorts by hour_start, and adds a day column.
         - Finds the number of zones
         - Checks that all required columns are present
         """
-        if self.DATA_SOURCE == "csv":
-            csv_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
-            df = pd.read_csv(csv_path)
-            self._log_info(f"Loaded {csv_path}")
+        range_start = pd.Timestamp(
+            self.start_time.astimezone(self.timezone).replace(tzinfo=None)
+        )
+        range_end = pd.Timestamp(
+            self.end_time.astimezone(self.timezone).replace(tzinfo=None)
+        )
+        expected_hours = pd.date_range(
+            start=range_start,
+            end=range_end,
+            freq="h",
+            inclusive="left",
+        )
+        cache_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_input_data.csv"
+        legacy_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
 
-        elif self.DATA_SOURCE == "database":
-            range_start = pd.Timestamp(
-                self.start_time.astimezone(self.timezone).replace(tzinfo=None)
-            )
-            range_end = pd.Timestamp(
-                self.end_time.astimezone(self.timezone).replace(tzinfo=None)
-            )
-            cache_path = self.HOURLY_DATA_DIR / f"{self.house_alias}_input_data.csv"
-            df = None
-            if not self.FORCE_DATABASE_REFRESH and cache_path.is_file():
-                cached = pd.read_csv(cache_path)
-                cached["hour_start"] = pd.to_datetime(cached["hour_start"])
-                expected_hours = pd.date_range(
-                    start=range_start,
-                    end=range_end,
-                    freq="h",
-                    inclusive="left",
+        # Load local hourly tables
+        if self.FORCE_DATABASE_REFRESH:
+            self._log_info("FORCE_DATABASE_REFRESH: re-querying entire requested range")
+            local = pd.DataFrame()
+            missing_hours = expected_hours
+        else:
+            local_frames: list[pd.DataFrame] = []
+            for path in (legacy_path, cache_path):
+                if not path.is_file():
+                    continue
+                part = pd.read_csv(path)
+                part["hour_start"] = pd.to_datetime(part["hour_start"])
+                local_frames.append(part)
+                self._log_info(f"Loaded local hourly data from {path}")
+            local = (
+                pd.concat(local_frames, ignore_index=True).drop_duplicates(
+                    subset=["hour_start"], keep="last"
                 )
-                in_range = cached.loc[
-                    (cached["hour_start"] >= range_start)
-                    & (cached["hour_start"] < range_end),
-                    "hour_start",
-                ]
-                cache_ok = expected_hours.empty or (
-                    len(in_range) == len(expected_hours)
-                    and set(in_range) == set(expected_hours)
-                )
-                if cache_ok:
-                    df = cached
-                    self._log_info(f"Loaded hourly data from cache {cache_path}")
-                else:
-                    self._log_info(
-                        f"Cache {cache_path} missing hours for "
-                        f"{range_start.isoformat()}–{range_end.isoformat()}; "
-                        f"querying database"
+                if local_frames
+                else pd.DataFrame()
+            )
+            if local.empty:
+                missing_hours = expected_hours
+            else:
+                present = pd.DatetimeIndex(local["hour_start"]).intersection(expected_hours)
+                missing_hours = expected_hours.difference(present)
+
+        # Query database for missing hours (contiguous ranges)
+        if not missing_hours.empty:
+            self._log_info(
+                f"Missing {len(missing_hours)} of {len(expected_hours)} hour(s) locally; "
+                "querying database"
+            )
+            fetched_parts: list[pd.DataFrame] = []
+            hours = missing_hours.sort_values()
+            one_hour = pd.Timedelta(hours=1)
+            block_start = hours[0]
+            previous = hours[0]
+            fetch_ranges: list[tuple[datetime, datetime]] = []
+            for hour in hours[1:]:
+                if hour - previous != one_hour:
+                    fetch_ranges.append(
+                        (
+                            block_start.to_pydatetime().replace(tzinfo=self.timezone),
+                            (previous + one_hour).to_pydatetime().replace(tzinfo=self.timezone),
+                        )
                     )
-            loaded_from_cache = df is not None
-            if df is None:
-                self.HOURLY_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                fetcher = HouseParamsDataFetcher(
-                    self.house_alias,
-                    self.start_time,
-                    self.end_time,
-                    self.timezone,
-                )
+                    block_start = hour
+                previous = hour
+            fetch_ranges.append(
                 (
-                    channel_data_by_hour_start,
-                    csv_fieldnames,
-                    zone_numbers,
-                ) = fetcher.fetch()
+                    block_start.to_pydatetime().replace(tzinfo=self.timezone),
+                    (previous + one_hour).to_pydatetime().replace(tzinfo=self.timezone),
+                )
+            )
+
+            for t_start, t_end in fetch_ranges:
+                self._log_info(
+                    f"Database fetch {t_start.isoformat()} to {t_end.isoformat()}"
+                )
+                fetcher = HouseParamsDataFetcher(
+                    self.house_alias, t_start, t_end, self.timezone
+                )
+                channel_data, csv_fieldnames, zone_numbers = fetcher.fetch()
+                # Build dataframe rows from fetcher output
                 rows: list[dict[str, object]] = []
-                for hour in sorted(channel_data_by_hour_start.keys()):
-                    data = channel_data_by_hour_start[hour]
+                for hour_key in sorted(channel_data.keys()):
+                    data = channel_data[hour_key]
                     row: dict[str, object] = {
-                        "hour_start": hour,
+                        "hour_start": hour_key,
                         "oat_f": data.get("oat_f", np.nan),
                         "ws_mph": data.get("ws_mph", np.nan),
                         "solar_w_m2": data.get("solar_w_m2", np.nan),
@@ -257,22 +281,38 @@ class HouseEnergyParamsComputer:
                             f"zone{zone}_avg_temp", np.nan
                         )
                     rows.append(row)
-                df = pd.DataFrame(rows, columns=csv_fieldnames)
+                fetched_parts.append(pd.DataFrame(rows, columns=csv_fieldnames))
+
+            if fetched_parts:
+                fetched = pd.concat(fetched_parts, ignore_index=True)
                 self._log_info(
-                    f"Loaded data from database ({len(df)} rows); "
-                    "weather from weather.forecast first hour (solar_w_m2=0)"
+                    f"Loaded {len(fetched)} row(s) from database "
+                    "(weather.forecast first hour; solar_w_m2=0)"
                 )
+                local = pd.concat([local, fetched], ignore_index=True)
+                local = local.drop_duplicates(subset=["hour_start"], keep="last")
+                self.HOURLY_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                if cache_path.is_file():
+                    existing = pd.read_csv(cache_path)
+                    existing["hour_start"] = pd.to_datetime(existing["hour_start"])
+                    merged = pd.concat([existing, fetched], ignore_index=True)
+                else:
+                    merged = fetched
+                merged = merged.drop_duplicates(subset=["hour_start"], keep="last")
+                merged.sort_values("hour_start").reset_index(drop=True).to_csv(
+                    cache_path, index=False
+                )
+                self._log_info(f"Updated hourly cache {cache_path} ({len(merged)} rows)")
 
-            if not loaded_from_cache:
-                df.to_csv(cache_path, index=False)
-                self._log_info(f"Wrote hourly data cache to {cache_path}")
-
-        else:
-            raise ValueError(f"Unsupported DATA_SOURCE: {self.DATA_SOURCE!r}")
+        # Crop to requested range
+        df = local.loc[local["hour_start"].isin(expected_hours)].copy()
+        if len(df) < len(expected_hours):
+            self._log_info(
+                f"Only {len(df)} of {len(expected_hours)} requested hours available "
+                "after local + database load"
+            )
 
         df["hour_start"] = pd.to_datetime(df["hour_start"])
-        range_start = pd.Timestamp(self.start_time.astimezone(self.timezone).replace(tzinfo=None))
-        range_end = pd.Timestamp(self.end_time.astimezone(self.timezone).replace(tzinfo=None))
         df = df.loc[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
         self._log_info(
             f"Cropped datafrom {range_start.isoformat()} to "

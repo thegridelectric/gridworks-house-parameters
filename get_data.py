@@ -222,6 +222,8 @@ ORDER BY timestamp ASC
 
 
 class HouseParamsDataFetcher:
+    FETCH_BATCH_DAYS = 5
+
     def __init__(self, house_alias: str, t_start: datetime, t_end: datetime, local_tz: ZoneInfo) -> None:
         dotenv.load_dotenv()
         db_url = os.environ.get("GW_DATA_DB_URL")
@@ -243,40 +245,9 @@ class HouseParamsDataFetcher:
 
     def fetch(self) -> tuple[dict[str, dict[str, float | None]], list[str], list[int]]:
         logger.info(
-            f"{self.house_alias} - Exporting from {self.t_start.isoformat()} "
+            f"[{self.house_alias}] Exporting from {self.t_start.isoformat()} "
             f"to {self.t_end.isoformat()} ({self.local_tz})"
         )
-
-        # Prepare query parameters
-        params = {
-            "house_alias": f"%{self.house_alias}%",
-            "t_start": self.t_start,
-            "t_end": self.t_end,
-            "t_end_inclusive": self.t_end - timedelta(microseconds=1),
-            "local_tz": str(self.local_tz),
-            "oil_boiler_channel": OIL_BOILER_CHANNEL,
-            "energy_channels": ENERGY_CHANNELS,
-            "dist_flow_channels": DIST_FLOW_CHANNELS,
-            "dist_flow_onset_delay": DIST_FLOW_ONSET_DELAY,
-            "dist_flow_only_channels": DIST_FLOW_ONLY_CHANNELS,
-            "kg_per_us_gallon": KG_PER_US_GALLON,
-        }
-
-        weather_params = {
-            "message_type": "weather.forecast",
-            "from_alias": f"%{self.house_alias}%",
-            "msg_t_start": self.t_start - timedelta(hours=48),
-            "t_end": self.t_end,
-        }
-
-        # Execute queries
-        with self.engine.connect() as conn:
-            energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
-            dist_flow_wt_rows = conn.execute(DIST_FLOW_WT_SQL, params).mappings().all()
-            dist_water_kg_rows = conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
-            oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
-            zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
-            weather_rows = conn.execute(WEATHER_FORECAST_SQL, weather_params).mappings().all()
 
         # Initialize by-hour dictionary
         channel_data_by_hour_start: dict[str, dict[str, float | None]] = {}
@@ -286,87 +257,139 @@ class HouseParamsDataFetcher:
             channel_data_by_hour_start[hour] = {}
             cursor += timedelta(hours=1)
 
-        # Populate by-hour dictionary with energy data
-        for row in energy_rows:
-            key = self.hour_start_key(row["time_bucket"])
-            bucket = channel_data_by_hour_start.setdefault(key, {})
-            bucket["dist_kwh"] = 0.0 if row["dist_kwh"] is None else round(float(row["dist_kwh"]), 2)
-            bucket["hp_kwh_th"] = 0.0 if row["hp_kwh_th"] is None else round(float(row["hp_kwh_th"]), 2)
-
-        for row in dist_flow_wt_rows:
-            key = self.hour_start_key(row["time_bucket"])
-            bucket = channel_data_by_hour_start.setdefault(key, {})
-            for field in ("swt_average_f", "rwt_average_f"):
-                val = row[field]
-                bucket[field] = round(float(val), 2) if val is not None else None
-
-        for row in dist_water_kg_rows:
-            key = self.hour_start_key(row["time_bucket"])
-            bucket = channel_data_by_hour_start.setdefault(key, {})
-            val = row["dist_water_kg"]
-            bucket["dist_water_kg"] = round(float(val), 2) if val is not None else None
-
-        # Populate by-hour dictionary with oil boiler power data
-        for row in oil_rows:
-            key = self.hour_start_key(row["time_bucket"])
-            bucket = channel_data_by_hour_start.setdefault(key, {})
-            avg = row["avg_value"]
-            bucket["oil_boiler_pwr"] = round(float(avg), 1) if avg is not None else 0.0
-
-        # Populate by-hour dictionary with zone data
         zone_ids: set[int] = set()
-        zone_accum: dict[str, list[float]] = {}
-
-        for row in zone_rows:
-            name = row["channel_name"]
-            parsed = ZONE_CHANNEL.match(name)
-            if not parsed:
-                continue
-            zone = int(parsed.group(1))
-            kind = parsed.group(2)
-            zone_ids.add(zone)
-
-            unit = row["unit"]
-            raw = float(row["avg_value"]) if row["avg_value"] is not None else None
-            if raw is None:
-                continue
-            if kind in ("temp", "set"):
-                value = round(raw / 1000.0 if unit == "AirTempFTimes1000" else raw, 1)
-            else:
-                value = round(raw, 2)
-
-            key = self.hour_start_key(row["time_bucket"])
-            if kind == "heat-call":
-                field = f"zone{zone}_heatcall_fraction"
-            elif kind == "temp":
-                field = f"zone{zone}_avg_temp"
-            else:
-                field = f"zone{zone}_avg_set"
-            zone_accum.setdefault(f"{key}|{field}", []).append(value)
-
-        for compound, values in zone_accum.items():
-            hour_key, field = compound.split("|", 1)
-            bucket = channel_data_by_hour_start.setdefault(hour_key, {})
-            bucket[field] = round(sum(values) / len(values), 1 if "avg_" in field else 2)
-
         weather_by_hour: dict[str, dict[str, float]] = {}
-        for row in weather_rows:
-            payload = row["payload"]
-            if not isinstance(payload, dict):
-                continue
-            times = payload.get("Time") or []
-            oat = payload.get("OatF") or []
-            wind = payload.get("WindSpeedMph") or []
-            if not times or not oat or not wind:
-                continue
-            hour_utc = datetime.fromtimestamp(int(times[0]), tz=ZoneInfo("UTC"))
-            hour_key = self.hour_start_key(hour_utc)
-            weather_by_hour[hour_key] = {
-                "oat_f": round(float(oat[0]), 1),
-                "ws_mph": round(float(wind[0]), 1),
-            }
-        logger.info(f"{self.house_alias} - weather.forecast first-hour rows: {len(weather_by_hour)}")
+        batch_start = self.t_start
+        batch_days = timedelta(days=self.FETCH_BATCH_DAYS)
 
+        # Execute queries in time batches
+        with self.engine.connect() as conn:
+            while batch_start < self.t_end:
+                batch_end = min(batch_start + batch_days, self.t_end)
+                logger.info(
+                    f"[{self.house_alias}] Fetching batch "
+                    f"{batch_start.isoformat()} to {batch_end.isoformat()}"
+                )
+
+                # Prepare query parameters
+                params = {
+                    "house_alias": f"%{self.house_alias}%",
+                    "t_start": batch_start,
+                    "t_end": batch_end,
+                    "t_end_inclusive": batch_end - timedelta(microseconds=1),
+                    "local_tz": str(self.local_tz),
+                    "oil_boiler_channel": OIL_BOILER_CHANNEL,
+                    "energy_channels": ENERGY_CHANNELS,
+                    "dist_flow_channels": DIST_FLOW_CHANNELS,
+                    "dist_flow_onset_delay": DIST_FLOW_ONSET_DELAY,
+                    "dist_flow_only_channels": DIST_FLOW_ONLY_CHANNELS,
+                    "kg_per_us_gallon": KG_PER_US_GALLON,
+                }
+                weather_params = {
+                    "message_type": "weather.forecast",
+                    "from_alias": f"%{self.house_alias}%",
+                    "msg_t_start": batch_start - timedelta(hours=48),
+                    "t_end": batch_end,
+                }
+
+                # Execute queries
+                energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
+                dist_flow_wt_rows = conn.execute(DIST_FLOW_WT_SQL, params).mappings().all()
+                dist_water_kg_rows = conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
+                oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
+                zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
+                weather_rows = conn.execute(WEATHER_FORECAST_SQL, weather_params).mappings().all()
+
+                # Populate by-hour dictionary with energy data
+                for row in energy_rows:
+                    key = self.hour_start_key(row["time_bucket"])
+                    bucket = channel_data_by_hour_start.setdefault(key, {})
+                    bucket["dist_kwh"] = (
+                        0.0 if row["dist_kwh"] is None else round(float(row["dist_kwh"]), 2)
+                    )
+                    bucket["hp_kwh_th"] = (
+                        0.0 if row["hp_kwh_th"] is None else round(float(row["hp_kwh_th"]), 2)
+                    )
+
+                for row in dist_flow_wt_rows:
+                    key = self.hour_start_key(row["time_bucket"])
+                    bucket = channel_data_by_hour_start.setdefault(key, {})
+                    for field in ("swt_average_f", "rwt_average_f"):
+                        val = row[field]
+                        bucket[field] = round(float(val), 2) if val is not None else None
+
+                for row in dist_water_kg_rows:
+                    key = self.hour_start_key(row["time_bucket"])
+                    bucket = channel_data_by_hour_start.setdefault(key, {})
+                    val = row["dist_water_kg"]
+                    bucket["dist_water_kg"] = round(float(val), 2) if val is not None else None
+
+                # Populate by-hour dictionary with oil boiler power data
+                for row in oil_rows:
+                    key = self.hour_start_key(row["time_bucket"])
+                    bucket = channel_data_by_hour_start.setdefault(key, {})
+                    avg = row["avg_value"]
+                    bucket["oil_boiler_pwr"] = round(float(avg), 1) if avg is not None else 0.0
+
+                # Populate by-hour dictionary with zone data
+                zone_accum: dict[str, list[float]] = {}
+                for row in zone_rows:
+                    name = row["channel_name"]
+                    parsed = ZONE_CHANNEL.match(name)
+                    if not parsed:
+                        continue
+                    zone = int(parsed.group(1))
+                    kind = parsed.group(2)
+                    zone_ids.add(zone)
+
+                    unit = row["unit"]
+                    raw = float(row["avg_value"]) if row["avg_value"] is not None else None
+                    if raw is None:
+                        continue
+                    if kind in ("temp", "set"):
+                        value = round(raw / 1000.0 if unit == "AirTempFTimes1000" else raw, 1)
+                    else:
+                        value = round(raw, 2)
+
+                    key = self.hour_start_key(row["time_bucket"])
+                    if kind == "heat-call":
+                        field = f"zone{zone}_heatcall_fraction"
+                    elif kind == "temp":
+                        field = f"zone{zone}_avg_temp"
+                    else:
+                        field = f"zone{zone}_avg_set"
+                    zone_accum.setdefault(f"{key}|{field}", []).append(value)
+
+                for compound, values in zone_accum.items():
+                    hour_key, field = compound.split("|", 1)
+                    bucket = channel_data_by_hour_start.setdefault(hour_key, {})
+                    bucket[field] = round(
+                        sum(values) / len(values), 1 if "avg_" in field else 2
+                    )
+
+                # weather.forecast: first hour of each message -> oat_f / ws_mph for that hour
+                for row in weather_rows:
+                    payload = row["payload"]
+                    if not isinstance(payload, dict):
+                        continue
+                    times = payload.get("Time") or []
+                    oat = payload.get("OatF") or []
+                    wind = payload.get("WindSpeedMph") or []
+                    if not times or not oat or not wind:
+                        continue
+                    hour_utc = datetime.fromtimestamp(int(times[0]), tz=ZoneInfo("UTC"))
+                    hour_key = self.hour_start_key(hour_utc)
+                    weather_by_hour[hour_key] = {
+                        "oat_f": round(float(oat[0]), 1),
+                        "ws_mph": round(float(wind[0]), 1),
+                    }
+
+                batch_start = batch_end
+
+        logger.info(
+            f"[{self.house_alias}] weather.forecast first-hour rows: {len(weather_by_hour)}"
+        )
+        # No DB solar yet; merge weather into hourly grid
         for hour_key, bucket in channel_data_by_hour_start.items():
             bucket["solar_w_m2"] = 0.0
             weather = weather_by_hour.get(hour_key)
