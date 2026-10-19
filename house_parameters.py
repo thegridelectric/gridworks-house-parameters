@@ -183,14 +183,20 @@ class HouseEnergyParamsComputer:
         start_time: datetime,
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        run_ms: int | None = None,
     ) -> None:
         self.house_alias = house_alias
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = timezone
-        run_ms = int(time.time() * 1000)
-        self.results_dir = Path("results") / house_alias / f"result_{run_ms}"
+        if run_ms is None:
+            run_ms = int(time.time() * 1000)
+        self.run_ms = run_ms
+        self.run_dir = Path("results") / f"result_{run_ms}"
+        self.results_dir = self.run_dir / house_alias
+        self.run_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        self._log_info(f"Run directory: {self.run_dir}")
         self._log_info(f"Results directory: {self.results_dir}")
         self._write_run_parameters_json(run_ms)
         self.prepare_data()
@@ -218,18 +224,26 @@ class HouseEnergyParamsComputer:
             name: self._to_json_safe(getattr(self.__class__, name))
             for name in self._SERIALIZED_CLASS_ATTRS
         }
-        payload = {
-            "run": {
-                "house_alias": self.house_alias,
-                "start_time": self.start_time.isoformat(),
-                "end_time": self.end_time.isoformat(),
-                "timezone": self.timezone.key,
-                "run_ms": run_ms,
-                "results_dir": str(self.results_dir),
-            },
-            "parameters": parameters,
-        }
-        path = self.results_dir / self.RUN_PARAMETERS_JSON
+        house_entry = {"results_dir": str(self.results_dir)}
+        path = self.run_dir / self.RUN_PARAMETERS_JSON
+        if path.exists():
+            with path.open(encoding="utf-8") as existing:
+                payload = json.load(existing)
+            run = payload.setdefault("run", {})
+            houses = run.setdefault("houses", {})
+            houses[self.house_alias] = house_entry
+        else:
+            payload = {
+                "run": {
+                    "start_time": self.start_time.isoformat(),
+                    "end_time": self.end_time.isoformat(),
+                    "timezone": self.timezone.key,
+                    "run_ms": run_ms,
+                    "run_dir": str(self.run_dir),
+                    "houses": {self.house_alias: house_entry},
+                },
+                "parameters": parameters,
+            }
         with path.open("w", encoding="utf-8") as out:
             json.dump(payload, out, indent=2)
             out.write("\n")

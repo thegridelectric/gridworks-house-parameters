@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -20,10 +21,12 @@ HOUSE_ALIASES = [
     "elm",
 ]
 
+run_ms = int(time.time() * 1000)
+
 for house in HOUSE_ALIASES:
     print(f"\n[{house.capitalize()}]")
     try:
-        h = HouseEnergyParamsComputer(house, START_TIME, END_TIME)
+        h = HouseEnergyParamsComputer(house, START_TIME, END_TIME, run_ms=run_ms)
         energy_params = h.get_energy_params()
         rswt_params = h.get_rswt_params()
         print(energy_params)
