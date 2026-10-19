@@ -939,7 +939,7 @@ class HouseEnergyParamsComputer:
         baseline_errors = baseline_predicted - actual
         baseline_mae = float(np.abs(baseline_errors).mean())
         baseline_rmse = float(np.sqrt((baseline_errors**2).mean()))
-        window_label = f"last {n_days} calendar day(s)"
+        window_label = f"last {n_days} calendar days"
         plot_pred_vs_actual(
             predicted,
             actual,
