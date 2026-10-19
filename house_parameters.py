@@ -193,11 +193,14 @@ class HouseEnergyParamsComputer:
             run_ms = int(time.time() * 1000)
         self.run_ms = run_ms
         self.run_dir = Path("results") / f"result_{run_ms}"
-        self.results_dir = self.run_dir / house_alias
+        self.house_dir = self.run_dir / house_alias
+        self.energy_params_dir = self.house_dir / "energy_params"
+        self.rswt_params_dir = self.house_dir / "rswt_params"
+        self.trailing_performance_dir = self.house_dir / "trailing_performance"
+        self.sweep_n_dir = self.house_dir / "sweep_n"
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.results_dir.mkdir(parents=True, exist_ok=True)
         self._log_info(f"Run directory: {self.run_dir}")
-        self._log_info(f"Results directory: {self.results_dir}")
+        self._log_info(f"House results directory: {self.house_dir}")
         self._write_run_parameters_json(run_ms)
         self.prepare_data()
 
@@ -224,7 +227,13 @@ class HouseEnergyParamsComputer:
             name: self._to_json_safe(getattr(self.__class__, name))
             for name in self._SERIALIZED_CLASS_ATTRS
         }
-        house_entry = {"results_dir": str(self.results_dir)}
+        house_entry = {
+            "house_dir": str(self.house_dir),
+            "energy_params_dir": str(self.energy_params_dir),
+            "rswt_params_dir": str(self.rswt_params_dir),
+            "trailing_performance_dir": str(self.trailing_performance_dir),
+            "sweep_n_dir": str(self.sweep_n_dir),
+        }
         path = self.run_dir / self.RUN_PARAMETERS_JSON
         if path.exists():
             with path.open(encoding="utf-8") as existing:
@@ -914,7 +923,7 @@ class HouseEnergyParamsComputer:
         """
         Fits the model on the last ``n`` calendar days of data, or on the full
         ``start_time``–``end_time`` window when ``n`` is omitted.
-        Writes one row to ``params_energy.csv`` and ``pred_vs_actual.png`` in ``results_dir``.
+        Writes one row to ``params_energy.csv`` and ``pred_vs_actual.png`` in ``energy_params_dir``.
         """
         window_df, n_days = self._fit_window(n)
         params = self.fit(window_df)
@@ -929,8 +938,10 @@ class HouseEnergyParamsComputer:
             energy_row[f"std_error_{name}"] = std_error
         energy_row["r_squared"] = params.r_squared
         energy_row["energy_ratio"] = params.energy_ratio
-        self.results_dir.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([energy_row]).to_csv(self.results_dir / "params_energy.csv", index=False)
+        self.energy_params_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([energy_row]).to_csv(
+            self.energy_params_dir / "params_energy.csv", index=False
+        )
 
         predicted = self.predict(params, window_df)
         actual = window_df["dist_kwh"].to_numpy(dtype=float) * params.energy_ratio
@@ -952,7 +963,7 @@ class HouseEnergyParamsComputer:
                 float(np.min(self.df["oat_f"].to_numpy())),
                 float(np.max(self.df["oat_f"].to_numpy())),
             ),
-            savepath=self.results_dir / "pred_vs_actual.png",
+            savepath=self.energy_params_dir / "pred_vs_actual.png",
             in_sample=True,
             baseline_mae=baseline_mae,
             baseline_rmse=baseline_rmse,
@@ -1088,7 +1099,7 @@ class HouseEnergyParamsComputer:
             f"(mean over {water_chc_n_hours} CHC training hour(s))"
         )
 
-        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.rswt_params_dir.mkdir(parents=True, exist_ok=True)
         plot_rswt_fit(
             rwt_df["swt_average_f"].to_numpy(),
             rwt_df["rwt_average_f"].to_numpy(),
@@ -1107,7 +1118,7 @@ class HouseEnergyParamsComputer:
             water_chc_n_hours=water_chc_n_hours,
             house_alias=self.house_alias,
             n_days=n_days,
-            savepath=self.results_dir / "rswt_fit.png",
+            savepath=self.rswt_params_dir / "rswt_fit.png",
         )
 
         params = HouseRswtParams(
@@ -1137,7 +1148,9 @@ class HouseEnergyParamsComputer:
             else:
                 rswt_row[f"{bucket}_rwt_intercept"] = fit.rwt_intercept
                 rswt_row[f"{bucket}_rwt_slope"] = fit.rwt_slope
-        pd.DataFrame([rswt_row]).to_csv(self.results_dir / "params_rswt.csv", index=False)
+        pd.DataFrame([rswt_row]).to_csv(
+            self.rswt_params_dir / "params_rswt.csv", index=False
+        )
         return params
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:
@@ -1156,7 +1169,7 @@ class HouseEnergyParamsComputer:
     # Evaluate the accuracy of the recursive horizon forecasts
     # ---------------------------------------------------------
 
-    def trailing_n_day_fits(self, n: int) -> None:
+    def evaluate_trailing_forecast_performance(self, n: int) -> None:
         """
         Repeatedly (daily or weekly, depending on ``TRAINING_FREQUENCY``) refits the house model 
         on the last ``n`` days of data. When ``GROW_WINDOW_TO_N`` is True and there is less 
@@ -1167,7 +1180,7 @@ class HouseEnergyParamsComputer:
         runs a recursive ``FORECAST_HORIZON_HOURS``-step ahead prediction, and scores errors against
         actual scaled_dist_kwh. 
         """
-        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.trailing_performance_dir.mkdir(parents=True, exist_ok=True)
 
         oos = self._evaluate_recursive_horizon_oos(n, collect_pointwise=True)
 
@@ -1208,7 +1221,7 @@ class HouseEnergyParamsComputer:
             },
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
-        params_table.to_csv(self.results_dir / "params_energy.csv")
+        params_table.to_csv(self.trailing_performance_dir / "params_energy.csv")
 
         self._log_info(
             f"{oos_label.capitalize()} out-of-sample over {oos['n_forecast_points']} "
@@ -1227,7 +1240,9 @@ class HouseEnergyParamsComputer:
                 "rmse_baseline_kwh": rmse_baseline_by_lead,
             }
         )
-        rmse_by_lead_df.to_csv(self.results_dir / "rmse_by_lead.csv", index=False)
+        rmse_by_lead_df.to_csv(
+            self.trailing_performance_dir / "rmse_by_lead.csv", index=False
+        )
 
         # Plots
         plot_pred_vs_actual(
@@ -1240,16 +1255,17 @@ class HouseEnergyParamsComputer:
                 float(np.min(self.df["oat_f"].to_numpy())),
                 float(np.max(self.df["oat_f"].to_numpy())),
             ),
-            savepath=self.results_dir / "pred_vs_actual.png",
+            savepath=self.trailing_performance_dir / "pred_vs_actual.png",
             baseline_mae=mae_baseline,
             baseline_rmse=rmse_baseline,
+            baseline_predicted=oos["oos_baseline_pred"],
             oos_period_label=oos_label,
         )
         plot_oos_residual_by_hour_of_day(
             oos["oos_lead1_errors"],
             oos["oos_lead1_hour_start"],
             house_alias=self.house_alias,
-            savepath=self.results_dir / "oos_residual_by_hour.png",
+            savepath=self.trailing_performance_dir / "oos_residual_by_hour.png",
             subtitle="first forecast hour (lead 1) only",
         )
         plot_oos_rmse_by_lead(
@@ -1257,7 +1273,7 @@ class HouseEnergyParamsComputer:
             rmse_baseline_by_lead,
             house_alias=self.house_alias,
             forecast_horizon_hours=self.FORECAST_HORIZON_HOURS,
-            savepath=self.results_dir / "rmse_by_lead.png",
+            savepath=self.trailing_performance_dir / "rmse_by_lead.png",
         )
 
     def predict_recursive_horizon(self, params: HouseEnergyParams, origin_index: int, horizon: int) -> np.ndarray:
@@ -1326,6 +1342,7 @@ class HouseEnergyParamsComputer:
         errors_by_lead: list[list[float]] = [[] for _ in range(horizon)]
         errors_baseline_by_lead: list[list[float]] = [[] for _ in range(horizon)]
         oos_pred: list[float] = []
+        oos_baseline_pred: list[float] = []
         oos_actual: list[float] = []
         oos_oat_f: list[float] = []
         oos_lead1_errors: list[float] = []
@@ -1358,9 +1375,10 @@ class HouseEnergyParamsComputer:
                 errors_baseline_by_lead[step].append(err_baseline)
 
             # Gathering of individual prediction and target values for every origin×lead in the recursive forecast evaluation.
-            # This is used by the plotting functions in trailing_n_day_fits() to plot the predicted vs actual values.
+            # Used by evaluate_trailing_forecast_performance() for pred vs actual plots.
             if collect_pointwise:
                 oos_pred.extend(pred.tolist())
+                oos_baseline_pred.extend(pred_baseline.tolist())
                 oos_actual.extend(actual.tolist())
                 oos_oat_f.extend(df["oat_f"].iloc[target_start : target_start + horizon].tolist())
                 oos_lead1_errors.append(float(pred[0] - actual[0]))
@@ -1402,6 +1420,7 @@ class HouseEnergyParamsComputer:
             "rmse_baseline_by_lead": rmse_baseline_by_lead,
             "n_forecast_points": len(all_errors),
             "oos_pred": np.array(oos_pred),
+            "oos_baseline_pred": np.array(oos_baseline_pred),
             "oos_actual": np.array(oos_actual),
             "oos_oat_f": np.array(oos_oat_f),
             "oos_lead1_errors": np.array(oos_lead1_errors),
@@ -1418,7 +1437,7 @@ class HouseEnergyParamsComputer:
         """
         import matplotlib.pyplot as plt
 
-        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.sweep_n_dir.mkdir(parents=True, exist_ok=True)
 
         rmses: list[float] = []
         b1_weekly_ranges: list[float] = []
@@ -1469,5 +1488,5 @@ class HouseEnergyParamsComputer:
             f"({self.TRAINING_FREQUENCY} training, {window_mode})"
         )
         fig.tight_layout()
-        fig.savefig(self.results_dir / "sweep_n.png", dpi=150, bbox_inches="tight")
+        fig.savefig(self.sweep_n_dir / "sweep_n.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
