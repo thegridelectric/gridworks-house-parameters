@@ -56,6 +56,7 @@ class HouseRswtParams:
 
 class HouseEnergyParamsComputer:
     HOURLY_DATA_DIR = Path("data")
+    SOLAR_DATA_CSV = Path("solar_data.csv")
     FORCE_DATABASE_REFRESH: bool = False
 
     # Data cleaning - erroneous data
@@ -213,7 +214,14 @@ class HouseEnergyParamsComputer:
             if local.empty:
                 missing_hours = expected_hours
             else:
-                present = pd.DatetimeIndex(local["hour_start"]).intersection(expected_hours)
+                local["hour_start"] = pd.to_datetime(local["hour_start"])
+                present = pd.DatetimeIndex(
+                    local.loc[
+                        (local["hour_start"] >= range_start)
+                        & (local["hour_start"] < range_end),
+                        "hour_start",
+                    ].unique()
+                )
                 missing_hours = expected_hours.difference(present)
 
         # Query database for missing hours (contiguous ranges)
@@ -285,9 +293,10 @@ class HouseEnergyParamsComputer:
 
             if fetched_parts:
                 fetched = pd.concat(fetched_parts, ignore_index=True)
+                fetched["hour_start"] = pd.to_datetime(fetched["hour_start"])
                 self._log_info(
                     f"Loaded {len(fetched)} row(s) from database "
-                    "(weather.forecast first hour; solar_w_m2=0)"
+                    "(weather.forecast first hour; solar_w_m2 from solar_data.csv)"
                 )
                 local = pd.concat([local, fetched], ignore_index=True)
                 local = local.drop_duplicates(subset=["hour_start"], keep="last")
@@ -305,21 +314,47 @@ class HouseEnergyParamsComputer:
                 self._log_info(f"Updated hourly cache {cache_path} ({len(merged)} rows)")
 
         # Crop to requested range
-        df = local.loc[local["hour_start"].isin(expected_hours)].copy()
+        if not local.empty:
+            local["hour_start"] = pd.to_datetime(local["hour_start"])
+        df = local.loc[
+            (local["hour_start"] >= range_start) & (local["hour_start"] < range_end)
+        ].copy()
         if len(df) < len(expected_hours):
             self._log_info(
                 f"Only {len(df)} of {len(expected_hours)} requested hours available "
                 "after local + database load"
             )
-
-        df["hour_start"] = pd.to_datetime(df["hour_start"])
-        df = df.loc[(df["hour_start"] >= range_start) & (df["hour_start"] < range_end)]
+        if df.empty:
+            raise ValueError(
+                f"No hourly data for {self.house_alias} in "
+                f"[{range_start.isoformat()}, {range_end.isoformat()})"
+            )
         self._log_info(
             f"Cropped datafrom {range_start.isoformat()} to "
             f"{range_end.isoformat()} ({self.timezone})"
         )
         df = df.sort_values("hour_start").reset_index(drop=True)
         df["day"] = df["hour_start"].dt.normalize()
+
+        if self.SOLAR_DATA_CSV.is_file():
+            solar_df = pd.read_csv(self.SOLAR_DATA_CSV, usecols=["hour_start", "solar_w_m2"])
+            solar_df["hour_start"] = pd.to_datetime(solar_df["hour_start"])
+            if "solar_w_m2" not in df.columns:
+                df["solar_w_m2"] = np.nan
+            solar_by_hour = solar_df.set_index("hour_start")["solar_w_m2"]
+            missing_solar = df["solar_w_m2"].isna()
+            df.loc[missing_solar, "solar_w_m2"] = df.loc[missing_solar, "hour_start"].map(
+                solar_by_hour
+            )
+            filled = int(missing_solar.sum())
+            if filled:
+                self._log_info(f"Filled solar_w_m2 for {filled} hour(s) from {self.SOLAR_DATA_CSV}")
+        else:
+            if "solar_w_m2" not in df.columns or df["solar_w_m2"].isna().all():
+                df["solar_w_m2"] = 0.0
+                self._log_info(f"No {self.SOLAR_DATA_CSV} and no solar values; solar_w_m2 set to 0")
+            else:
+                self._log_info(f"No {self.SOLAR_DATA_CSV}; solar_w_m2 left as loaded")
 
         self.zones = sorted(
             int(str(c).removeprefix("zone").removesuffix("_avg_set"))
@@ -439,6 +474,8 @@ class HouseEnergyParamsComputer:
         """
         # Insert missing rows (need one row per hour)
         df = df.copy()
+        if df.empty:
+            return df
         df["hour_start"] = pd.to_datetime(df["hour_start"])
         full_hours = pd.date_range(df["hour_start"].min(), df["hour_start"].max(), freq="h")
         n_before = len(df)

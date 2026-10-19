@@ -389,9 +389,8 @@ class HouseParamsDataFetcher:
         logger.info(
             f"[{self.house_alias}] weather.forecast first-hour rows: {len(weather_by_hour)}"
         )
-        # No DB solar yet; merge weather into hourly grid
+        # No DB solar in weather.forecast; merge OAT/wind into hourly grid (solar filled later)
         for hour_key, bucket in channel_data_by_hour_start.items():
-            bucket["solar_w_m2"] = 0.0
             weather = weather_by_hour.get(hour_key)
             if weather:
                 bucket["oat_f"] = weather["oat_f"]
