@@ -397,7 +397,9 @@ class HouseEnergyParamsComputer:
         df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
-        df = df.drop(0).reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"No usable hourly rows for {self.house_alias} after data cleaning")
+        df = df.iloc[1:].reset_index(drop=True)
         df["windspeed_times_65_minus_oat"] = df["ws_mph"] * (65.0 - df["oat_f"])
         if self.INCLUDE_OCCUPANCY:
             hour = df["hour_start"].dt.hour
