@@ -69,15 +69,18 @@ def plot_pred_vs_actual(
     baseline_mae: float | None = None,
     baseline_rmse: float | None = None,
     oos_period_label: str = "next-day",
+    in_sample: bool = False,
+    baseline_predicted: np.ndarray | None = None,
 ) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.cm import ScalarMappable
+    from matplotlib.axes import Axes
     from matplotlib.colors import Normalize
 
     predicted = np.asarray(predicted)
     actual = np.asarray(actual)
     oat_values = np.asarray(oat_f, dtype=float)
-    errors = predicted - actual
+    if baseline_predicted is not None:
+        baseline_predicted = np.asarray(baseline_predicted)
 
     oat_min, oat_max = oat_f_colormap_bounds
     if oat_min >= oat_max:
@@ -85,59 +88,104 @@ def plot_pred_vs_actual(
     norm = Normalize(vmin=oat_min, vmax=oat_max)
     cmap = plt.cm.coolwarm
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    ax = axes[0]
-    ax.scatter(actual, predicted, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6)
     hi = float(max(actual.max(), predicted.max()) * 1.05)
-    limits = [0, hi]
-    ax.plot(limits, limits, "k--", linewidth=1)
-    ax.set_xlim(limits)
-    ax.set_ylim(limits)
-    ax.set_xlabel("Actual scaled dist_kwh (kWh)")
-    ax.set_ylabel("Predicted scaled dist_kwh (kWh)")
-    mae = float(np.abs(errors).mean())
-    rmse = float(np.sqrt((errors**2).mean()))
+    if baseline_predicted is not None:
+        hi = float(max(hi, baseline_predicted.max() * 1.05))
+    limits = (0.0, hi)
 
-    scatter_title = f"{oos_period_label.capitalize()} out-of-sample predictions"
-    if baseline_mae is not None and baseline_rmse is not None:
-        rmse_pct = (baseline_rmse - rmse) / baseline_rmse * 100.0
-        mae_pct = (baseline_mae - mae) / baseline_mae * 100.0
-        scatter_title += (
-            "\n"
-            + f"RMSE {abs(rmse_pct):.0f}% {'better' if rmse_pct >= 0 else 'worse'}"
-            + ", "
-            + f"MAE {abs(mae_pct):.0f}% {'better' if mae_pct >= 0 else 'worse'}"
-            + " than αβγ"
+    n_rows = 2 if baseline_predicted is not None else 1
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 6 * n_rows))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+
+    def draw_row(
+        ax_scatter: Axes,
+        ax_hist: Axes,
+        predicted_row: np.ndarray,
+        *,
+        scatter_title: str,
+        compare_to_baseline: bool,
+    ) -> None:
+        errors = predicted_row - actual
+        ax_scatter.scatter(
+            actual, predicted_row, c=oat_values, cmap=cmap, norm=norm, s=8, alpha=0.6
         )
-    ax.set_title(scatter_title)
+        ax_scatter.plot(limits, limits, "k--", linewidth=1)
+        ax_scatter.set_xlim(limits)
+        ax_scatter.set_ylim(limits)
+        ax_scatter.set_xlabel("Actual scaled dist_kwh (kWh)")
+        ax_scatter.set_ylabel("Predicted scaled dist_kwh (kWh)")
+        mae = float(np.abs(errors).mean())
+        rmse = float(np.sqrt((errors**2).mean()))
 
-    stats = f"MAE  = {mae:.3f} kWh\n"
-    if baseline_mae is not None:
-        stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
-    stats += f"RMSE = {rmse:.3f} kWh\n"
-    if baseline_rmse is not None:
-        stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
-    stats = stats.rstrip()
-    ax.text(
-        0.97, 0.03, stats, transform=ax.transAxes, ha="right", va="bottom",
-        family="monospace", fontsize=9,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        title_text = scatter_title
+        if (
+            compare_to_baseline
+            and baseline_mae is not None
+            and baseline_rmse is not None
+        ):
+            rmse_pct = (baseline_rmse - rmse) / baseline_rmse * 100.0
+            mae_pct = (baseline_mae - mae) / baseline_mae * 100.0
+            title_text += (
+                "\n"
+                + f"RMSE {abs(rmse_pct):.0f}% {'better' if rmse_pct >= 0 else 'worse'}"
+                + ", "
+                + f"MAE {abs(mae_pct):.0f}% {'better' if mae_pct >= 0 else 'worse'}"
+                + " than αβγ"
+            )
+        ax_scatter.set_title(title_text)
+
+        stats = f"MAE  = {mae:.3f} kWh\n"
+        if compare_to_baseline and baseline_mae is not None:
+            stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
+        stats += f"RMSE = {rmse:.3f} kWh\n"
+        if compare_to_baseline and baseline_rmse is not None:
+            stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
+        stats = stats.rstrip()
+        ax_scatter.text(
+            0.97,
+            0.03,
+            stats,
+            transform=ax_scatter.transAxes,
+            ha="right",
+            va="bottom",
+            family="monospace",
+            fontsize=9,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+        ax_hist.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
+        ax_hist.axvline(0, color="k", linestyle="--", linewidth=1)
+        ax_hist.set_xlim(-6, 6)
+        ax_hist.set_xlabel("Prediction error (scaled kWh)")
+        ax_hist.set_ylabel("Hours")
+        ax_hist.set_title("Error distribution")
+
+    main_scatter_title = (
+        "In-sample predictions"
+        if in_sample
+        else f"{oos_period_label.capitalize()} out-of-sample predictions"
     )
-
-    ax = axes[1]
-    ax.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
-    ax.axvline(0, color="k", linestyle="--", linewidth=1)
-    ax.set_xlim(-6, 6)
-    ax.set_xlabel("Prediction error (scaled kWh)")
-    ax.set_ylabel("Hours")
-    ax.set_title("Error distribution")
-
-    sm = ScalarMappable(norm=norm, cmap=cmap)
-    cbar = fig.colorbar(sm, ax=list(axes), fraction=0.03, pad=0.02)
-    ticks = np.linspace(oat_min, oat_max, num=6, retstep=False).tolist()
-    cbar.set_ticks(ticks)
-    cbar.set_ticklabels([f"{t:.0f}°F" for t in ticks])
+    draw_row(
+        axes[0, 0],
+        axes[0, 1],
+        predicted,
+        scatter_title=main_scatter_title,
+        compare_to_baseline=True,
+    )
+    if baseline_predicted is not None:
+        baseline_title = (
+            "αβγ baseline in-sample predictions"
+            if in_sample
+            else f"αβγ baseline {oos_period_label} out-of-sample predictions"
+        )
+        draw_row(
+            axes[1, 0],
+            axes[1, 1],
+            baseline_predicted,
+            scatter_title=baseline_title,
+            compare_to_baseline=False,
+        )
 
     fig.suptitle(title)
 

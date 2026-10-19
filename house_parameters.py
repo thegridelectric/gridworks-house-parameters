@@ -880,26 +880,80 @@ class HouseEnergyParamsComputer:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
 
+    def _fit_window(self, n: int | None = None) -> tuple[pd.DataFrame, int]:
+        """Training rows and calendar-day count (full window length when ``n`` is omitted)."""
+        if n is None:
+            window_df = self.df
+            n_days = len(np.unique(window_df["day"].to_numpy()))
+        else:
+            days = np.unique(self.df["day"].to_numpy())
+            window_days = (days[-n:] if len(days) >= n else days).tolist()
+            window_df = self.df.loc[self.df["day"].isin(window_days)]
+            n_days = n
+        return window_df, n_days
+
     # --------------------------------------------------
     # Get energy parameters for the last N days of data
     # --------------------------------------------------
 
-    def energy_fit_on_last_n_days(self, n: int) -> HouseEnergyParams:
+    def get_energy_params(self, n: int | None = None) -> HouseEnergyParams:
         """
-        Fits the model on the last ``n`` calendar days of data.
+        Fits the model on the last ``n`` calendar days of data, or on the full
+        ``start_time``–``end_time`` window when ``n`` is omitted.
+        Writes one row to ``params_energy.csv`` and ``pred_vs_actual.png`` in ``results_dir``.
         """
-        days = np.unique(self.df["day"].to_numpy())
-        window_days = (days[-n:] if len(days) >= n else days).tolist()
-        window_df = self.df.loc[self.df["day"].isin(window_days)]
-        return self.fit(window_df)
+        window_df, n_days = self._fit_window(n)
+        params = self.fit(window_df)
+        energy_row: dict[str, float | int] = {
+            "n_days": n_days,
+        }
+        coef_names = ("intercept",) + params.feature_names
+        for name, value, std_error in zip(
+            coef_names, params.values, params.std_errors, strict=True
+        ):
+            energy_row[name] = value
+            energy_row[f"std_error_{name}"] = std_error
+        energy_row["r_squared"] = params.r_squared
+        energy_row["energy_ratio"] = params.energy_ratio
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([energy_row]).to_csv(self.results_dir / "params_energy.csv", index=False)
+
+        predicted = self.predict(params, window_df)
+        actual = window_df["dist_kwh"].to_numpy(dtype=float) * params.energy_ratio
+        baseline_params = self.fit(window_df, baseline=True)
+        baseline_predicted = self.predict(baseline_params, window_df)
+        baseline_errors = baseline_predicted - actual
+        baseline_mae = float(np.abs(baseline_errors).mean())
+        baseline_rmse = float(np.sqrt((baseline_errors**2).mean()))
+        window_label = f"last {n_days} calendar day(s)"
+        plot_pred_vs_actual(
+            predicted,
+            actual,
+            window_df["oat_f"].to_numpy(),
+            (
+                f"{self.house_alias.capitalize()}: in-sample predicted vs actual "
+                f"({window_label})"
+            ),
+            oat_f_colormap_bounds=(
+                float(np.min(self.df["oat_f"].to_numpy())),
+                float(np.max(self.df["oat_f"].to_numpy())),
+            ),
+            savepath=self.results_dir / "pred_vs_actual.png",
+            in_sample=True,
+            baseline_mae=baseline_mae,
+            baseline_rmse=baseline_rmse,
+            baseline_predicted=baseline_predicted,
+        )
+        return params
 
     # ----------------------------------------------------
     # Get rswt parameters for the last N days of data
     # ----------------------------------------------------
 
-    def rswt_fit_on_last_n_days(self, n: int) -> HouseRswtParams:
+    def get_rswt_params(self, n: int | None = None) -> HouseRswtParams:
         """
-        Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar days.
+        Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
+        days, or on the full ``start_time``–``end_time`` window when ``n`` is omitted.
 
         Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
         ``dist_kwh`` band (see ``RSWT_LOAD_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
@@ -907,9 +961,8 @@ class HouseEnergyParamsComputer:
         ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or top-k by heat-call if too few.
         Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None``).
         """
-        days = np.unique(self.df["day"].to_numpy())
-        window_days = (days[-n:] if len(days) >= n else days).tolist()
-        window_df = self.df.loc[self.df["day"].isin(window_days)]
+        window_df, n_days = self._fit_window(n)
+        window_label = f"the last {n_days} day(s)"
 
         heatcall_cols = [f"zone{z}_heatcall_fraction" for z in self.zones]
         rwt_cols = ["swt_average_f", "rwt_average_f", "dist_kwh", *heatcall_cols]
@@ -917,7 +970,7 @@ class HouseEnergyParamsComputer:
         if rwt_df.empty:
             raise ValueError(
                 f"{self.house_alias}: no rows with swt_average_f, rwt_average_f, dist_kwh, "
-                f"and zone heat-call data in the last {n} day(s)"
+                f"and zone heat-call data in {window_label}"
             )
 
         if "dist_water_kg" not in window_df.columns:
@@ -977,7 +1030,7 @@ class HouseEnergyParamsComputer:
         if all(f is None for f in bucket_fits):
             raise ValueError(
                 f"{self.house_alias}: no load band had at least {min_rows} hour(s) "
-                f"for RSWT fit in the last {n} day(s)"
+                f"for RSWT fit in the last {n_days} day(s)"
             )
 
         threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
@@ -1012,7 +1065,7 @@ class HouseEnergyParamsComputer:
         if chc_dist_water.empty:
             raise ValueError(
                 f"{self.house_alias}: no dist_water_kg on CHC training rows "
-                f"in the last {n} day(s)"
+                f"in the last {n_days} day(s)"
             )
         water_kg_hour_chc = round(float(chc_dist_water.mean()), 2)
         water_chc_n_hours = len(chc_dist_water)
@@ -1039,7 +1092,7 @@ class HouseEnergyParamsComputer:
             water_kg_hour_chc=water_kg_hour_chc,
             water_chc_n_hours=water_chc_n_hours,
             house_alias=self.house_alias,
-            n_days=n,
+            n_days=n_days,
             savepath=self.results_dir / "rswt_fit.png",
         )
 
