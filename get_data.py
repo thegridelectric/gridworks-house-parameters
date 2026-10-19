@@ -209,6 +209,17 @@ GROUP BY rc.name, rc.unit, time_bucket
 ORDER BY time_bucket, rc.name
 """)
 
+# First forecast hour is treated as measured OAT/wind for that hour.
+WEATHER_FORECAST_SQL = text("""
+SELECT timestamp, payload
+FROM gridworks.messages
+WHERE message_type_name = :message_type
+  AND from_alias ILIKE :from_alias
+  AND timestamp >= :msg_t_start
+  AND timestamp < :t_end
+ORDER BY timestamp ASC
+""")
+
 
 class HouseParamsDataFetcher:
     def __init__(self, house_alias: str, t_start: datetime, t_end: datetime, local_tz: ZoneInfo) -> None:
@@ -229,7 +240,7 @@ class HouseParamsDataFetcher:
             tb = tb.replace(tzinfo=ZoneInfo("UTC"))
         local = tb.astimezone(self.local_tz)
         return local.replace(tzinfo=None).isoformat(timespec="seconds")
-    
+
     def fetch(self) -> tuple[dict[str, dict[str, float | None]], list[str], list[int]]:
         logger.info(
             f"{self.house_alias} - Exporting from {self.t_start.isoformat()} "
@@ -251,6 +262,13 @@ class HouseParamsDataFetcher:
             "kg_per_us_gallon": KG_PER_US_GALLON,
         }
 
+        weather_params = {
+            "message_type": "weather.forecast",
+            "from_alias": f"%{self.house_alias}%",
+            "msg_t_start": self.t_start - timedelta(hours=48),
+            "t_end": self.t_end,
+        }
+
         # Execute queries
         with self.engine.connect() as conn:
             energy_rows = conn.execute(ENERGY_SQL, params).mappings().all()
@@ -258,6 +276,7 @@ class HouseParamsDataFetcher:
             dist_water_kg_rows = conn.execute(DIST_WATER_KG_SQL, params).mappings().all()
             oil_rows = conn.execute(OIL_PWR_SQL, params).mappings().all()
             zone_rows = conn.execute(ZONE_AND_HEATCALL_SQL, params).mappings().all()
+            weather_rows = conn.execute(WEATHER_FORECAST_SQL, weather_params).mappings().all()
 
         # Initialize by-hour dictionary
         channel_data_by_hour_start: dict[str, dict[str, float | None]] = {}
@@ -329,6 +348,31 @@ class HouseParamsDataFetcher:
             hour_key, field = compound.split("|", 1)
             bucket = channel_data_by_hour_start.setdefault(hour_key, {})
             bucket[field] = round(sum(values) / len(values), 1 if "avg_" in field else 2)
+
+        weather_by_hour: dict[str, dict[str, float]] = {}
+        for row in weather_rows:
+            payload = row["payload"]
+            if not isinstance(payload, dict):
+                continue
+            times = payload.get("Time") or []
+            oat = payload.get("OatF") or []
+            wind = payload.get("WindSpeedMph") or []
+            if not times or not oat or not wind:
+                continue
+            hour_utc = datetime.fromtimestamp(int(times[0]), tz=ZoneInfo("UTC"))
+            hour_key = self.hour_start_key(hour_utc)
+            weather_by_hour[hour_key] = {
+                "oat_f": round(float(oat[0]), 1),
+                "ws_mph": round(float(wind[0]), 1),
+            }
+        logger.info(f"{self.house_alias} - weather.forecast first-hour rows: {len(weather_by_hour)}")
+
+        for hour_key, bucket in channel_data_by_hour_start.items():
+            bucket["solar_w_m2"] = 0.0
+            weather = weather_by_hour.get(hour_key)
+            if weather:
+                bucket["oat_f"] = weather["oat_f"]
+                bucket["ws_mph"] = weather["ws_mph"]
 
         zone_numbers = sorted(zone_ids)
 

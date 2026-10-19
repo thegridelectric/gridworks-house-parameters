@@ -258,21 +258,11 @@ class HouseEnergyParamsComputer:
                         )
                     rows.append(row)
                 df = pd.DataFrame(rows, columns=csv_fieldnames)
-                self._log_info(f"Loaded data from database ({len(df)} rows)")
+                self._log_info(
+                    f"Loaded data from database ({len(df)} rows); "
+                    "weather from weather.forecast first hour (solar_w_m2=0)"
+                )
 
-            weather_csv_path = (
-                self.HOURLY_DATA_DIR / f"{self.house_alias}_house_params_data.csv"
-            )
-            weather_df = pd.read_csv(
-                weather_csv_path,
-                usecols=["hour_start", "oat_f", "ws_mph", "solar_w_m2"],
-            )
-            weather_df["hour_start"] = pd.to_datetime(weather_df["hour_start"])
-            df["hour_start"] = pd.to_datetime(df["hour_start"])
-            df = df.drop(
-                columns=["oat_f", "ws_mph", "solar_w_m2"], errors="ignore"
-            ).merge(weather_df, on="hour_start", how="left")
-            self._log_info(f"Weather from {weather_csv_path}")
             if not loaded_from_cache:
                 df.to_csv(cache_path, index=False)
                 self._log_info(f"Wrote hourly data cache to {cache_path}")
