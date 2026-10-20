@@ -36,11 +36,11 @@ $$
 
 We load hourly data from the local cache (`data/{house}_input_data.csv`), fetch any missing hours from the database, and merge into that cache. We then crop to `[start_time, end_time)`.
 
-Note: Database fetches populate `oat_f` and `ws_mph` from the first hour of each `weather.forecast` message for that house. `solar_w_m2` is filled from `solar_data.csv` where not present in the loaded data (there is no solar field in `weather.forecast` yet).
+Note: For each hour, database fetches use the latest `weather.forecast` message at or before that hour: `oat_f` / `ws_mph` are payload index `[0]`, and `oat_f_forecast` / `ws_mph_forecast` are JSON arrays of payload indices `[0]`–`[47]` (for OOS backtests). `solar_w_m2` is filled from `solar_data.csv` where not present in the loaded data (there is no solar field in `weather.forecast` yet).
 
 After data cleaning, we either fit the model on the last N calendar days ending that day (or all days so far if `GROW_WINDOW_TO_N` is True). This gives the parameters that we will use to make 48-hour predictions.
 
-If we are interested in the model's performance over past data, we can simulate a backtest. Use `evaluate_trailing_forecast_performance(n)` for one lookback *N*, or `sweep_n` to try several values of *N*.
+If we are interested in the model's performance over past data, we can simulate a backtest. Use `evaluate_trailing_forecast_performance(n)` for one lookback *N*, or `sweep_n` to try several values of *N*. With `BACKTEST_USE_FORECASTS = True` (default), recursive OOS scoring predicts load for origin, origin+1, … (48 hours from the top of the origin hour) using `oat_f_forecast` / `ws_mph_forecast` at JSON index `step`.
 
 ### Data cleaning
 

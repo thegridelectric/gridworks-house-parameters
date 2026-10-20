@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import csv
 import os
@@ -16,6 +17,8 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+FORECAST_HORIZON_HOURS = 48
 
 # -----------------
 # Channel names
@@ -209,7 +212,6 @@ GROUP BY rc.name, rc.unit, time_bucket
 ORDER BY time_bucket, rc.name
 """)
 
-# First forecast hour is treated as measured OAT/wind for that hour.
 WEATHER_FORECAST_SQL = text("""
 SELECT timestamp, payload
 FROM gridworks.messages
@@ -243,14 +245,14 @@ class HouseParamsDataFetcher:
         local = tb.astimezone(self.local_tz)
         return local.replace(tzinfo=None).isoformat(timespec="seconds")
 
-    def fetch(self) -> tuple[dict[str, dict[str, float | None]], list[str], list[int]]:
+    def fetch(self) -> tuple[dict[str, dict[str, float | str | None]], list[str], list[int]]:
         logger.info(
             f"[{self.house_alias}] Exporting from {self.t_start.isoformat()} "
             f"to {self.t_end.isoformat()} ({self.local_tz})"
         )
 
         # Initialize by-hour dictionary
-        channel_data_by_hour_start: dict[str, dict[str, float | None]] = {}
+        channel_data_by_hour_start: dict[str, dict[str, float | str | None]] = {}
         cursor = self.t_start
         while cursor < self.t_end:
             hour = cursor.replace(tzinfo=None).isoformat(timespec="seconds")
@@ -258,7 +260,8 @@ class HouseParamsDataFetcher:
             cursor += timedelta(hours=1)
 
         zone_ids: set[int] = set()
-        weather_by_hour: dict[str, dict[str, float]] = {}
+        weather_forecasts: list[tuple[datetime, list[float], list[float]]] = []
+        seen_weather_message_ts: set[datetime] = set()
         batch_start = self.t_start
         batch_days = timedelta(days=self.FETCH_BATCH_DAYS)
 
@@ -367,7 +370,7 @@ class HouseParamsDataFetcher:
                         sum(values) / len(values), 1 if "avg_" in field else 2
                     )
 
-                # weather.forecast: first hour of each message -> oat_f / ws_mph for that hour
+                # weather.forecast: store full message trajectories for per-origin merge
                 for row in weather_rows:
                     payload = row["payload"]
                     if not isinstance(payload, dict):
@@ -377,24 +380,49 @@ class HouseParamsDataFetcher:
                     wind = payload.get("WindSpeedMph") or []
                     if not times or not oat or not wind:
                         continue
-                    hour_utc = datetime.fromtimestamp(int(times[0]), tz=ZoneInfo("UTC"))
-                    hour_key = self.hour_start_key(hour_utc)
-                    weather_by_hour[hour_key] = {
-                        "oat_f": round(float(oat[0]), 1),
-                        "ws_mph": round(float(wind[0]), 1),
-                    }
+                    timestamp = row["timestamp"]
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+                    timestamp = timestamp.astimezone(self.local_tz)
+                    if timestamp in seen_weather_message_ts:
+                        continue
+                    n = min(len(times), len(oat), len(wind))
+                    if n == 0:
+                        continue
+                    oat_vals = [round(float(oat[i]), 1) for i in range(n)]
+                    wind_vals = [round(float(wind[i]), 1) for i in range(n)]
+                    weather_forecasts.append((timestamp, oat_vals, wind_vals))
+                    seen_weather_message_ts.add(timestamp)
 
                 batch_start = batch_end
 
-        logger.info(
-            f"[{self.house_alias}] weather.forecast first-hour rows: {len(weather_by_hour)}"
-        )
-        # No DB solar in weather.forecast; merge OAT/wind into hourly grid (solar filled later)
+        weather_forecasts.sort(key=lambda item: item[0])
+        logger.info(f"[{self.house_alias}] weather.forecast messages: {len(weather_forecasts)}")
+        # Latest message at or before each hour: payload[0] -> oat_f/ws_mph; [0:48] -> forecast JSON
         for hour_key, bucket in channel_data_by_hour_start.items():
-            weather = weather_by_hour.get(hour_key)
-            if weather:
-                bucket["oat_f"] = weather["oat_f"]
-                bucket["ws_mph"] = weather["ws_mph"]
+            origin_start = datetime.fromisoformat(hour_key).replace(tzinfo=self.local_tz)
+            chosen_oat: list[float] | None = None
+            chosen_wind: list[float] | None = None
+            chosen_ts: datetime | None = None
+            for timestamp, oat_vals, wind_vals in weather_forecasts:
+                if timestamp <= origin_start and (chosen_ts is None or timestamp > chosen_ts):
+                    chosen_ts = timestamp
+                    chosen_oat = oat_vals
+                    chosen_wind = wind_vals
+            oat_arr: list[float | None] = []
+            ws_arr: list[float | None] = []
+            if chosen_oat and chosen_wind:
+                bucket["oat_f"] = chosen_oat[0]
+                bucket["ws_mph"] = chosen_wind[0]
+                for i in range(FORECAST_HORIZON_HOURS):
+                    oat_arr.append(chosen_oat[i] if i < len(chosen_oat) else None)
+                    ws_arr.append(chosen_wind[i] if i < len(chosen_wind) else None)
+            else:
+                for _ in range(FORECAST_HORIZON_HOURS):
+                    oat_arr.append(None)
+                    ws_arr.append(None)
+            bucket["oat_f_forecast"] = json.dumps(oat_arr)
+            bucket["ws_mph_forecast"] = json.dumps(ws_arr)
 
         zone_numbers = sorted(zone_ids)
 
@@ -410,6 +438,8 @@ class HouseParamsDataFetcher:
             "rwt_average_f",
             "dist_water_kg",
             "oil_boiler_pwr",
+            "oat_f_forecast",
+            "ws_mph_forecast",
         ]
         for zone in zone_numbers:
             csv_fieldnames.append(f"zone{zone}_heatcall_fraction")
@@ -442,8 +472,8 @@ def main() -> None:
             data = channel_data_by_hour_start[hour]
             row = {
                 "hour_start": hour,
-                "oat_f": "",
-                "ws_mph": "",
+                "oat_f": data.get("oat_f", ""),
+                "ws_mph": data.get("ws_mph", ""),
                 "solar_w_m2": "",
                 "dist_kwh": data.get("dist_kwh", 0.0),
                 "hp_kwh_th": data.get("hp_kwh_th", 0.0),
@@ -451,6 +481,8 @@ def main() -> None:
                 "rwt_average_f": data.get("rwt_average_f", ""),
                 "dist_water_kg": data.get("dist_water_kg", ""),
                 "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
+                "oat_f_forecast": data.get("oat_f_forecast", ""),
+                "ws_mph_forecast": data.get("ws_mph_forecast", ""),
             }
             for zone in zone_numbers:
                 row[f"zone{zone}_heatcall_fraction"] = data.get(f"zone{zone}_heatcall_fraction", 0.0)

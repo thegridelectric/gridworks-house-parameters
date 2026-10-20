@@ -95,6 +95,8 @@ class HouseEnergyParamsComputer:
         "swt_average_f",
         "rwt_average_f",
         "dist_water_kg",
+        "oat_f_forecast",
+        "ws_mph_forecast",
     )
 
     # Data cleaning - known bad data
@@ -134,6 +136,7 @@ class HouseEnergyParamsComputer:
     GROW_WINDOW_TO_N: bool = False
     MIN_FIT_WINDOW_DAYS: int = 10
     FORECAST_HORIZON_HOURS = 48
+    BACKTEST_USE_FORECASTS: bool = True
     ROLLING_AVG_HOURS = 4
     RSWT_LOAD_BUCKET_BOUNDS: tuple[tuple[float, float, str], ...] = (
         (0.0, 2.0, "0-2 kWh"),
@@ -170,6 +173,7 @@ class HouseEnergyParamsComputer:
         "GROW_WINDOW_TO_N",
         "MIN_FIT_WINDOW_DAYS",
         "FORECAST_HORIZON_HOURS",
+        "BACKTEST_USE_FORECASTS",
         "ROLLING_AVG_HOURS",
         "RSWT_LOAD_BUCKET_BOUNDS",
         "RSWT_CHC_HEATCALL_FRACTION_THRESHOLD",
@@ -264,6 +268,28 @@ class HouseEnergyParamsComputer:
     def _log_debug(self, message: str) -> None:
         logger.debug(f"[{self.house_alias}] {message}")
 
+    @staticmethod
+    def _hourly_cache_fieldnames(cache_zones: list[int]) -> list[str]:
+        names = [
+            "hour_start",
+            "oat_f",
+            "ws_mph",
+            "solar_w_m2",
+            "dist_kwh",
+            "hp_kwh_th",
+            "swt_average_f",
+            "rwt_average_f",
+            "dist_water_kg",
+            "oil_boiler_pwr",
+            "oat_f_forecast",
+            "ws_mph_forecast",
+        ]
+        for zone in cache_zones:
+            names.append(f"zone{zone}_heatcall_fraction")
+        for zone in cache_zones:
+            names.extend([f"zone{zone}_avg_set", f"zone{zone}_avg_temp"])
+        return names
+
     # --------------------------------
     # Data preparation 
     # --------------------------------
@@ -315,24 +341,7 @@ class HouseEnergyParamsComputer:
                     for c in local.columns
                     if str(c).startswith("zone") and str(c).endswith("_avg_set")
                 )
-                cache_fieldnames = [
-                    "hour_start",
-                    "oat_f",
-                    "ws_mph",
-                    "solar_w_m2",
-                    "dist_kwh",
-                    "hp_kwh_th",
-                    "swt_average_f",
-                    "rwt_average_f",
-                    "dist_water_kg",
-                    "oil_boiler_pwr",
-                ]
-                for zone in cache_zones:
-                    cache_fieldnames.append(f"zone{zone}_heatcall_fraction")
-                for zone in cache_zones:
-                    cache_fieldnames.extend(
-                        [f"zone{zone}_avg_set", f"zone{zone}_avg_temp"]
-                    )
+                cache_fieldnames = self._hourly_cache_fieldnames(cache_zones)
                 extra = [c for c in local.columns if c not in cache_fieldnames]
                 if extra:
                     self._log_info(f"Dropping non-cache columns: {extra}")
@@ -402,6 +411,8 @@ class HouseEnergyParamsComputer:
                         "rwt_average_f": data.get("rwt_average_f", np.nan),
                         "dist_water_kg": data.get("dist_water_kg", np.nan),
                         "oil_boiler_pwr": data.get("oil_boiler_pwr", 0.0),
+                        "oat_f_forecast": data.get("oat_f_forecast", ""),
+                        "ws_mph_forecast": data.get("ws_mph_forecast", ""),
                     }
                     for zone in zone_numbers:
                         row[f"zone{zone}_heatcall_fraction"] = data.get(
@@ -422,7 +433,7 @@ class HouseEnergyParamsComputer:
                 fetched["hour_start"] = pd.to_datetime(fetched["hour_start"])
                 self._log_info(
                     f"Loaded {len(fetched)} row(s) from database "
-                    "(weather.forecast first hour; solar_w_m2 from solar_data.csv)"
+                    "(weather.forecast; solar_w_m2 from solar_data.csv)"
                 )
                 local = pd.concat([local, fetched], ignore_index=True)
                 local = local.drop_duplicates(subset=["hour_start"], keep="last")
@@ -444,24 +455,7 @@ class HouseEnergyParamsComputer:
                         if str(c).startswith("zone") and str(c).endswith("_avg_set")
                     )
                     cache_zones = sorted(set(existing_zones) | set(fetched_zones))
-                    cache_fieldnames = [
-                        "hour_start",
-                        "oat_f",
-                        "ws_mph",
-                        "solar_w_m2",
-                        "dist_kwh",
-                        "hp_kwh_th",
-                        "swt_average_f",
-                        "rwt_average_f",
-                        "dist_water_kg",
-                        "oil_boiler_pwr",
-                    ]
-                    for zone in cache_zones:
-                        cache_fieldnames.append(f"zone{zone}_heatcall_fraction")
-                    for zone in cache_zones:
-                        cache_fieldnames.extend(
-                            [f"zone{zone}_avg_set", f"zone{zone}_avg_temp"]
-                        )
+                    cache_fieldnames = self._hourly_cache_fieldnames(cache_zones)
                     extra = [c for c in existing.columns if c not in cache_fieldnames]
                     if extra:
                         self._log_info(f"Dropping non-cache columns: {extra}")
@@ -1278,22 +1272,61 @@ class HouseEnergyParamsComputer:
 
     def predict_recursive_horizon(self, params: HouseEnergyParams, origin_index: int, horizon: int) -> np.ndarray:
         """
-        Forecast scaled_dist_kwh for the next ``horizon`` hours after a forecast origin.
+        Forecast scaled_dist_kwh for ``horizon`` hours starting at the forecast origin hour.
 
-        For the main (non-baseline) model,the lagged load feature uses the observed 
-        previous hour for lead 1, then the prior step's prediction for leads 2 onward.
+        For the main (non-baseline) model, step 0 uses observed previous-hour load; later
+        steps use the prior step's prediction as the lagged load feature.
+
+        When ``BACKTEST_USE_FORECASTS`` is True, OAT/wind come from the origin row's
+        ``oat_f_forecast`` / ``ws_mph_forecast`` JSON at index ``step`` (origin+step).
 
         Returns a length-``horizon`` array of scaled_dist_kwh.
         """
-        if params.is_baseline:
-            target = self.df.iloc[origin_index + 1 : origin_index + 1 + (horizon or self.FORECAST_HORIZON_HOURS)]
-            return self.predict(params, target)
-        preds = np.empty(horizon, dtype=float)
-        for step in range(horizon):
-            target_idx = origin_index + 1 + step
+        n_steps = horizon or self.FORECAST_HORIZON_HOURS
+        if not self.BACKTEST_USE_FORECASTS:
+            if params.is_baseline:
+                target = self.df.iloc[origin_index : origin_index + n_steps]
+                return self.predict(params, target)
+            preds = np.empty(n_steps, dtype=float)
+            for step in range(n_steps):
+                target_idx = origin_index + step
+                row = self.df.iloc[[target_idx]].copy()
+                if step > 0:
+                    row["previous_dist_kwh"] = preds[step - 1] / params.energy_ratio
+                preds[step] = self.predict(params, row)[0]
+            return preds
+
+        oat_fc: list | None = None
+        ws_fc: list | None = None
+        raw_oat = self.df.iloc[origin_index].get("oat_f_forecast")
+        raw_ws = self.df.iloc[origin_index].get("ws_mph_forecast")
+        if isinstance(raw_oat, str) and raw_oat.strip() and isinstance(raw_ws, str) and raw_ws.strip():
+            oat_fc = json.loads(raw_oat)
+            ws_fc = json.loads(raw_ws)
+        setpoint_cols = [f"zone{z}_avg_set" for z in self.zones]
+
+        preds = np.empty(n_steps, dtype=float)
+        for step in range(n_steps):
+            target_idx = origin_index + step
             row = self.df.iloc[[target_idx]].copy()
-            if step > 0:
+            if not params.is_baseline and step > 0:
                 row["previous_dist_kwh"] = preds[step - 1] / params.energy_ratio
+            if oat_fc is not None and ws_fc is not None:
+                wi = step
+                if (
+                    wi < len(oat_fc)
+                    and wi < len(ws_fc)
+                    and oat_fc[wi] is not None
+                    and ws_fc[wi] is not None
+                ):
+                    oat = float(oat_fc[wi])
+                    ws = float(ws_fc[wi])
+                    row["oat_f"] = oat
+                    row["ws_mph"] = ws
+                    setpoint_avg = row[setpoint_cols].mean(axis=1)
+                    row["deltaT"] = (setpoint_avg - oat).clip(lower=0)
+                    row["windspeed_times_deltaT"] = row["deltaT"] * ws
+                    row["windspeed_times_65_minus_oat"] = ws * (65.0 - oat)
             preds[step] = self.predict(params, row)[0]
         return preds
 
@@ -1364,7 +1397,7 @@ class HouseEnergyParamsComputer:
             params_baseline = results_baseline[fit_idx]
             pred = self.predict_recursive_horizon(params, origin, horizon)
             pred_baseline = self.predict_recursive_horizon(params_baseline, origin, horizon)
-            target_start = origin + 1
+            target_start = origin
             actual = dist_kwh[target_start : target_start + horizon] * params.energy_ratio
 
             # Collect the errors by lead
