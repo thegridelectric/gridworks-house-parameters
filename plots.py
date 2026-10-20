@@ -135,13 +135,7 @@ def plot_pred_vs_actual(
             )
         ax_scatter.set_title(title_text)
 
-        stats = f"MAE  = {mae:.3f} kWh\n"
-        if compare_to_baseline and baseline_mae is not None:
-            stats += f"MAE αβγ = {baseline_mae:.3f} kWh\n"
-        stats += f"RMSE = {rmse:.3f} kWh\n"
-        if compare_to_baseline and baseline_rmse is not None:
-            stats += f"RMSE αβγ = {baseline_rmse:.3f} kWh"
-        stats = stats.rstrip()
+        stats = f"MAE  = {mae:.3f} kWh\nRMSE = {rmse:.3f} kWh"
         ax_scatter.text(
             0.97,
             0.03,
