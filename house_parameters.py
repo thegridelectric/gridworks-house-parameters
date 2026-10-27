@@ -1,6 +1,8 @@
+import csv
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,25 +48,31 @@ class RswtLoadBucketFit:
 
 
 @dataclass(frozen=True)
+class RswtLoadBucketParams:
+    lo: float
+    hi: float
+    fit: RswtLoadBucketFit
+
+    @property
+    def label(self) -> str:
+        if math.isfinite(self.hi):
+            return f"{self.lo:.1f}-{self.hi:.1f} kWh"
+        return f"{self.lo:.1f}+ kWh"
+
+
+@dataclass(frozen=True)
 class HouseRswtParams:
     rwt_min: float
     water_kg_hour_chc: float
-    load_0_2: RswtLoadBucketFit | None
-    load_2_4: RswtLoadBucketFit | None
-    load_4_6: RswtLoadBucketFit | None
-    load_6_8: RswtLoadBucketFit | None
-    load_8_plus: RswtLoadBucketFit | None
+    load_buckets: tuple[RswtLoadBucketParams, ...]
 
     def __repr__(self) -> str:
         return_string = "HouseRswtParams:\n"
         return_string += f"- rwt_min: {self.rwt_min}\n"
         return_string += f"- water_kg_hour_chc: {self.water_kg_hour_chc}\n"
-        return_string += f"- load_0_2: {self.load_0_2}\n"
-        return_string += f"- load_2_4: {self.load_2_4}\n"
-        return_string += f"- load_4_6: {self.load_4_6}\n"
-        return_string += f"- load_6_8: {self.load_6_8}\n"
-        return_string += f"- load_8_plus: {self.load_8_plus}"
-        return return_string
+        for bucket in self.load_buckets:
+            return_string += f"- {bucket.label}: {bucket.fit}\n"
+        return return_string.rstrip()
 
 
 class HouseEnergyParamsComputer:
@@ -107,10 +115,12 @@ class HouseEnergyParamsComputer:
     }
     BELOW_SETPOINT_MIN_TEMP_SET_GAP_F = 1
     EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F = 3
+    DELTA_T_HINGE_F = 40.0
 
     # Regression features
     FEATURE_NAMES = (
         "deltaT",
+        "deltaT_subfreezing",
         "windspeed_times_deltaT",
         "solar_w_m2",
         "previous_dist_kwh_scaled",
@@ -138,16 +148,11 @@ class HouseEnergyParamsComputer:
     FORECAST_HORIZON_HOURS = 48
     BACKTEST_USE_FORECASTS: bool = True
     ROLLING_AVG_HOURS = 4
-    RSWT_LOAD_BUCKET_BOUNDS: tuple[tuple[float, float, str], ...] = (
-        (0.0, 2.0, "0-2 kWh"),
-        (2.0, 4.0, "2-4 kWh"),
-        (4.0, 6.0, "4-6 kWh"),
-        (6.0, 8.0, "6-8 kWh"),
-        (8.0, math.inf, "8+ kWh"),
-    )
+    RSWT_LOAD_BUCKET_COUNT = 1
     RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
     RSWT_CHC_HEATCALL_FLOOR = 0.7
     RSWT_BUCKET_MIN_FIT_ROWS = 20
+    RSWT_BUCKET_MAX_SPLIT_CANDIDATES = 96
 
     RUN_PARAMETERS_JSON = "run_parameters.json"
     _SERIALIZED_CLASS_ATTRS = (
@@ -162,6 +167,7 @@ class HouseEnergyParamsComputer:
         "BROKEN_THERMOSTAT_MIN_TEMP_SET_GAP_F",
         "BELOW_SETPOINT_MIN_TEMP_SET_GAP_F",
         "EXTERNAL_HEAT_SOURCE_MIN_TEMP_ABOVE_SET_F",
+        "DELTA_T_HINGE_F",
         "FEATURE_NAMES",
         "FEATURE_NAMES_BASELINE",
         "INCLUDE_OCCUPANCY",
@@ -175,10 +181,11 @@ class HouseEnergyParamsComputer:
         "FORECAST_HORIZON_HOURS",
         "BACKTEST_USE_FORECASTS",
         "ROLLING_AVG_HOURS",
-        "RSWT_LOAD_BUCKET_BOUNDS",
+        "RSWT_LOAD_BUCKET_COUNT",
         "RSWT_CHC_HEATCALL_FRACTION_THRESHOLD",
         "RSWT_CHC_HEATCALL_FLOOR",
         "RSWT_BUCKET_MIN_FIT_ROWS",
+        "RSWT_BUCKET_MAX_SPLIT_CANDIDATES",
     )
 
     def __init__(
@@ -567,7 +574,28 @@ class HouseEnergyParamsComputer:
             self.feature_names = self.FEATURE_NAMES + self.OCCUPANCY_FEATURE_NAMES
         else:
             self.feature_names = self.FEATURE_NAMES
+        self._engineer_optional_weather_features(df)
         self.df = df
+
+    def _engineer_optional_weather_features(self, df: pd.DataFrame) -> None:
+        names = set(self.feature_names)
+        if "deltaT_subfreezing" in names:
+            df["deltaT_subfreezing"] = df["deltaT"] * (32.0 - df["oat_f"]).clip(lower=0)
+        if "deltaT_hinge" in names:
+            df["deltaT_hinge"] = (df["deltaT"] - self.DELTA_T_HINGE_F).clip(lower=0)
+
+    def _apply_forecast_weather_to_row(
+        self, row: pd.DataFrame, oat: float, ws: float, setpoint_cols: list[str]
+    ) -> None:
+        setpoint_avg = row[setpoint_cols].mean(axis=1)
+        row["deltaT"] = (setpoint_avg - oat).clip(lower=0)
+        row["windspeed_times_deltaT"] = row["deltaT"] * ws
+        row["windspeed_times_65_minus_oat"] = ws * (65.0 - oat)
+        names = set(self.feature_names)
+        if "deltaT_subfreezing" in names:
+            row["deltaT_subfreezing"] = row["deltaT"] * max(0.0, 32.0 - oat)
+        if "deltaT_hinge" in names:
+            row["deltaT_hinge"] = (row["deltaT"] - self.DELTA_T_HINGE_F).clip(lower=0)
 
     def _remove_erroneous_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -881,6 +909,69 @@ class HouseEnergyParamsComputer:
         X = self.design_matrix(df, baseline=params.is_baseline, energy_ratio=params.energy_ratio)
         return np.maximum(X @ np.asarray(params.values, dtype=float), 0.0)
 
+    def _weather_forecast_export_columns(self, df: pd.DataFrame) -> dict[str, np.ndarray]:
+        """Expand ``oat_f_forecast`` / ``ws_mph_forecast`` JSON to one column per lead hour."""
+        horizon = self.FORECAST_HORIZON_HOURS
+        columns: dict[str, np.ndarray] = {}
+        for json_col, prefix in (
+            ("oat_f_forecast", "oat_f_fc"),
+            ("ws_mph_forecast", "ws_mph_fc"),
+        ):
+            if json_col not in df.columns:
+                continue
+            rows: list[list[float]] = []
+            for raw in df[json_col]:
+                padded = [math.nan] * horizon
+                if isinstance(raw, str) and raw.strip():
+                    arr = json.loads(raw)
+                    for h in range(min(horizon, len(arr))):
+                        val = arr[h]
+                        if val is not None:
+                            padded[h] = float(val)
+                rows.append(padded)
+            mat = np.asarray(rows, dtype=float)
+            for h in range(horizon):
+                columns[f"{prefix}_h{h}"] = mat[:, h]
+        return columns
+
+    def energy_regression_feature_frame(
+        self, params: HouseEnergyParams, df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Hourly rows used for energy OLS: measured ``dist_kwh``, feature values as in
+        ``design_matrix`` (scaled load features use ``params.energy_ratio``), and weather
+        forecast leads.
+        """
+        dist_kwh = df["dist_kwh"].to_numpy(dtype=float)
+        feature_columns: dict[str, np.ndarray] = {}
+        for name in params.feature_names:
+            if name in ("previous_dist_kwh_scaled", "dist_kwh_scaled_avg_4h"):
+                raw_col = (
+                    "previous_dist_kwh"
+                    if name == "previous_dist_kwh_scaled"
+                    else "dist_kwh_avg_4h"
+                )
+                feature_columns[name] = df[raw_col].to_numpy(dtype=float) * params.energy_ratio
+            else:
+                feature_columns[name] = df[name].to_numpy(dtype=float)
+        forecast_columns = self._weather_forecast_export_columns(df)
+        column_order = (
+            ["hour_start", "dist_kwh"]
+            + list(params.feature_names)
+            + sorted(forecast_columns.keys())
+        )
+        out = pd.DataFrame(
+            {
+                "hour_start": df["hour_start"].to_numpy(),
+                "dist_kwh": dist_kwh,
+                **feature_columns,
+                **forecast_columns,
+            }
+        )[column_order]
+        numeric_cols = [c for c in out.columns if c != "hour_start"]
+        out[numeric_cols] = out[numeric_cols].round(3)
+        return out
+
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float) -> np.ndarray:
         """
         Constructs the matrix of features for the linear regression model.
@@ -896,6 +987,41 @@ class HouseEnergyParamsComputer:
             else:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
+
+    @staticmethod
+    def _energy_coef_feature_labels(params: HouseEnergyParams) -> tuple[str, ...]:
+        return ("intercept",) + params.feature_names
+
+    @staticmethod
+    def _write_trailing_params_energy_csv(
+        path: Path,
+        params_table: pd.DataFrame,
+        coef_feature_labels: tuple[str, ...],
+    ) -> None:
+        """Write trailing ``params_energy.csv`` with a feature-name row under ``B0``, ``B1``, …"""
+        out = params_table.reset_index()
+        index_col = out.columns[0]
+        header = list(out.columns)
+        feature_row: list[str] = []
+        for col in header:
+            if col == index_col:
+                feature_row.append("feature")
+                continue
+            b_match = re.fullmatch(r"B(\d+)", col)
+            if b_match is not None:
+                feature_row.append(coef_feature_labels[int(b_match.group(1))])
+                continue
+            std_match = re.fullmatch(r"std_error_B(\d+)", col)
+            if std_match is not None:
+                feature_row.append(coef_feature_labels[int(std_match.group(1))])
+                continue
+            feature_row.append("")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerow(feature_row)
+            writer.writerows(out.itertuples(index=False, name=None))
 
     def _fit_window(self, n: int | None = None) -> tuple[pd.DataFrame, int]:
         """Training rows and calendar-day count (full window length when ``n`` is omitted)."""
@@ -917,7 +1043,8 @@ class HouseEnergyParamsComputer:
         """
         Fits the model on the last ``n`` calendar days of data, or on the full
         ``start_time``–``end_time`` window when ``n`` is omitted.
-        Writes one row to ``params_energy.csv`` and ``pred_vs_actual.png`` in ``energy_params_dir``.
+        Writes one row to ``params_energy.csv``, ``regression_training.csv``, and
+        ``pred_vs_actual.png`` in ``energy_params_dir``.
         """
         window_df, n_days = self._fit_window(n)
         params = self.fit(window_df)
@@ -931,10 +1058,14 @@ class HouseEnergyParamsComputer:
             energy_row[name] = value
             energy_row[f"std_error_{name}"] = std_error
         energy_row["r_squared"] = params.r_squared
+        energy_row["R"] = params.energy_ratio
         energy_row["energy_ratio"] = params.energy_ratio
         self.energy_params_dir.mkdir(parents=True, exist_ok=True)
         pd.DataFrame([energy_row]).to_csv(
             self.energy_params_dir / "params_energy.csv", index=False
+        )
+        self.energy_regression_feature_frame(params, window_df).to_csv(
+            self.energy_params_dir / "regression_training.csv", index=False
         )
 
         predicted = self.predict(params, window_df)
@@ -969,16 +1100,20 @@ class HouseEnergyParamsComputer:
     # Get rswt parameters for the last N days of data
     # ----------------------------------------------------
 
-    def get_rswt_params(self, n: int | None = None) -> HouseRswtParams:
+    def get_rswt_params(
+        self, energy_params: HouseEnergyParams, n: int | None = None
+    ) -> HouseRswtParams:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
         days, or on the full ``start_time``–``end_time`` window when ``n`` is omitted.
 
-        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
-        ``dist_kwh`` band (see ``RSWT_LOAD_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
-        ``dist_water_kg`` on hours with max zone heat-call above
-        ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or top-k by heat-call if too few.
-        Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None``).
+        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each
+        ``house_energy_pred`` band (``RSWT_LOAD_BUCKET_COUNT`` bands, chosen per house to
+        minimize in-sample RWT RMSE subject to ``RSWT_BUCKET_MIN_FIT_ROWS`` per band).
+        ``house_energy_pred`` is in-sample scaled load
+        from ``predict(energy_params, ...)``. ``water_kg_hour_chc`` is mean ``dist_water_kg`` on
+        hours with max zone heat-call above ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or top-k
+        by heat-call if too few.
         """
         window_df, n_days = self._fit_window(n)
         window_label = f"the last {n_days} day(s)"
@@ -999,18 +1134,42 @@ class HouseEnergyParamsComputer:
         rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
         rwt_df = rwt_df.drop(columns=heatcall_cols)
 
+        fit_rows = window_df.loc[rwt_df.index]
+        house_energy_pred = self.predict(energy_params, fit_rows)
+        if np.any(~np.isfinite(house_energy_pred)):
+            raise ValueError(
+                f"{self.house_alias}: non-finite house_energy_pred on RSWT rows in {window_label}"
+            )
+        rwt_df["house_energy_pred"] = house_energy_pred
+        self._log_info("RSWT load buckets use house_energy_pred from energy_params")
+
+        min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
+        load = rwt_df["house_energy_pred"].to_numpy(dtype=float)
+        swt = rwt_df["swt_average_f"].to_numpy(dtype=float)
+        rwt = rwt_df["rwt_average_f"].to_numpy(dtype=float)
+        n_buckets = self.RSWT_LOAD_BUCKET_COUNT
+        bounds, fit_rmse = self._optimal_rswt_load_buckets(
+            swt, rwt, load, min_rows, n_buckets=n_buckets
+        )
+        self._log_info(
+            "RSWT optimal house_energy_pred buckets (min in-sample RMSE): "
+            + ", ".join(label for _, _, label in bounds)
+            + f"; RMSE={fit_rmse:.3f}°F"
+        )
+
         bucket_fits: list[RswtLoadBucketFit | None] = []
         bucket_n_hours: list[int] = []
         bucket_mid_load_kwh: list[float] = []
-        min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
-        bounds = self.RSWT_LOAD_BUCKET_BOUNDS
-        high_lo, high_hi, _high_load_label = bounds[-1]
-        prev_lo = bounds[-2][0]
-        chc_reference_load_kwh = (
-            high_lo + (high_lo - prev_lo) / 2
-            if not math.isfinite(high_hi)
-            else (high_lo + high_hi) / 2
-        )
+        high_lo, high_hi, _ = bounds[-1]
+        if len(bounds) >= 2:
+            prev_lo = bounds[-2][0]
+            chc_reference_load_kwh = (
+                high_lo + (high_lo - prev_lo) / 2
+                if not math.isfinite(high_hi)
+                else (high_lo + high_hi) / 2
+            )
+        else:
+            chc_reference_load_kwh = float(np.nanmean(load))
         for idx, (lo, hi, label) in enumerate(bounds):
             is_last = idx == len(bounds) - 1
             if is_last and not math.isfinite(hi):
@@ -1019,21 +1178,13 @@ class HouseEnergyParamsComputer:
                 mid_load = (lo + hi) / 2
             bucket_mid_load_kwh.append(mid_load)
 
-            load = rwt_df["dist_kwh"]
             if is_last:
                 mask = load >= lo
             else:
                 mask = (load >= lo) & (load < hi)
             bucket_df = rwt_df.loc[mask]
-            n_bucket = len(bucket_df)
+            n_bucket = int(mask.sum())
             bucket_n_hours.append(n_bucket)
-            if n_bucket < min_rows:
-                self._log_info(
-                    f"RSWT {label}: skipped ({n_bucket} hour(s), need {min_rows})"
-                )
-                bucket_fits.append(None)
-                continue
-
             intercept, slope = self._fit_rwt_vs_swt(bucket_df)
             self._log_info(
                 f"RSWT {label}: {n_bucket} hour(s), "
@@ -1044,12 +1195,6 @@ class HouseEnergyParamsComputer:
                     rwt_intercept=round(intercept, 6),
                     rwt_slope=round(slope, 6),
                 )
-            )
-
-        if all(f is None for f in bucket_fits):
-            raise ValueError(
-                f"{self.house_alias}: no load band had at least {min_rows} hour(s) "
-                f"for RSWT fit in the last {n_days} day(s)"
             )
 
         threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
@@ -1097,7 +1242,7 @@ class HouseEnergyParamsComputer:
         plot_rswt_fit(
             rwt_df["swt_average_f"].to_numpy(),
             rwt_df["rwt_average_f"].to_numpy(),
-            rwt_df["dist_kwh"].to_numpy(),
+            rwt_df["house_energy_pred"].to_numpy(),
             bucket_fits=[
                 (label, fit, n_hours, mid_load)
                 for (_, _, label), fit, n_hours, mid_load in zip(
@@ -1115,33 +1260,28 @@ class HouseEnergyParamsComputer:
             savepath=self.rswt_params_dir / "rswt_fit.png",
         )
 
+        load_bucket_params = tuple(
+            RswtLoadBucketParams(lo=lo, hi=hi, fit=fit)
+            for (lo, hi, _label), fit in zip(bounds, bucket_fits, strict=True)
+        )
         params = HouseRswtParams(
             rwt_min=50.0,
             water_kg_hour_chc=water_kg_hour_chc,
-            load_0_2=bucket_fits[0],
-            load_2_4=bucket_fits[1],
-            load_4_6=bucket_fits[2],
-            load_6_8=bucket_fits[3],
-            load_8_plus=bucket_fits[4],
+            load_buckets=load_bucket_params,
         )
         rswt_row: dict[str, float] = {
             "rwt_min": params.rwt_min,
             "water_kg_hour_chc": params.water_kg_hour_chc,
+            "rswt_fit_rmse_f": round(fit_rmse, 4),
+            "rswt_load_bucket_count": n_buckets,
         }
-        for bucket in (
-            "load_0_2",
-            "load_2_4",
-            "load_4_6",
-            "load_6_8",
-            "load_8_plus",
-        ):
-            fit = getattr(params, bucket)
-            if fit is None:
-                rswt_row[f"{bucket}_rwt_intercept"] = np.nan
-                rswt_row[f"{bucket}_rwt_slope"] = np.nan
-            else:
-                rswt_row[f"{bucket}_rwt_intercept"] = fit.rwt_intercept
-                rswt_row[f"{bucket}_rwt_slope"] = fit.rwt_slope
+        for idx, bucket in enumerate(params.load_buckets, start=1):
+            rswt_row[f"house_energy_pred_bucket_{idx}_lo"] = bucket.lo
+            rswt_row[f"house_energy_pred_bucket_{idx}_hi"] = (
+                bucket.hi if math.isfinite(bucket.hi) else np.nan
+            )
+            rswt_row[f"load_bucket_{idx}_rwt_intercept"] = bucket.fit.rwt_intercept
+            rswt_row[f"load_bucket_{idx}_rwt_slope"] = bucket.fit.rwt_slope
         pd.DataFrame([rswt_row]).to_csv(
             self.rswt_params_dir / "params_rswt.csv", index=False
         )
@@ -1153,11 +1293,174 @@ class HouseEnergyParamsComputer:
             raise ValueError(
                 f"{self.house_alias}: need at least 2 rows to fit RSWT vs SWT (got {len(df)})"
             )
-        swt = df["swt_average_f"].to_numpy(dtype=float)
-        rwt = df["rwt_average_f"].to_numpy(dtype=float)
-        X = np.column_stack([np.ones(len(df)), swt])
+        return self._fit_rwt_vs_swt_arrays(
+            df["swt_average_f"].to_numpy(dtype=float),
+            df["rwt_average_f"].to_numpy(dtype=float),
+        )
+
+    @staticmethod
+    def _fit_rwt_vs_swt_arrays(swt: np.ndarray, rwt: np.ndarray) -> tuple[float, float]:
+        X = np.column_stack([np.ones(len(swt)), swt])
         coefficients, *_ = np.linalg.lstsq(X, rwt, rcond=None)
         return float(coefficients[0]), float(coefficients[1])
+
+    @staticmethod
+    def _rswt_load_bucket_label(lo: float, hi: float) -> str:
+        if math.isfinite(hi):
+            return f"{lo:.1f}-{hi:.1f} kWh"
+        return f"{lo:.1f}+ kWh"
+
+    @staticmethod
+    def _split_candidate_indices(i_min: int, i_max: int, max_candidates: int) -> np.ndarray:
+        if i_max < i_min:
+            return np.array([], dtype=int)
+        span = i_max - i_min + 1
+        if span <= max_candidates:
+            return np.arange(i_min, i_max + 1, dtype=int)
+        return np.unique(np.linspace(i_min, i_max, max_candidates, dtype=int))
+
+    @staticmethod
+    def _ols_sse_segment(
+        n: int,
+        sx: float,
+        sy: float,
+        sxx: float,
+        syy: float,
+        sxy: float,
+    ) -> float:
+        if n < 2:
+            return math.inf
+        denom = n * sxx - sx * sx
+        if denom <= 0:
+            return syy - sy * sy / n
+        b = (n * sxy - sx * sy) / denom
+        a = (sy - b * sx) / n
+        sse = syy - 2 * a * sy - 2 * b * sxy + a * a * n + 2 * a * b * sx + b * b * sxx
+        return max(0.0, float(sse))
+
+    def _segment_regression_sums(
+        self, prefix: tuple[np.ndarray, ...], left: int, right: int
+    ) -> tuple[int, float, float, float, float, float]:
+        """Inclusive index bounds on sorted RSWT rows."""
+        psx, psy, psxx, psyy, psxy = prefix
+        n = right - left + 1
+        sx = float(psx[right + 1] - psx[left])
+        sy = float(psy[right + 1] - psy[left])
+        sxx = float(psxx[right + 1] - psxx[left])
+        syy = float(psyy[right + 1] - psyy[left])
+        sxy = float(psxy[right + 1] - psxy[left])
+        return n, sx, sy, sxx, syy, sxy
+
+    def _segment_sse(self, prefix: tuple[np.ndarray, ...], left: int, right: int) -> float:
+        return self._ols_sse_segment(*self._segment_regression_sums(prefix, left, right))
+
+    def _optimal_rswt_load_buckets(
+        self,
+        swt: np.ndarray,
+        rwt: np.ndarray,
+        load: np.ndarray,
+        min_rows: int,
+        *,
+        n_buckets: int,
+    ) -> tuple[tuple[tuple[float, float, str], ...], float]:
+        """
+        ``n_buckets`` bands on ``load`` (low inclusive, high exclusive; top band high inclusive)
+        that minimize pooled in-sample RMSE of per-band RWT~SWT lines.
+        """
+        if n_buckets < 1:
+            raise ValueError(
+                f"{self.house_alias}: RSWT_LOAD_BUCKET_COUNT must be >= 1 (got {n_buckets})"
+            )
+
+        n = len(load)
+        min_total = n_buckets * min_rows
+        if n < min_total:
+            raise ValueError(
+                f"{self.house_alias}: need at least {min_total} RSWT hour(s) to choose "
+                f"{n_buckets} load bucket(s) (got {n}, min_rows={min_rows})"
+            )
+
+        order = np.argsort(load, kind="mergesort")
+        swt_s = swt[order]
+        load_s = load[order]
+
+        prefix = (
+            np.concatenate([[0.0], np.cumsum(swt_s)]),
+            np.concatenate([[0.0], np.cumsum(rwt[order])]),
+            np.concatenate([[0.0], np.cumsum(swt_s * swt_s)]),
+            np.concatenate([[0.0], np.cumsum(rwt[order] * rwt[order])]),
+            np.concatenate([[0.0], np.cumsum(swt_s * rwt[order])]),
+        )
+
+        if n_buckets == 1:
+            best_sse = self._segment_sse(prefix, 0, n - 1)
+            bounds = (
+                (0.0, math.inf, self._rswt_load_bucket_label(0.0, math.inf)),
+            )
+            return bounds, float(np.sqrt(best_sse / n))
+
+        max_c = self.RSWT_BUCKET_MAX_SPLIT_CANDIDATES
+        inf = math.inf
+        dp: list[list[float]] = [[inf] * n for _ in range(n_buckets + 1)]
+        parent: list[list[int]] = [[-1] * n for _ in range(n_buckets + 1)]
+        n_transitions = 0
+
+        for r in range(min_rows - 1, n):
+            dp[1][r] = self._segment_sse(prefix, 0, r)
+
+        for c in range(2, n_buckets + 1):
+            r_min = c * min_rows - 1
+            for r in range(r_min, n):
+                s_min = (c - 1) * min_rows - 1
+                s_max = r - min_rows
+                if s_max < s_min:
+                    continue
+                for s in self._split_candidate_indices(s_min, s_max, max_c):
+                    prev = dp[c - 1][s]
+                    if prev == inf:
+                        continue
+                    n_transitions += 1
+                    seg = self._segment_sse(prefix, s + 1, r)
+                    total = prev + seg
+                    if total < dp[c][r]:
+                        dp[c][r] = total
+                        parent[c][r] = s
+
+        best_sse = dp[n_buckets][n - 1]
+        if not math.isfinite(best_sse):
+            raise ValueError(
+                f"{self.house_alias}: could not find {n_buckets} RSWT load bucket(s) "
+                f"with at least {min_rows} hour(s) each"
+            )
+
+        split_ends: list[int] = []
+        r = n - 1
+        for c in range(n_buckets, 1, -1):
+            s = parent[c][r]
+            if s < 0:
+                raise ValueError(
+                    f"{self.house_alias}: failed to backtrack RSWT load bucket splits"
+                )
+            split_ends.append(s)
+            r = s
+        split_ends.reverse()
+
+        cut_loads = [
+            0.5 * (load_s[split_end] + load_s[split_end + 1]) for split_end in split_ends
+        ]
+        bounds_list: list[tuple[float, float, str]] = []
+        lo = 0.0
+        for cut in cut_loads:
+            bounds_list.append((lo, cut, self._rswt_load_bucket_label(lo, cut)))
+            lo = cut
+        bounds_list.append((lo, math.inf, self._rswt_load_bucket_label(lo, math.inf)))
+
+        best_rmse = float(np.sqrt(best_sse / n))
+        self._log_info(
+            f"RSWT bucket search: {n_buckets} bucket(s), {n} hour(s), "
+            f"{n_transitions} DP transition(s) (max {max_c} split candidates)"
+        )
+        return tuple(bounds_list), best_rmse
 
     # ---------------------------------------------------------
     # Evaluate the accuracy of the recursive horizon forecasts
@@ -1210,12 +1513,17 @@ class HouseEnergyParamsComputer:
                 for i, name in enumerate(coef_names)
             }
             | {
+                "R": [r.energy_ratio for r in results],
                 "r_squared": [r.r_squared for r in results],
                 "energy_ratio": [r.energy_ratio for r in results],
             },
             index=pd.DatetimeIndex(fit_days),
         ).sort_index()
-        params_table.to_csv(self.trailing_performance_dir / "params_energy.csv")
+        self._write_trailing_params_energy_csv(
+            self.trailing_performance_dir / "params_energy.csv",
+            params_table,
+            self._energy_coef_feature_labels(results[0]),
+        )
 
         self._log_info(
             f"{oos_label.capitalize()} out-of-sample over {oos['n_forecast_points']} "
@@ -1323,10 +1631,7 @@ class HouseEnergyParamsComputer:
                     ws = float(ws_fc[wi])
                     row["oat_f"] = oat
                     row["ws_mph"] = ws
-                    setpoint_avg = row[setpoint_cols].mean(axis=1)
-                    row["deltaT"] = (setpoint_avg - oat).clip(lower=0)
-                    row["windspeed_times_deltaT"] = row["deltaT"] * ws
-                    row["windspeed_times_65_minus_oat"] = ws * (65.0 - oat)
+                    self._apply_forecast_weather_to_row(row, oat, ws, setpoint_cols)
             preds[step] = self.predict(params, row)[0]
         return preds
 

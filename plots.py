@@ -326,7 +326,7 @@ def plot_data_distribution(
 def plot_rswt_fit(
     swt: np.ndarray,
     rwt: np.ndarray,
-    dist_kwh: np.ndarray,
+    house_energy_pred: np.ndarray,
     *,
     bucket_fits: list[tuple[str, RswtLoadBucketFit | None, int, float]],
     water_kg_hour_chc: float,
@@ -340,19 +340,17 @@ def plot_rswt_fit(
 
     swt = np.asarray(swt, dtype=float)
     rwt = np.asarray(rwt, dtype=float)
-    load_kwh = np.asarray(dist_kwh, dtype=float)
+    load_kwh = np.asarray(house_energy_pred, dtype=float)
     load_max = float(np.nanmax(load_kwh)) if load_kwh.size else 1.0
     load_norm = Normalize(vmin=0.0, vmax=max(load_max, 1.0))
-    n_buckets = len(bucket_fits)
-    gray = np.linspace(0.78, 0.0, n_buckets) if n_buckets else np.array([])
-    line_colors = [(float(g), float(g), float(g)) for g in gray]
+    load_cmap = plt.cm.coolwarm
 
     fig, (ax_rwt, ax_water) = plt.subplots(1, 2, figsize=(14, 6))
     sc = ax_rwt.scatter(
         swt,
         rwt,
         c=load_kwh,
-        cmap=plt.cm.coolwarm,
+        cmap=load_cmap,
         s=22,
         alpha=0.65,
         norm=load_norm,
@@ -360,15 +358,13 @@ def plot_rswt_fit(
     )
 
     swt_line = np.linspace(float(np.min(swt)), float(np.max(swt)), num=100)
-    for color, (label, fit, n_hours, _load_mid) in zip(
-        line_colors, bucket_fits, strict=True
-    ):
+    for label, fit, n_hours, load_mid in bucket_fits:
         if fit is None:
             continue
         ax_rwt.plot(
             swt_line,
             fit.rwt_intercept + fit.rwt_slope * swt_line,
-            color=color,
+            color=load_cmap(load_norm(load_mid)),
             linewidth=2,
             label=f"{label} (n={n_hours})",
         )
@@ -379,7 +375,7 @@ def plot_rswt_fit(
     ax_rwt.legend(loc="upper left", fontsize=8)
 
     cbar = fig.colorbar(sc, ax=ax_rwt)
-    cbar.set_label("dist_kwh")
+    cbar.set_label("house_energy_pred")
 
     chc_reference_hcf = 0.9
     ax_water.scatter(
