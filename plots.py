@@ -423,3 +423,114 @@ def plot_rswt_fit(
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     # plt.show()
     plt.close(fig)
+
+
+def _rmse_vs_actual(predicted: np.ndarray, actual: np.ndarray) -> float | None:
+    pred = np.asarray(predicted, dtype=float)
+    act = np.asarray(actual, dtype=float)
+    mask = np.isfinite(pred) & np.isfinite(act)
+    if not np.any(mask):
+        return None
+    errors = pred[mask] - act[mask]
+    return float(np.sqrt(np.mean(errors**2)))
+
+
+def plot_test_period_method_comparison(
+    timestamp: pd.Series | np.ndarray,
+    new_method: np.ndarray,
+    old_method: np.ndarray,
+    *,
+    actual: np.ndarray | None = None,
+    baseline_method: np.ndarray | None = None,
+    ylabel: str,
+    title: str,
+    savepath: Path | None = None,
+) -> None:
+    """Hourly new-model vs legacy-method lines over the test window; optional actual."""
+    import matplotlib.pyplot as plt
+
+    ts = pd.to_datetime(timestamp)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    new_label = "New method"
+    old_label = "Old method"
+    if actual is not None:
+        rmse_new = _rmse_vs_actual(new_method, actual)
+        rmse_old = _rmse_vs_actual(old_method, actual)
+        if rmse_new is not None:
+            new_label = f"New method (RMSE={rmse_new:.2f})"
+        if rmse_old is not None:
+            old_label = f"Old method (RMSE={rmse_old:.2f})"
+    if actual is not None:
+        ax.plot(ts, actual, color="tab:red", linewidth=1.2, label="Actual")
+    ax.plot(ts, new_method, color="tab:gray", linewidth=1.2, label=new_label)
+    if baseline_method is not None:
+        ax.plot(
+            ts,
+            baseline_method,
+            color="tab:gray",
+            linewidth=1.2,
+            linestyle=":",
+            label="Baseline",
+        )
+    ax.plot(
+        ts,
+        old_method,
+        color="tab:gray",
+        linewidth=1.2,
+        linestyle="--",
+        label=old_label,
+    )
+    ax.set_xlabel("Time")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(loc="upper left")
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    if savepath is not None:
+        savepath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_training_hourly_avg_setpoint(
+    timestamp: pd.Series | np.ndarray,
+    avg_setpoint_f: pd.Series | np.ndarray,
+    *,
+    title: str,
+    savepath: Path | None = None,
+) -> None:
+    """Average zone setpoint (°F) over the energy training window: time series and histogram."""
+    import matplotlib.pyplot as plt
+
+    ts = pd.to_datetime(timestamp)
+    setpoints = np.asarray(avg_setpoint_f, dtype=float)
+    fig, (ax_ts, ax_hist) = plt.subplots(1, 2, figsize=(14, 4))
+    fig.suptitle(title)
+
+    ax_ts.plot(ts, setpoints, color="tab:orange", linewidth=1.2, label="Avg setpoint")
+    ax_ts.set_xlabel("Time")
+    ax_ts.set_ylabel("Avg setpoint (°F)")
+    ax_ts.legend(loc="upper left")
+    fig.autofmt_xdate()
+
+    valid = setpoints[np.isfinite(setpoints)]
+    if valid.size:
+        lo = np.floor(valid.min() / 2.0) * 2.0
+        hi = np.ceil(valid.max() / 2.0) * 2.0
+        bins = np.arange(lo, hi + 2.0, 2.0)
+    else:
+        bins = 30
+    ax_hist.hist(valid, bins=bins, color="tab:orange", edgecolor="white", alpha=0.85)
+    ax_hist.set_xlabel("Avg setpoint (°F)")
+    ax_hist.set_ylabel("Hours")
+    ax_hist.set_title("Distribution")
+
+    fig.tight_layout()
+    if savepath is not None:
+        savepath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()

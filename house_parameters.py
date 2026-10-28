@@ -148,6 +148,14 @@ class HouseEnergyParamsComputer:
     RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
     RSWT_CHC_HEATCALL_FLOOR = 0.7
     RSWT_BUCKET_MIN_FIT_ROWS = 20
+    WATER_CP_KWH_PER_KG_K = 0.001163
+    RSWT_BUCKET_ATTR_NAMES = (
+        "load_0_2",
+        "load_2_4",
+        "load_4_6",
+        "load_6_8",
+        "load_8_plus",
+    )
 
     RUN_PARAMETERS_JSON = "run_parameters.json"
     _SERIALIZED_CLASS_ATTRS = (
@@ -303,6 +311,48 @@ class HouseEnergyParamsComputer:
         self._load_data()
         self._clean_data()
         self._engineer_features()
+
+    @classmethod
+    def load_hourly_uncleaned(
+        cls,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+    ) -> tuple[pd.DataFrame, list[int]]:
+        """Load hourly cache/DB data for ``[start_time, end_time)`` with solar fill; no cleaning."""
+        loader = cls.__new__(cls)
+        loader.house_alias = house_alias
+        loader.start_time = start_time
+        loader.end_time = end_time
+        loader.timezone = timezone
+        loader._load_data()
+        return loader.df.copy(), list(loader.zones)
+
+    @classmethod
+    def engineer_features_uncleaned(cls, df: pd.DataFrame, zones: list[int]) -> pd.DataFrame:
+        """
+        Build regression feature columns on raw hourly data (no training filters or row drops).
+        Rolling averages use simple rolling means; early rows may have NaNs in lag/rolling features.
+        """
+        df = df.sort_values("hour_start").reset_index(drop=True).copy()
+        zone_temp_avg = df[[f"zone{z}_avg_temp" for z in zones]].mean(axis=1)
+        df["deltaT"] = (zone_temp_avg - df["oat_f"]).clip(lower=0)
+        df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
+        df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
+        n = cls.ROLLING_AVG_HOURS
+        df["OAT_avg_4h"] = df["oat_f"].rolling(n).mean().shift(1)
+        df["dist_kwh_avg_4h"] = df["dist_kwh"].rolling(n).mean().shift(1)
+        df["windspeed_times_65_minus_oat"] = df["ws_mph"] * (65.0 - df["oat_f"])
+        if cls.INCLUDE_OCCUPANCY:
+            hour = df["hour_start"].dt.hour
+            is_weekday = df["hour_start"].dt.dayofweek < 5
+            is_weekend = ~is_weekday
+            for occupancy_hour in cls.OCCUPANCY_INDIVIDUAL_HOURS:
+                at_hour = hour == occupancy_hour
+                df[f"wd_hour_{occupancy_hour}"] = (is_weekday & at_hour).astype(float)
+                df[f"we_hour_{occupancy_hour}"] = (is_weekend & at_hour).astype(float)
+        return df
 
     def _load_data(self) -> None:
         """
@@ -548,8 +598,8 @@ class HouseEnergyParamsComputer:
         (OAT_avg_4h and dist_kwh_avg_4h are built during missing-data handling in _clean_data.)
         """
         df = self.df.copy()
-        setpoint_avg = df[[f"zone{z}_avg_set" for z in self.zones]].mean(axis=1)
-        df["deltaT"] = (setpoint_avg - df["oat_f"]).clip(lower=0)
+        zone_temp_avg = df[[f"zone{z}_avg_temp" for z in self.zones]].mean(axis=1)
+        df["deltaT"] = (zone_temp_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         if df.empty:
@@ -878,7 +928,15 @@ class HouseEnergyParamsComputer:
 
     def predict(self, params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
         """Predicts the scaled distribution kWh using a given set of parameters and data."""
-        X = self.design_matrix(df, baseline=params.is_baseline, energy_ratio=params.energy_ratio)
+        return self.predict_with_params(params, df)
+
+    @staticmethod
+    def predict_with_params(params: HouseEnergyParams, df: pd.DataFrame) -> np.ndarray:
+        X = HouseEnergyParamsComputer.design_matrix_for(
+            df,
+            params.feature_names,
+            energy_ratio=params.energy_ratio,
+        )
         return np.maximum(X @ np.asarray(params.values, dtype=float), 0.0)
 
     def design_matrix(self, df: pd.DataFrame, *, baseline: bool = False, energy_ratio: float) -> np.ndarray:
@@ -888,6 +946,15 @@ class HouseEnergyParamsComputer:
         - Scales the previous distribution kWh (by the energy ratio) since the model predicts scaled distribution kWh.
         """
         feature_names = self.FEATURE_NAMES_BASELINE if baseline else self.feature_names
+        return self.design_matrix_for(df, feature_names, energy_ratio=energy_ratio)
+
+    @staticmethod
+    def design_matrix_for(
+        df: pd.DataFrame,
+        feature_names: tuple[str, ...],
+        *,
+        energy_ratio: float,
+    ) -> np.ndarray:
         columns = [np.ones(len(df))]
         for name in feature_names:
             if name in ("previous_dist_kwh_scaled", "dist_kwh_scaled_avg_4h"):
@@ -896,6 +963,71 @@ class HouseEnergyParamsComputer:
             else:
                 columns.append(df[name].to_numpy(dtype=float))
         return np.column_stack(columns)
+
+    @classmethod
+    def rswt_bucket_mid_loads(cls) -> list[float]:
+        """Representative load (kWh) at the center of each ``RSWT_LOAD_BUCKET_BOUNDS`` band."""
+        bounds = cls.RSWT_LOAD_BUCKET_BOUNDS
+        high_lo, high_hi, _ = bounds[-1]
+        prev_lo = bounds[-2][0]
+        open_ended_mid = (
+            high_lo + (high_lo - prev_lo) / 2
+            if not math.isfinite(high_hi)
+            else (high_lo + high_hi) / 2
+        )
+        mids: list[float] = []
+        for idx, (lo, hi, _) in enumerate(bounds):
+            is_last = idx == len(bounds) - 1
+            if is_last and not math.isfinite(hi):
+                mids.append(open_ended_mid)
+            else:
+                mids.append((lo + hi) / 2)
+        return mids
+
+    @classmethod
+    def select_rswt_bucket_fit(
+        cls, pred_load_kwh: float, rswt_params: HouseRswtParams
+    ) -> RswtLoadBucketFit:
+        """Pick intercept/slope from the bucket whose midpoint is closest to ``pred_load_kwh``."""
+        mids = cls.rswt_bucket_mid_loads()
+        fits = [getattr(rswt_params, name) for name in cls.RSWT_BUCKET_ATTR_NAMES]
+        order = np.argsort(np.abs(np.asarray(mids, dtype=float) - pred_load_kwh))
+        for idx in order:
+            fit = fits[int(idx)]
+            if fit is not None:
+                return fit
+        raise ValueError("No RSWT bucket with a fitted intercept/slope is available")
+
+    @classmethod
+    def predict_rswt_from_pred_load(
+        cls,
+        pred_load_kwh: np.ndarray | float,
+        rswt_params: HouseRswtParams,
+    ) -> np.ndarray | float:
+        """
+        Return-side water temperature (°F) from predicted scaled load (kWh/h) at CHC water flow.
+
+        Uses the closest load bucket's ``rwt ~ intercept + slope * swt`` line and
+        ``swt - rwt = pred_load / (water_kg_hour_chc * c_p) * 9/5``.
+        """
+        scalar_in = isinstance(pred_load_kwh, (int, float))
+        loads = np.atleast_1d(np.asarray(pred_load_kwh, dtype=float))
+        out = np.full(loads.shape, np.nan, dtype=float)
+        water = rswt_params.water_kg_hour_chc
+        cp = cls.WATER_CP_KWH_PER_KG_K
+        for i, load in enumerate(loads):
+            if not np.isfinite(load) or water <= 0:
+                continue
+            fit = cls.select_rswt_bucket_fit(float(load), rswt_params)
+            slope = fit.rwt_slope
+            denom = 1.0 - slope
+            if abs(denom) < 1e-12:
+                continue
+            delta_t_f = float(load) / (water * cp) * (9.0 / 5.0)
+            out[i] = (fit.rwt_intercept + slope * delta_t_f) / denom
+        if scalar_in:
+            return float(out[0])
+        return out
 
     def _fit_window(self, n: int | None = None) -> tuple[pd.DataFrame, int]:
         """Training rows and calendar-day count (full window length when ``n`` is omitted)."""
@@ -969,16 +1101,23 @@ class HouseEnergyParamsComputer:
     # Get rswt parameters for the last N days of data
     # ----------------------------------------------------
 
-    def get_rswt_params(self, n: int | None = None) -> HouseRswtParams:
+    def get_rswt_params(
+        self,
+        n: int | None = None,
+        *,
+        energy_params: HouseEnergyParams | None = None,
+    ) -> HouseRswtParams:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
         days, or on the full ``start_time``–``end_time`` window when ``n`` is omitted.
 
         Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
-        ``dist_kwh`` band (see ``RSWT_LOAD_BUCKET_BOUNDS``). ``water_kg_hour_chc`` is mean
-        ``dist_water_kg`` on hours with max zone heat-call above
-        ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or top-k by heat-call if too few.
-        Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS`` hours are omitted (``None``).
+        estimated-energy band (see ``RSWT_LOAD_BUCKET_BOUNDS``). Bucketing load is
+        ``energy_params`` in-sample/scoring prediction when provided, otherwise scaled
+        ``dist_kwh`` from the fit window. ``water_kg_hour_chc`` is mean ``dist_water_kg`` on
+        hours with max zone heat-call above ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or
+        top-k by heat-call if too few. Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS``
+        hours are omitted (``None``).
         """
         window_df, n_days = self._fit_window(n)
         window_label = f"the last {n_days} day(s)"
@@ -999,27 +1138,28 @@ class HouseEnergyParamsComputer:
         rwt_df["max_zone_heatcall_fraction"] = rwt_df[heatcall_cols].max(axis=1)
         rwt_df = rwt_df.drop(columns=heatcall_cols)
 
+        fit_rows = window_df.loc[rwt_df.index]
+        if energy_params is not None:
+            est_load_kwh = self.predict(energy_params, fit_rows)
+            load_label = "estimated energy use (energy_params)"
+        else:
+            energy_ratio = float(
+                np.sum(window_df["hp_kwh_th"].to_numpy())
+                / np.sum(window_df["dist_kwh"].to_numpy())
+            )
+            est_load_kwh = fit_rows["dist_kwh"].to_numpy(dtype=float) * energy_ratio
+            load_label = "scaled dist_kwh (window energy_ratio)"
+        self._log_info(f"RSWT bucket load: {load_label}")
+        rwt_df["est_load_kwh"] = est_load_kwh
+
         bucket_fits: list[RswtLoadBucketFit | None] = []
         bucket_n_hours: list[int] = []
-        bucket_mid_load_kwh: list[float] = []
+        bucket_mid_load_kwh = self.rswt_bucket_mid_loads()
         min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
         bounds = self.RSWT_LOAD_BUCKET_BOUNDS
-        high_lo, high_hi, _high_load_label = bounds[-1]
-        prev_lo = bounds[-2][0]
-        chc_reference_load_kwh = (
-            high_lo + (high_lo - prev_lo) / 2
-            if not math.isfinite(high_hi)
-            else (high_lo + high_hi) / 2
-        )
         for idx, (lo, hi, label) in enumerate(bounds):
             is_last = idx == len(bounds) - 1
-            if is_last and not math.isfinite(hi):
-                mid_load = chc_reference_load_kwh
-            else:
-                mid_load = (lo + hi) / 2
-            bucket_mid_load_kwh.append(mid_load)
-
-            load = rwt_df["dist_kwh"]
+            load = rwt_df["est_load_kwh"]
             if is_last:
                 mask = load >= lo
             else:
@@ -1097,7 +1237,7 @@ class HouseEnergyParamsComputer:
         plot_rswt_fit(
             rwt_df["swt_average_f"].to_numpy(),
             rwt_df["rwt_average_f"].to_numpy(),
-            rwt_df["dist_kwh"].to_numpy(),
+            rwt_df["est_load_kwh"].to_numpy(),
             bucket_fits=[
                 (label, fit, n_hours, mid_load)
                 for (_, _, label), fit, n_hours, mid_load in zip(
@@ -1303,7 +1443,7 @@ class HouseEnergyParamsComputer:
         if isinstance(raw_oat, str) and raw_oat.strip() and isinstance(raw_ws, str) and raw_ws.strip():
             oat_fc = json.loads(raw_oat)
             ws_fc = json.loads(raw_ws)
-        setpoint_cols = [f"zone{z}_avg_set" for z in self.zones]
+        zone_temp_cols = [f"zone{z}_avg_temp" for z in self.zones]
 
         preds = np.empty(n_steps, dtype=float)
         for step in range(n_steps):
@@ -1323,8 +1463,8 @@ class HouseEnergyParamsComputer:
                     ws = float(ws_fc[wi])
                     row["oat_f"] = oat
                     row["ws_mph"] = ws
-                    setpoint_avg = row[setpoint_cols].mean(axis=1)
-                    row["deltaT"] = (setpoint_avg - oat).clip(lower=0)
+                    zone_temp_avg = row[zone_temp_cols].mean(axis=1)
+                    row["deltaT"] = (zone_temp_avg - oat).clip(lower=0)
                     row["windspeed_times_deltaT"] = row["deltaT"] * ws
                     row["windspeed_times_65_minus_oat"] = ws * (65.0 - oat)
             preds[step] = self.predict(params, row)[0]
