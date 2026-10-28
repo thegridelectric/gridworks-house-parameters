@@ -598,8 +598,8 @@ class HouseEnergyParamsComputer:
         (OAT_avg_4h and dist_kwh_avg_4h are built during missing-data handling in _clean_data.)
         """
         df = self.df.copy()
-        zone_temp_avg = df[[f"zone{z}_avg_temp" for z in self.zones]].mean(axis=1)
-        df["deltaT"] = (zone_temp_avg - df["oat_f"]).clip(lower=0)
+        temp_avg = df[[f"zone{z}_avg_temp" for z in self.zones]].mean(axis=1)
+        df["deltaT"] = (temp_avg - df["oat_f"]).clip(lower=0)
         df["windspeed_times_deltaT"] = df["deltaT"] * df["ws_mph"]
         df["previous_dist_kwh"] = df["dist_kwh"].shift(1)
         if df.empty:
@@ -1366,18 +1366,6 @@ class HouseEnergyParamsComputer:
         )
         self._log_info("RMSE by lead (kWh): " + ", ".join(f"{h}h={rmse_by_lead[h - 1]:.2f}" for h in (1, 6, 12, 24, 48)))
 
-        # Save the RMSE by lead (number of hours ahead of the forecast origin) to a CSV
-        rmse_by_lead_df = pd.DataFrame(
-            {
-                "lead_hour": range(1, self.FORECAST_HORIZON_HOURS + 1),
-                "rmse_kwh": rmse_by_lead,
-                "rmse_baseline_kwh": rmse_baseline_by_lead,
-            }
-        )
-        rmse_by_lead_df.to_csv(
-            self.trailing_performance_dir / "rmse_by_lead.csv", index=False
-        )
-
         # Plots
         plot_pred_vs_actual(
             oos_pred, oos_actual, oos_oat_f,
@@ -1443,7 +1431,7 @@ class HouseEnergyParamsComputer:
         if isinstance(raw_oat, str) and raw_oat.strip() and isinstance(raw_ws, str) and raw_ws.strip():
             oat_fc = json.loads(raw_oat)
             ws_fc = json.loads(raw_ws)
-        zone_temp_cols = [f"zone{z}_avg_temp" for z in self.zones]
+        temp_cols = [f"zone{z}_avg_temp" for z in self.zones]
 
         preds = np.empty(n_steps, dtype=float)
         for step in range(n_steps):
@@ -1463,8 +1451,8 @@ class HouseEnergyParamsComputer:
                     ws = float(ws_fc[wi])
                     row["oat_f"] = oat
                     row["ws_mph"] = ws
-                    zone_temp_avg = row[zone_temp_cols].mean(axis=1)
-                    row["deltaT"] = (zone_temp_avg - oat).clip(lower=0)
+                    temp_avg = row[temp_cols].mean(axis=1)
+                    row["deltaT"] = (temp_avg - oat).clip(lower=0)
                     row["windspeed_times_deltaT"] = row["deltaT"] * ws
                     row["windspeed_times_65_minus_oat"] = ws * (65.0 - oat)
             preds[step] = self.predict(params, row)[0]
