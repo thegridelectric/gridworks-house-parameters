@@ -98,6 +98,21 @@ def plot_pred_vs_actual(
     if n_rows == 1:
         axes = axes[np.newaxis, :]
 
+    error_hist_bins = 60
+    error_hist_range = (-6, 6)
+
+    def error_hist_ymax(*error_arrays: np.ndarray) -> float:
+        ymax = 0.0
+        for err in error_arrays:
+            counts, _ = np.histogram(err, bins=error_hist_bins, range=error_hist_range)
+            ymax = max(ymax, float(counts.max()))
+        return ymax * 1.05 if ymax > 0 else 1.0
+
+    shared_hist_ylim = error_hist_ymax(
+        predicted - actual,
+        *( [baseline_predicted - actual] if baseline_predicted is not None else [] ),
+    )
+
     def draw_row(
         ax_scatter: Axes,
         ax_hist: Axes,
@@ -148,9 +163,12 @@ def plot_pred_vs_actual(
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
         )
 
-        ax_hist.hist(errors, bins=60, range=(-6, 6), color="tab:blue", alpha=0.8)
+        ax_hist.hist(
+            errors, bins=error_hist_bins, range=error_hist_range, color="tab:blue", alpha=0.8
+        )
         ax_hist.axvline(0, color="k", linestyle="--", linewidth=1)
-        ax_hist.set_xlim(-6, 6)
+        ax_hist.set_xlim(error_hist_range)
+        ax_hist.set_ylim(0, shared_hist_ylim)
         ax_hist.set_xlabel("Prediction error (scaled kWh)")
         ax_hist.set_ylabel("Hours")
         ax_hist.set_title("Error distribution")
