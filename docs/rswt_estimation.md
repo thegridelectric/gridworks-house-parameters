@@ -49,3 +49,10 @@ T_{supply}(Q) = T_{room} + (T_{supply,DD} - T_{room} - \frac{Q_{DD}}{2\dot{m}c_p
 $$
 
 If, in the equation above, we use the mass flow rate ($\dot{m}$) that the distribution system provides in constant heat call, we are effectively providing an equation for the required supply water temperature as a function of the required heating rate.
+
+# In practice
+
+From the equation above:
+- $\dot{m}_{chc}$ can be estimated using hours in which the house was in constant heat call
+- We can find the design day $Q_{DD}$ and $T_{supply,DD}$ from the method used in our paper
+- We can find $n$ using the design day conditions in the equation above
