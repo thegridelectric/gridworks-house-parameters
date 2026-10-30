@@ -485,3 +485,52 @@ def plot_rswt_swt_rwt_by_heatcall(
         savepath.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_rswt_dist_kwh_by_heatcall(
+    max_zone_heatcall_fraction: np.ndarray,
+    dist_kwh: np.ndarray,
+    swt: np.ndarray,
+    *,
+    house_alias: str,
+    n_days: int,
+    savepath: Path | None = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    hcf = np.asarray(max_zone_heatcall_fraction, dtype=float)
+    load_kwh = np.asarray(dist_kwh, dtype=float)
+    swt = np.asarray(swt, dtype=float)
+    swt_min = float(np.nanmin(swt)) if swt.size else 0.0
+    swt_max = float(np.nanmax(swt)) if swt.size else 1.0
+    if swt_max <= swt_min:
+        swt_max = swt_min + 1.0
+    swt_norm = Normalize(vmin=swt_min, vmax=swt_max)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(
+        hcf,
+        load_kwh,
+        c=swt,
+        cmap=plt.cm.coolwarm,
+        norm=swt_norm,
+        s=28,
+        alpha=0.7,
+    )
+    ax.set_xlabel("Max zone heat-call fraction")
+    ax.set_ylabel("Distribution load dist_kwh (kWh)")
+    ax.set_title("Hourly dist_kwh vs heat-call")
+    ax.set_xlim(-0.02, 1.02)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Average SWT (°F)")
+
+    fig.suptitle(
+        f"{house_alias.capitalize()}: RSWT data (last {n_days} day(s))",
+        y=1.02,
+    )
+    fig.tight_layout()
+    if savepath is not None:
+        savepath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.close(fig)

@@ -18,6 +18,7 @@ from plots import (
     plot_pred_vs_actual,
     plot_rswt_fit,
     plot_rswt_swt_rwt_by_heatcall,
+    plot_rswt_dist_kwh_by_heatcall,
 )
 
 logger = logging.getLogger(__name__)
@@ -1122,6 +1123,14 @@ class HouseEnergyParamsComputer:
             house_alias=self.house_alias,
             n_days=n_days,
             savepath=self.rswt_params_dir / "rswt_swt_rwt_heatcall.png",
+        )
+        plot_rswt_dist_kwh_by_heatcall(
+            rwt_df["max_zone_heatcall_fraction"].to_numpy(),
+            rwt_df["dist_kwh"].to_numpy(),
+            rwt_df["swt_average_f"].to_numpy(),
+            house_alias=self.house_alias,
+            n_days=n_days,
+            savepath=self.rswt_params_dir / "rswt_dist_kwh_heatcall.png",
         )
 
         params = HouseRswtParams(
