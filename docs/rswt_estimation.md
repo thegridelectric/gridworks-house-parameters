@@ -45,11 +45,10 @@ $$
 Adding design day conditions $Q_{DD}$ and $\Delta T_{supply, DD}$, and assuming a constant room temperature, we can bring it all together to get $T_{supply}$ as a function of $Q$:
 
 $$
-T_{supply}(Q) = T_{room} + (T_{supply,DD} - T_{room} - \frac{Q_{DD}}{2\dot{m}c_p})\cdot (\frac{Q}{Q_{DD}})^{1/n} +\frac{Q}{2\dot{m}c_p}
+T_{supply}(Q) = T_{room} + \big(T_{supply,DD} - T_{room} - \frac{Q_{DD}}{2\dot{m}c_p}\big)\cdot \big(\frac{Q}{Q_{DD}}\big)^{1/n} +\frac{Q}{2\dot{m}c_p}
 $$
 
-If, in the equation above, we use the mass flow rate ($\dot{m}$) that the distribution system provides in constant heat call, we are effectively providing an equation for the required supply water temperature as a function of the required heating rate.
-
+If, in the equation above, we use the mass flow rate that the distribution system provides in constant heat call ($\dot{m} = \dot{m}_{chc}$), we are effectively providing an equation for the required supply water temperature as a function of the required heating rate.
 # In practice
 
 From the equation above:
