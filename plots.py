@@ -441,3 +441,47 @@ def plot_rswt_fit(
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
     # plt.show()
     plt.close(fig)
+
+
+def plot_rswt_swt_rwt_by_heatcall(
+    swt: np.ndarray,
+    rwt: np.ndarray,
+    max_zone_heatcall_fraction: np.ndarray,
+    *,
+    house_alias: str,
+    n_days: int,
+    savepath: Path | None = None,
+) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    swt = np.asarray(swt, dtype=float)
+    rwt = np.asarray(rwt, dtype=float)
+    hcf = np.asarray(max_zone_heatcall_fraction, dtype=float)
+    hcf_norm = Normalize(vmin=0.0, vmax=1.0)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sc = ax.scatter(
+        swt,
+        rwt,
+        c=hcf,
+        cmap=plt.cm.coolwarm,
+        norm=hcf_norm,
+        s=28,
+        alpha=0.7,
+    )
+    ax.set_xlabel("Average supply water temperature SWT (°F)")
+    ax.set_ylabel("Average return water temperature RWT (°F)")
+    ax.set_title("Hourly RWT vs SWT")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("Max zone heat-call fraction")
+
+    fig.suptitle(
+        f"{house_alias.capitalize()}: RSWT data (last {n_days} day(s))",
+        y=1.02,
+    )
+    fig.tight_layout()
+    if savepath is not None:
+        savepath.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(savepath, dpi=150, bbox_inches="tight")
+    plt.close(fig)
