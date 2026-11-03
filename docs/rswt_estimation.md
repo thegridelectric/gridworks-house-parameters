@@ -42,7 +42,7 @@ $$
 T_{supply}= \bar{T}_{water}+ \frac{\Delta T_{water}}{2}
 $$
 
-Adding design day conditions $Q_{DD}$ and $\Delta T_{supply, DD}$, and assuming a constant room temperature, we can bring it all together to get $T_{supply}$ as a function of $Q$:
+Adding design day conditions $Q_{DD}$ and $T_{supply, DD}$, and assuming a constant room temperature, we can bring it all together to get $T_{supply}$ as a function of $Q$:
 
 $$
 T_{supply}(Q) = T_{room} + \big(T_{supply,DD} - T_{room} - \frac{Q_{DD}}{2\dot{m}c_p}\big)\cdot \big(\frac{Q}{Q_{DD}}\big)^{1/n} +\frac{Q}{2\dot{m}c_p}
