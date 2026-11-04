@@ -20,14 +20,14 @@ with $\Delta T = \max(0,\ \overline{T}_{\text{zone}} - T_{\text{out}})$, $I$ for
 
 
 - `alpha` ($\alpha$) — intercept
-- `beta` ($\beta$) through `eta` ($\eta$) — one coefficient per feature (same order as the table)
+- `beta` ($\beta$) through `eta` ($\eta$) — one coefficient per feature
 - `rho` ($\rho$) — converts $Q_{\text{dist}}$ to $\hat{Q}$ for load-history terms
 
 Units: $T_{\text{out}}$ and zone temperatures °F, wind mph, solar W/m², heat load kWh/h.
 
 # Building a 48-hour forecast
 
-Forecast hours $t = 1, \ldots, 48$. Measured distribution load $Q_{\text{dist}}^{\mathrm{meas}}(s)$ for $s \le 0$ (at least $s = 0, -1, -2, -3$), weather forecasts $T_{\text{out}}(t)$, $w(t)$, $I(t)$, $\overline{T_{\text{zone}}}(t)$.
+Forecast hours $t = 1, \ldots, 48$. Measured distribution load $Q_{\text{dist}}^{\mathrm{meas}}(s)$ for $s \le 0$ (at least $s = 0, -1, -2, -3$), weather forecasts $T_{\text{out}}(t)$, $w(t)$, $I(t)$, $\overline{T}_{\text{zone}}(t)$.
 
 $$
 Q^{\mathrm{meas}}(s) = \rho \cdot Q_{\text{dist}}^{\mathrm{meas}}(s),
