@@ -12,6 +12,11 @@ import numpy as np
 import pandas as pd
 
 from get_data import HouseParamsDataFetcher
+from rswt_physics import (
+    SupplyPhysicsFitResult,
+    design_supply_temp_c,
+    fit_k_rad_and_n,
+)
 from plots import (
     plot_oos_residual_by_hour_of_day,
     plot_oos_rmse_by_lead,
@@ -20,6 +25,17 @@ from plots import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Main energy model (docs/house_load_forecast.md): intercept + one coef per feature.
+_ENERGY_MODEL_GREEK_COEFFS: tuple[tuple[str, str | None], ...] = (
+    ("alpha", None),
+    ("beta", "deltaT"),
+    ("gamma", "windspeed_times_deltaT"),
+    ("delta", "solar_w_m2"),
+    ("epsilon", "OAT_avg_4h"),
+    ("zeta", "previous_dist_kwh_scaled"),
+    ("eta", "dist_kwh_scaled_avg_4h"),
+)
 
 
 @dataclass
@@ -38,11 +54,91 @@ class HouseEnergyParams:
         return_string += f"- R²: {self.r_squared}"
         return return_string
 
+    def coefficient_report_lines(self, *, title: str) -> list[str]:
+        """Human-readable B0_intercept, B1_<feature>, … lines (values[0] is intercept)."""
+        if len(self.values) != 1 + len(self.feature_names):
+            raise ValueError(
+                f"expected {1 + len(self.feature_names)} coefficients, got {len(self.values)}"
+            )
+        bar = "=" * 72
+        lines = [bar, title, bar, f"B0_intercept: {self.values[0]}"]
+        for i, name in enumerate(self.feature_names, start=1):
+            lines.append(f"B{i}_{name}: {self.values[i]}")
+        lines.append(f"R²: {self.r_squared}")
+        lines.append(f"energy_ratio: {self.energy_ratio}")
+        lines.append(bar)
+        return lines
+
+    def print_coefficient_report(self, *, title: str) -> None:
+        for line in self.coefficient_report_lines(title=title):
+            print(line)
+
+    def greek_scada_copy_paste_lines(self) -> list[str]:
+        """SCADA-style lines: ``alpha_ex_6`` (coef × 10⁶) and ``rho_times_100``."""
+        if self.is_baseline:
+            raise ValueError("greek_scada_copy_paste_lines applies to the main energy model only")
+        if len(self.values) != 1 + len(self.feature_names):
+            raise ValueError(
+                f"expected {1 + len(self.feature_names)} coefficients, got {len(self.values)}"
+            )
+        by_feature = dict(zip(self.feature_names, self.values[1:], strict=True))
+        lines: list[str] = []
+        for greek, feature in _ENERGY_MODEL_GREEK_COEFFS:
+            coef = float(self.values[0]) if feature is None else float(by_feature.get(feature, 0.0))
+            lines.append(f"{greek}_ex_6={int(round(coef * 1_000_000))},")
+        lines.append(f"rho_times_100={int(round(self.energy_ratio * 100))},")
+        return lines
+
+    def baseline_scada_copy_paste_lines(self) -> list[str]:
+        """SCADA-style baseline (α + β·OAT + γ·w·(65−OAT)) coefficients."""
+        if not self.is_baseline:
+            raise ValueError("baseline_scada_copy_paste_lines applies to the baseline model only")
+        if len(self.values) != 1 + len(self.feature_names):
+            raise ValueError(
+                f"expected {1 + len(self.feature_names)} coefficients, got {len(self.values)}"
+            )
+        by_feature = dict(zip(self.feature_names, self.values[1:], strict=True))
+        alpha = float(self.values[0])
+        beta = float(by_feature["oat_f"])
+        gamma = float(by_feature["windspeed_times_65_minus_oat"])
+        return [
+            f"baseline_alpha_times_10={int(round(alpha * 10))},",
+            f"baseline_beta_times_100={int(round(beta * 100))},",
+            f"baseline_gamma_ex_6={int(round(gamma * 1_000_000))},",
+        ]
+
 
 @dataclass(frozen=True)
 class RswtLoadBucketFit:
     rwt_intercept: float
     rwt_slope: float
+
+
+@dataclass(frozen=True)
+class HouseSupplyPhysicsParams:
+    k_rad: float
+    n: float
+    t_room_c: float
+    water_kg_hour_chc: float
+    q_dd_kwh: float
+    t_supply_dd_c: float
+    fit_rmse_c: float
+    fit_n_rows: int
+    k_rad_std: float | None = None
+    n_std: float | None = None
+
+    def __repr__(self) -> str:
+        t_dd_f = self.t_supply_dd_c * (9.0 / 5.0) + 32.0
+        return (
+            "HouseSupplyPhysicsParams:\n"
+            f"- k_rad: {self.k_rad:.6g}\n"
+            f"- n: {self.n:.4f}\n"
+            f"- t_room_c: {self.t_room_c:.2f}\n"
+            f"- water_kg_hour_chc: {self.water_kg_hour_chc}\n"
+            f"- q_dd_kwh (anchor): {self.q_dd_kwh}\n"
+            f"- t_supply_dd: {self.t_supply_dd_c:.2f} °C ({t_dd_f:.2f} °F)\n"
+            f"- fit RMSE: {self.fit_rmse_c:.3f} °C on {self.fit_n_rows} hour(s)"
+        )
 
 
 @dataclass(frozen=True)
@@ -113,8 +209,8 @@ class HouseEnergyParamsComputer:
         "deltaT",
         "windspeed_times_deltaT",
         "solar_w_m2",
-        "previous_dist_kwh_scaled",
         "OAT_avg_4h",
+        "previous_dist_kwh_scaled",
         "dist_kwh_scaled_avg_4h",
     )
 
@@ -148,6 +244,8 @@ class HouseEnergyParamsComputer:
     RSWT_CHC_HEATCALL_FRACTION_THRESHOLD = 0.8
     RSWT_CHC_HEATCALL_FLOOR = 0.7
     RSWT_BUCKET_MIN_FIT_ROWS = 20
+    SUPPLY_PHYSICS_N_INITIAL = 1.3
+    SUPPLY_PHYSICS_N_BOUNDS: tuple[float, float] = (1.0, 1.6)
     WATER_CP_KWH_PER_KG_K = 0.001163
     RSWT_BUCKET_ATTR_NAMES = (
         "load_0_2",
@@ -196,11 +294,13 @@ class HouseEnergyParamsComputer:
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
         run_ms: int | None = None,
+        use_solar: bool = True,
     ) -> None:
         self.house_alias = house_alias
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = timezone
+        self.use_solar = use_solar
         if run_ms is None:
             run_ms = int(time.time() * 1000)
         self.run_ms = run_ms
@@ -245,6 +345,7 @@ class HouseEnergyParamsComputer:
             "rswt_params_dir": str(self.rswt_params_dir),
             "trailing_performance_dir": str(self.trailing_performance_dir),
             "sweep_n_dir": str(self.sweep_n_dir),
+            "use_solar": self.use_solar,
         }
         path = self.run_dir / self.RUN_PARAMETERS_JSON
         if path.exists():
@@ -327,6 +428,42 @@ class HouseEnergyParamsComputer:
         loader.end_time = end_time
         loader.timezone = timezone
         loader._load_data()
+        return loader.df.copy(), list(loader.zones)
+
+    @classmethod
+    def load_hourly_erroneous_only(
+        cls,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+    ) -> tuple[pd.DataFrame, list[int]]:
+        """Load hourly cache/DB data and apply valid-range / rate-of-change cleaning only."""
+        loader = cls.__new__(cls)
+        loader.house_alias = house_alias
+        loader.start_time = start_time
+        loader.end_time = end_time
+        loader.timezone = timezone
+        loader._load_data()
+        loader.df = loader._remove_erroneous_data(loader.df)
+        return loader.df.copy(), list(loader.zones)
+
+    @classmethod
+    def load_hourly_fully_cleaned(
+        cls,
+        house_alias: str,
+        start_time: datetime,
+        end_time: datetime,
+        timezone: ZoneInfo = ZoneInfo("America/New_York"),
+    ) -> tuple[pd.DataFrame, list[int]]:
+        """Load hourly data and apply full training pipeline cleaning (no feature engineering)."""
+        loader = cls.__new__(cls)
+        loader.house_alias = house_alias
+        loader.start_time = start_time
+        loader.end_time = end_time
+        loader.timezone = timezone
+        loader._load_data()
+        loader._clean_data()
         return loader.df.copy(), list(loader.zones)
 
     @classmethod
@@ -614,10 +751,16 @@ class HouseEnergyParamsComputer:
                 at_hour = hour == occupancy_hour
                 df[f"wd_hour_{occupancy_hour}"] = (is_weekday & at_hour).astype(float)
                 df[f"we_hour_{occupancy_hour}"] = (is_weekend & at_hour).astype(float)
-            self.feature_names = self.FEATURE_NAMES + self.OCCUPANCY_FEATURE_NAMES
+            regression_features = self._regression_feature_names()
+            self.feature_names = regression_features + self.OCCUPANCY_FEATURE_NAMES
         else:
-            self.feature_names = self.FEATURE_NAMES
+            self.feature_names = self._regression_feature_names()
         self.df = df
+
+    def _regression_feature_names(self) -> tuple[str, ...]:
+        if self.use_solar:
+            return self.FEATURE_NAMES
+        return tuple(f for f in self.FEATURE_NAMES if f != "solar_w_m2")
 
     def _remove_erroneous_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -1101,24 +1244,13 @@ class HouseEnergyParamsComputer:
     # Get rswt parameters for the last N days of data
     # ----------------------------------------------------
 
-    def get_rswt_params(
+    def _prepare_rswt_fit_frame(
         self,
-        n: int | None = None,
+        n: int | None,
         *,
-        energy_params: HouseEnergyParams | None = None,
-    ) -> HouseRswtParams:
-        """
-        Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
-        days, or on the full ``start_time``–``end_time`` window when ``n`` is omitted.
-
-        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
-        estimated-energy band (see ``RSWT_LOAD_BUCKET_BOUNDS``). Bucketing load is
-        ``energy_params`` in-sample/scoring prediction when provided, otherwise scaled
-        ``dist_kwh`` from the fit window. ``water_kg_hour_chc`` is mean ``dist_water_kg`` on
-        hours with max zone heat-call above ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or
-        top-k by heat-call if too few. Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS``
-        hours are omitted (``None``).
-        """
+        energy_params: HouseEnergyParams | None,
+    ) -> tuple[pd.DataFrame, int, float, int]:
+        """Hourly SWT/RWT/load frame, calendar days, CHC water kg/h, CHC hour count."""
         window_df, n_days = self._fit_window(n)
         window_label = f"the last {n_days} day(s)"
 
@@ -1151,6 +1283,71 @@ class HouseEnergyParamsComputer:
             load_label = "scaled dist_kwh (window energy_ratio)"
         self._log_info(f"RSWT bucket load: {load_label}")
         rwt_df["est_load_kwh"] = est_load_kwh
+
+        min_rows = self.RSWT_BUCKET_MIN_FIT_ROWS
+        threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
+        floor = self.RSWT_CHC_HEATCALL_FLOOR
+        hc = rwt_df["max_zone_heatcall_fraction"]
+        above_threshold = rwt_df.loc[hc > threshold]
+        if len(above_threshold) >= min_rows:
+            chc_df = above_threshold
+            self._log_info(
+                f"CHC water: {len(chc_df)} hour(s) with max zone heat-call > {threshold}"
+            )
+        else:
+            n_above = len(above_threshold)
+            k = min(min_rows, len(rwt_df))
+            floored = rwt_df.loc[hc >= floor]
+            if len(floored) >= k:
+                pool = floored
+                pool_label = f"heat-call >= {floor}"
+            else:
+                pool = rwt_df
+                pool_label = "all hours"
+            chc_df = pool.nlargest(k, "max_zone_heatcall_fraction")
+            min_hc = float(chc_df["max_zone_heatcall_fraction"].min())
+            max_hc = float(chc_df["max_zone_heatcall_fraction"].max())
+            self._log_info(
+                f"CHC water: only {n_above} hour(s) above {threshold}, "
+                f"using top {len(chc_df)} by heat-call from {pool_label} "
+                f"(heat-call {min_hc:.2f}–{max_hc:.2f})"
+            )
+
+        chc_dist_water = chc_df["dist_water_kg"].dropna()
+        if chc_dist_water.empty:
+            raise ValueError(
+                f"{self.house_alias}: no dist_water_kg on CHC training rows "
+                f"in {window_label}"
+            )
+        water_kg_hour_chc = round(float(chc_dist_water.mean()), 2)
+        water_chc_n_hours = len(chc_dist_water)
+        self._log_info(
+            f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg "
+            f"(mean over {water_chc_n_hours} CHC training hour(s))"
+        )
+        return rwt_df, n_days, water_kg_hour_chc, water_chc_n_hours
+
+    def get_rswt_params(
+        self,
+        n: int | None = None,
+        *,
+        energy_params: HouseEnergyParams | None = None,
+    ) -> HouseRswtParams:
+        """
+        Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
+        days, or on the full ``start_time``–``end_time`` window when ``n`` is omitted.
+
+        Uses ``rwt_average_f ~ intercept + slope * swt_average_f`` separately for each hourly
+        estimated-energy band (see ``RSWT_LOAD_BUCKET_BOUNDS``). Bucketing load is
+        ``energy_params`` in-sample/scoring prediction when provided, otherwise scaled
+        ``dist_kwh`` from the fit window. ``water_kg_hour_chc`` is mean ``dist_water_kg`` on
+        hours with max zone heat-call above ``RSWT_CHC_HEATCALL_FRACTION_THRESHOLD``, or
+        top-k by heat-call if too few. Load bands with fewer than ``RSWT_BUCKET_MIN_FIT_ROWS``
+        hours are omitted (``None``).
+        """
+        rwt_df, n_days, water_kg_hour_chc, water_chc_n_hours = self._prepare_rswt_fit_frame(
+            n, energy_params=energy_params
+        )
 
         bucket_fits: list[RswtLoadBucketFit | None] = []
         bucket_n_hours: list[int] = []
@@ -1191,47 +1388,6 @@ class HouseEnergyParamsComputer:
                 f"{self.house_alias}: no load band had at least {min_rows} hour(s) "
                 f"for RSWT fit in the last {n_days} day(s)"
             )
-
-        threshold = self.RSWT_CHC_HEATCALL_FRACTION_THRESHOLD
-        floor = self.RSWT_CHC_HEATCALL_FLOOR
-        hc = rwt_df["max_zone_heatcall_fraction"]
-        above_threshold = rwt_df.loc[hc > threshold]
-        if len(above_threshold) >= min_rows:
-            chc_df = above_threshold
-            self._log_info(
-                f"CHC water: {len(chc_df)} hour(s) with max zone heat-call > {threshold}"
-            )
-        else:
-            n_above = len(above_threshold)
-            k = min(min_rows, len(rwt_df))
-            floored = rwt_df.loc[hc >= floor]
-            if len(floored) >= k:
-                pool = floored
-                pool_label = f"heat-call >= {floor}"
-            else:
-                pool = rwt_df
-                pool_label = "all hours"
-            chc_df = pool.nlargest(k, "max_zone_heatcall_fraction")
-            min_hc = float(chc_df["max_zone_heatcall_fraction"].min())
-            max_hc = float(chc_df["max_zone_heatcall_fraction"].max())
-            self._log_info(
-                f"CHC water: only {n_above} hour(s) above {threshold}, "
-                f"using top {len(chc_df)} by heat-call from {pool_label} "
-                f"(heat-call {min_hc:.2f}–{max_hc:.2f})"
-            )
-
-        chc_dist_water = chc_df["dist_water_kg"].dropna()
-        if chc_dist_water.empty:
-            raise ValueError(
-                f"{self.house_alias}: no dist_water_kg on CHC training rows "
-                f"in the last {n_days} day(s)"
-            )
-        water_kg_hour_chc = round(float(chc_dist_water.mean()), 2)
-        water_chc_n_hours = len(chc_dist_water)
-        self._log_info(
-            f"water_kg_hour_chc={water_kg_hour_chc:.2f} kg "
-            f"(mean over {water_chc_n_hours} CHC training hour(s))"
-        )
 
         self.rswt_params_dir.mkdir(parents=True, exist_ok=True)
         plot_rswt_fit(
@@ -1285,6 +1441,87 @@ class HouseEnergyParamsComputer:
         pd.DataFrame([rswt_row]).to_csv(
             self.rswt_params_dir / "params_rswt.csv", index=False
         )
+        return params
+
+    def get_supply_physics_params(
+        self,
+        n: int | None = None,
+        *,
+        energy_params: HouseEnergyParams | None = None,
+        t_room_c: float,
+        q_dd_kwh: float,
+    ) -> HouseSupplyPhysicsParams:
+        """
+        Fit ``K_rad`` and ``n`` in
+        ``T_supply(Q) = T_room + K_rad·Q^(1/n) + Q/(2·ṁ·cp)``
+        to historical (Q, SWT) using nonlinear least squares.
+
+        ``Q_DD`` is a fixed design anchor; ``T_supply,DD`` is computed after the fit.
+        """
+        rwt_df, n_days, water_kg_hour_chc, _water_chc_n_hours = self._prepare_rswt_fit_frame(
+            n, energy_params=energy_params
+        )
+        q_kwh = rwt_df["est_load_kwh"].to_numpy(dtype=float)
+        swt_c = (rwt_df["swt_average_f"].to_numpy(dtype=float) - 32.0) * (5.0 / 9.0)
+        self._log_info(
+            f"Supply physics fit: {len(q_kwh)} hour(s) in the last {n_days} day(s), "
+            f"T_room={t_room_c:.2f} °C, Q_DD anchor={q_dd_kwh:.2f} kWh/h"
+        )
+        fit: SupplyPhysicsFitResult = fit_k_rad_and_n(
+            q_kwh,
+            swt_c,
+            t_room_c=t_room_c,
+            mdot_kg_hour=water_kg_hour_chc,
+            cp_kwh_per_kg_k=self.WATER_CP_KWH_PER_KG_K,
+            n_initial=self.SUPPLY_PHYSICS_N_INITIAL,
+            n_bounds=self.SUPPLY_PHYSICS_N_BOUNDS,
+            min_rows=self.RSWT_BUCKET_MIN_FIT_ROWS,
+        )
+        t_supply_dd_c = design_supply_temp_c(
+            q_dd_kwh,
+            t_room_c=t_room_c,
+            k_rad=fit.k_rad,
+            n=fit.n,
+            mdot_kg_hour=water_kg_hour_chc,
+            cp_kwh_per_kg_k=self.WATER_CP_KWH_PER_KG_K,
+        )
+        delta_rad_dd = fit.k_rad * (q_dd_kwh ** (1.0 / fit.n))
+        self._log_info(
+            f"Supply physics: K_rad={fit.k_rad:.6g}, n={fit.n:.4f}, "
+            f"RMSE={fit.rmse_c:.3f} °C; at Q_DD={q_dd_kwh:.2f}: "
+            f"ΔT_rad,DD={delta_rad_dd:.2f} °C, T_supply,DD={t_supply_dd_c:.2f} °C "
+            f"({t_supply_dd_c * 9.0 / 5.0 + 32.0:.2f} °F)"
+        )
+        params = HouseSupplyPhysicsParams(
+            k_rad=round(fit.k_rad, 8),
+            n=round(fit.n, 6),
+            t_room_c=round(t_room_c, 4),
+            water_kg_hour_chc=water_kg_hour_chc,
+            q_dd_kwh=q_dd_kwh,
+            t_supply_dd_c=round(t_supply_dd_c, 4),
+            fit_rmse_c=round(fit.rmse_c, 4),
+            fit_n_rows=fit.n_rows,
+            k_rad_std=round(fit.k_rad_std, 8) if fit.k_rad_std is not None else None,
+            n_std=round(fit.n_std, 6) if fit.n_std is not None else None,
+        )
+        self.rswt_params_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "k_rad": params.k_rad,
+                    "n": params.n,
+                    "k_rad_std": params.k_rad_std,
+                    "n_std": params.n_std,
+                    "t_room_c": params.t_room_c,
+                    "water_kg_hour_chc": params.water_kg_hour_chc,
+                    "q_dd_kwh": params.q_dd_kwh,
+                    "t_supply_dd_c": params.t_supply_dd_c,
+                    "t_supply_dd_f": params.t_supply_dd_c * (9.0 / 5.0) + 32.0,
+                    "fit_rmse_c": params.fit_rmse_c,
+                    "fit_n_rows": params.fit_n_rows,
+                }
+            ]
+        ).to_csv(self.rswt_params_dir / "params_supply_physics.csv", index=False)
         return params
 
     def _fit_rwt_vs_swt(self, df: pd.DataFrame) -> tuple[float, float]:

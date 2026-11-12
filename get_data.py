@@ -245,6 +245,37 @@ class HouseParamsDataFetcher:
         local = tb.astimezone(self.local_tz)
         return local.replace(tzinfo=None).isoformat(timespec="seconds")
 
+    def _local_hour_floor(self, dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=self.local_tz)
+        else:
+            dt = dt.astimezone(self.local_tz)
+        return dt.replace(minute=0, second=0, microsecond=0)
+
+    def _weather_at_hour_from_forecasts(
+        self,
+        target_hour: datetime,
+        weather_forecasts: list[tuple[datetime, list[float], list[float]]],
+    ) -> tuple[float, float] | None:
+        """
+        Map weather.forecast to an hourly bucket.
+
+        Payload index 0 is valid only for the hour immediately after the message
+        hour (not reused across later hours with the same value).
+        """
+        target = self._local_hour_floor(target_hour)
+        best_ts: datetime | None = None
+        best: tuple[float, float] | None = None
+        for timestamp, oat_vals, wind_vals in weather_forecasts:
+            msg_hour = self._local_hour_floor(timestamp)
+            valid_hour = msg_hour + timedelta(hours=1)
+            if valid_hour != target or not oat_vals or not wind_vals:
+                continue
+            if best_ts is None or timestamp > best_ts:
+                best_ts = timestamp
+                best = (oat_vals[0], wind_vals[0])
+        return best
+
     def fetch(self) -> tuple[dict[str, dict[str, float | str | None]], list[str], list[int]]:
         logger.info(
             f"[{self.house_alias}] Exporting from {self.t_start.isoformat()} "
@@ -398,9 +429,13 @@ class HouseParamsDataFetcher:
 
         weather_forecasts.sort(key=lambda item: item[0])
         logger.info(f"[{self.house_alias}] weather.forecast messages: {len(weather_forecasts)}")
-        # Latest message at or before each hour: payload[0] -> oat_f/ws_mph; [0:48] -> forecast JSON
         for hour_key, bucket in channel_data_by_hour_start.items():
             origin_start = datetime.fromisoformat(hour_key).replace(tzinfo=self.local_tz)
+            weather = self._weather_at_hour_from_forecasts(origin_start, weather_forecasts)
+            if weather is not None:
+                bucket["oat_f"], bucket["ws_mph"] = weather
+
+            # Trajectory JSON for multi-step backtests: latest message at or before this hour
             chosen_oat: list[float] | None = None
             chosen_wind: list[float] | None = None
             chosen_ts: datetime | None = None
@@ -412,8 +447,6 @@ class HouseParamsDataFetcher:
             oat_arr: list[float | None] = []
             ws_arr: list[float | None] = []
             if chosen_oat and chosen_wind:
-                bucket["oat_f"] = chosen_oat[0]
-                bucket["ws_mph"] = chosen_wind[0]
                 for i in range(FORECAST_HORIZON_HOURS):
                     oat_arr.append(chosen_oat[i] if i < len(chosen_oat) else None)
                     ws_arr.append(chosen_wind[i] if i < len(chosen_wind) else None)

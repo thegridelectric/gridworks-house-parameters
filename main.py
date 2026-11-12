@@ -15,10 +15,10 @@ END_TIME = datetime(2026, 10, 31, tzinfo=ZoneInfo("America/New_York"))
 
 HOUSE_ALIASES = [
     "beech",
-    # "oak",
-    # "fir",
-    # "maple",
-    # "elm",
+    "oak",
+    "fir",
+    "maple",
+    "elm",
 ]
 
 run_ms = int(time.time() * 1000)
