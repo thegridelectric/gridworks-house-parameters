@@ -50,8 +50,8 @@ if HOUSE_ALIAS=='beech':
     SCADA_DD_RSWT = 155.0
 
 else:
-    TEST_DATA_START_TIME = datetime(2026, 10, 19, 0, tzinfo=TIMEZONE)
-    TEST_DATA_END_TIME = datetime(2026, 10, 27, 18, tzinfo=TIMEZONE)
+    TEST_DATA_START_TIME = datetime(2026, 11, 10, 0, tzinfo=TIMEZONE)
+    TEST_DATA_END_TIME = datetime(2026, 11, 18, 0, tzinfo=TIMEZONE)
     SCADA_ALPHA=7.6
     SCADA_BETA=-0.13
     SCADA_GAMMA=0.0024

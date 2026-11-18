@@ -20,6 +20,17 @@ logger = logging.getLogger(__name__)
 
 FORECAST_HORIZON_HOURS = 48
 
+# After 2026-10-29 the houses stopped publishing weather.forecast. Outdoor
+# temperature and wind for every Keene house come from the shared Millinocket
+# moose bundle. Its series integers are FahrenheitX10 and MilesPerHourX10,
+# and slice 0 starts on the hour after the message hour (same as the legacy
+# OatF / WindSpeedMph arrays).
+GW_WEATHER_FORECAST_BUNDLE = "us.me.millinocket.moose"
+GW_WEATHER_SERIES_DIVISOR = {
+    "Temperature": 10.0,
+    "WindSpeed": 10.0,
+}
+
 # -----------------
 # Channel names
 # -----------------
@@ -49,8 +60,23 @@ KG_PER_US_GALLON = 3.785411784
 # Querries
 # -----------------
 
+def _water_temp_c_expr(channel: str) -> str:
+    """°C for a water channel across the October 2026 unit change.
+
+    CelsiusTimes100 (value/100) wins when both units are present in one second.
+    retrieve_readings_1s LOCF-fills a retired WaterTempCTimes1000 series through
+    the rest of a batch that still contains its last reading.
+    """
+    return (
+        "COALESCE("
+        f"AVG(value) FILTER (WHERE channel_name = '{channel}' AND unit = 'CelsiusTimes100') / 100, "
+        f"AVG(value) FILTER (WHERE channel_name = '{channel}' AND unit = 'WaterTempCTimes1000') / 1000"
+        ")"
+    )
+
+
 # Hourly energy (distribution and heat pump)
-ENERGY_SQL = text("""
+ENERGY_SQL = text(f"""
 SELECT
     time_bucket(INTERVAL '1 hour', time_bucket_1s, :local_tz) AS time_bucket,
     avg(hp_kw) AS hp_kwh_th,
@@ -65,16 +91,12 @@ FROM (
             time_bucket AS time_bucket_1s,
             (AVG(value) FILTER (WHERE channel_name = 'primary-flow' AND unit = 'GpmTimes100') / 100)
                 AS primary_flow_gpm,
-            (AVG(value) FILTER (WHERE channel_name = 'hp-lwt' AND unit = 'WaterTempCTimes1000') / 1000)
-                AS hp_lwt_c,
-            (AVG(value) FILTER (WHERE channel_name = 'hp-ewt' AND unit = 'WaterTempCTimes1000') / 1000)
-                AS hp_ewt_c,
+            {_water_temp_c_expr("hp-lwt")} AS hp_lwt_c,
+            {_water_temp_c_expr("hp-ewt")} AS hp_ewt_c,
             (AVG(value) FILTER (WHERE channel_name = 'dist-flow' AND unit = 'GpmTimes100') / 100)
                 AS dist_flow_gpm,
-            (AVG(value) FILTER (WHERE channel_name = 'dist-swt' AND unit = 'WaterTempCTimes1000') / 1000)
-                AS dist_swt_c,
-            (AVG(value) FILTER (WHERE channel_name = 'dist-rwt' AND unit = 'WaterTempCTimes1000') / 1000)
-                AS dist_rwt_c
+            {_water_temp_c_expr("dist-swt")} AS dist_swt_c,
+            {_water_temp_c_expr("dist-rwt")} AS dist_rwt_c
         FROM gridworks.retrieve_readings_1s(
             t_start => :t_start,
             t_end => :t_end_inclusive,
@@ -89,16 +111,14 @@ ORDER BY time_bucket
 """)
 
 # Duration-weighted average dist SWT/RWT while dist-flow > 0 (after 30s in each flow run)
-DIST_FLOW_WT_SQL = text("""
+DIST_FLOW_WT_SQL = text(f"""
 WITH per_second AS (
     SELECT
         time_bucket AS time_bucket_1s,
         (AVG(value) FILTER (WHERE channel_name = 'dist-flow' AND unit = 'GpmTimes100') / 100)
             AS dist_flow_gpm,
-        (AVG(value) FILTER (WHERE channel_name = 'dist-swt' AND unit = 'WaterTempCTimes1000') / 1000)
-            AS dist_swt_c,
-        (AVG(value) FILTER (WHERE channel_name = 'dist-rwt' AND unit = 'WaterTempCTimes1000') / 1000)
-            AS dist_rwt_c
+        {_water_temp_c_expr("dist-swt")} AS dist_swt_c,
+        {_water_temp_c_expr("dist-rwt")} AS dist_rwt_c
     FROM gridworks.retrieve_readings_1s(
         t_start => :t_start,
         t_end => :t_end_inclusive,
@@ -213,14 +233,60 @@ ORDER BY time_bucket, rc.name
 """)
 
 WEATHER_FORECAST_SQL = text("""
-SELECT timestamp, payload
+SELECT timestamp, message_type_name, payload
 FROM gridworks.messages
-WHERE message_type_name = :message_type
-  AND from_alias ILIKE :from_alias
-  AND timestamp >= :msg_t_start
+WHERE timestamp >= :msg_t_start
   AND timestamp < :t_end
+  AND (
+    (
+      message_type_name = 'weather.forecast'
+      AND from_alias ILIKE :from_alias
+    )
+    OR (
+      message_type_name = 'gw.weather.forecast'
+      AND payload->>'BundleName' = :bundle_name
+    )
+  )
 ORDER BY timestamp ASC
 """)
+
+
+def _zone_temp_f(raw: float, unit: str) -> float:
+    """Zone temp or setpoint in °F. AirTempFTimes1000 until Oct 2026, then CelsiusTimes100."""
+    if unit == "AirTempFTimes1000":
+        return round(raw / 1000.0, 1)
+    if unit == "CelsiusTimes100":
+        return round((raw / 100.0) * 9.0 / 5.0 + 32.0, 1)
+    return round(raw, 1)
+
+
+def _forecast_oat_and_wind(message_type: str, payload: dict) -> tuple[list[float], list[float]] | None:
+    """Hourly °F and mph arrays whose index 0 is the hour after the message hour."""
+    if message_type == "gw.weather.forecast":
+        by_quantity = {
+            series.get("Quantity"): series.get("Values") or []
+            for series in payload.get("SeriesList") or []
+        }
+        oat = by_quantity.get("Temperature") or []
+        wind = by_quantity.get("WindSpeed") or []
+        if not oat or not wind:
+            return None
+        return (
+            [round(float(v) / GW_WEATHER_SERIES_DIVISOR["Temperature"], 1) for v in oat],
+            [round(float(v) / GW_WEATHER_SERIES_DIVISOR["WindSpeed"], 1) for v in wind],
+        )
+    times = payload.get("Time") or []
+    oat = payload.get("OatF") or []
+    wind = payload.get("WindSpeedMph") or []
+    if not times or not oat or not wind:
+        return None
+    n = min(len(times), len(oat), len(wind))
+    if n == 0:
+        return None
+    return (
+        [round(float(oat[i]), 1) for i in range(n)],
+        [round(float(wind[i]), 1) for i in range(n)],
+    )
 
 
 class HouseParamsDataFetcher:
@@ -258,10 +324,10 @@ class HouseParamsDataFetcher:
         weather_forecasts: list[tuple[datetime, list[float], list[float]]],
     ) -> tuple[float, float] | None:
         """
-        Map weather.forecast to an hourly bucket.
+        Map a forecast message to an hourly bucket.
 
-        Payload index 0 is valid only for the hour immediately after the message
-        hour (not reused across later hours with the same value).
+        Index 0 is the hour immediately after the message hour, for both
+        weather.forecast and gw.weather.forecast. It is not reused for later hours.
         """
         target = self._local_hour_floor(target_hour)
         best_ts: datetime | None = None
@@ -292,7 +358,9 @@ class HouseParamsDataFetcher:
 
         zone_ids: set[int] = set()
         weather_forecasts: list[tuple[datetime, list[float], list[float]]] = []
-        seen_weather_message_ts: set[datetime] = set()
+        seen_weather_messages: set[tuple[datetime, str]] = set()
+        n_legacy_forecasts = 0
+        n_gw_forecasts = 0
         batch_start = self.t_start
         batch_days = timedelta(days=self.FETCH_BATCH_DAYS)
 
@@ -320,8 +388,8 @@ class HouseParamsDataFetcher:
                     "kg_per_us_gallon": KG_PER_US_GALLON,
                 }
                 weather_params = {
-                    "message_type": "weather.forecast",
                     "from_alias": f"%{self.house_alias}%",
+                    "bundle_name": GW_WEATHER_FORECAST_BUNDLE,
                     "msg_t_start": batch_start - timedelta(hours=48),
                     "t_end": batch_end,
                 }
@@ -381,7 +449,7 @@ class HouseParamsDataFetcher:
                     if raw is None:
                         continue
                     if kind in ("temp", "set"):
-                        value = round(raw / 1000.0 if unit == "AirTempFTimes1000" else raw, 1)
+                        value = _zone_temp_f(raw, unit)
                     else:
                         value = round(raw, 2)
 
@@ -401,34 +469,38 @@ class HouseParamsDataFetcher:
                         sum(values) / len(values), 1 if "avg_" in field else 2
                     )
 
-                # weather.forecast: store full message trajectories for per-origin merge
+                # Forecast trajectories for per-origin merge. Legacy weather.forecast
+                # and gw.weather.forecast both yield hourly °F / mph arrays.
                 for row in weather_rows:
                     payload = row["payload"]
                     if not isinstance(payload, dict):
                         continue
-                    times = payload.get("Time") or []
-                    oat = payload.get("OatF") or []
-                    wind = payload.get("WindSpeedMph") or []
-                    if not times or not oat or not wind:
+                    message_type = row["message_type_name"]
+                    parsed = _forecast_oat_and_wind(message_type, payload)
+                    if parsed is None:
                         continue
                     timestamp = row["timestamp"]
                     if timestamp.tzinfo is None:
                         timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
                     timestamp = timestamp.astimezone(self.local_tz)
-                    if timestamp in seen_weather_message_ts:
+                    identity = (timestamp, message_type)
+                    if identity in seen_weather_messages:
                         continue
-                    n = min(len(times), len(oat), len(wind))
-                    if n == 0:
-                        continue
-                    oat_vals = [round(float(oat[i]), 1) for i in range(n)]
-                    wind_vals = [round(float(wind[i]), 1) for i in range(n)]
+                    oat_vals, wind_vals = parsed
                     weather_forecasts.append((timestamp, oat_vals, wind_vals))
-                    seen_weather_message_ts.add(timestamp)
+                    seen_weather_messages.add(identity)
+                    if message_type == "gw.weather.forecast":
+                        n_gw_forecasts += 1
+                    else:
+                        n_legacy_forecasts += 1
 
                 batch_start = batch_end
 
         weather_forecasts.sort(key=lambda item: item[0])
-        logger.info(f"[{self.house_alias}] weather.forecast messages: {len(weather_forecasts)}")
+        logger.info(
+            f"[{self.house_alias}] weather messages: {n_legacy_forecasts} weather.forecast, "
+            f"{n_gw_forecasts} gw.weather.forecast ({GW_WEATHER_FORECAST_BUNDLE})"
+        )
         for hour_key, bucket in channel_data_by_hour_start.items():
             origin_start = datetime.fromisoformat(hour_key).replace(tzinfo=self.local_tz)
             weather = self._weather_at_hour_from_forecasts(origin_start, weather_forecasts)

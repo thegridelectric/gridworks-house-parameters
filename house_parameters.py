@@ -620,7 +620,7 @@ class HouseEnergyParamsComputer:
                 fetched["hour_start"] = pd.to_datetime(fetched["hour_start"])
                 self._log_info(
                     f"Loaded {len(fetched)} row(s) from database "
-                    "(weather.forecast; solar_w_m2 from solar_data.csv)"
+                    "(weather.forecast / gw.weather.forecast; solar_w_m2 from solar_data.csv)"
                 )
                 local = pd.concat([local, fetched], ignore_index=True)
                 local = local.drop_duplicates(subset=["hour_start"], keep="last")
