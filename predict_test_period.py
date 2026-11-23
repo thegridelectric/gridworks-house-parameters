@@ -26,7 +26,7 @@ from house_parameters import (
 )
 from plots import plot_test_period_combined_interactive
 
-HOUSE_ALIAS = "oak"
+HOUSE_ALIAS = "fir"
 TIMEZONE = ZoneInfo("America/New_York")
 USE_SOLAR = False
 
@@ -37,6 +37,9 @@ RSWT_TRAINING_DATA_START_TIME = datetime(2025, 10, 17, tzinfo=TIMEZONE)
 RSWT_TRAINING_DATA_END_TIME = datetime(2026, 5, 1, tzinfo=TIMEZONE)
 
 OUTPUT_CSV: Path | None = None  # default: results/.../test_period_predictions.csv
+
+TEST_DATA_START_TIME = datetime(2026, 11, 10, 0, tzinfo=TIMEZONE)
+TEST_DATA_END_TIME = datetime(2026, 11, 23, 0, tzinfo=TIMEZONE)
 
 if HOUSE_ALIAS=='beech':
     TEST_DATA_START_TIME = datetime(2026, 10, 25, 14, tzinfo=TIMEZONE)
@@ -49,7 +52,7 @@ if HOUSE_ALIAS=='beech':
     SCADA_DD_POWER = 8.6
     SCADA_DD_RSWT = 155.0
 
-else:
+elif HOUSE_ALIAS=='oak':
     TEST_DATA_START_TIME = datetime(2026, 11, 10, 0, tzinfo=TIMEZONE)
     TEST_DATA_END_TIME = datetime(2026, 11, 18, 0, tzinfo=TIMEZONE)
     SCADA_ALPHA=7.6
@@ -59,6 +62,18 @@ else:
     SCADA_INTERMEDIATE_RSWT = 100
     SCADA_DD_POWER = 7.6
     SCADA_DD_RSWT=140
+
+elif HOUSE_ALIAS=='fir':
+    SCADA_ALPHA = 7.5
+    SCADA_BETA = -0.13
+    SCADA_GAMMA = 0.0022
+    SCADA_INTERMEDIATE_POWER = 1.5
+    SCADA_INTERMEDIATE_RSWT = 94
+    SCADA_DD_POWER = 7.5
+    SCADA_DD_RSWT = 150
+
+else:
+    raise ValueError(f"Unknown house alias: {HOUSE_ALIAS}")
 
 
 # Q_DD anchor: mean of highest estimated-energy hours on energy training window
@@ -289,6 +304,7 @@ def main() -> None:
         RSWT_TRAINING_DATA_END_TIME,
         timezone=TIMEZONE,
         run_ms=run_ms,
+        use_solar=USE_SOLAR,
     )
     if rswt_computer.df.empty:
         raise ValueError(f"No RSWT training rows for {HOUSE_ALIAS} after data cleaning")
@@ -321,6 +337,7 @@ def main() -> None:
         load_test_from,
         TEST_DATA_END_TIME,
         timezone=TIMEZONE,
+        use_solar=USE_SOLAR,
     )
     featured_test_df = HouseEnergyParamsComputer.engineer_features_uncleaned(
         raw_test_df, test_zones
@@ -394,6 +411,7 @@ def main() -> None:
         load_test_from,
         TEST_DATA_END_TIME,
         timezone=TIMEZONE,
+        use_solar=USE_SOLAR,
     )
     clean_test_window = clean_test_df.loc[
         (clean_test_df["hour_start"] >= test_start)

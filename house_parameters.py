@@ -420,6 +420,7 @@ class HouseEnergyParamsComputer:
         start_time: datetime,
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        use_solar: bool = True,
     ) -> tuple[pd.DataFrame, list[int]]:
         """Load hourly cache/DB data for ``[start_time, end_time)`` with solar fill; no cleaning."""
         loader = cls.__new__(cls)
@@ -427,6 +428,7 @@ class HouseEnergyParamsComputer:
         loader.start_time = start_time
         loader.end_time = end_time
         loader.timezone = timezone
+        loader.use_solar = use_solar
         loader._load_data()
         return loader.df.copy(), list(loader.zones)
 
@@ -437,6 +439,7 @@ class HouseEnergyParamsComputer:
         start_time: datetime,
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        use_solar: bool = True,
     ) -> tuple[pd.DataFrame, list[int]]:
         """Load hourly cache/DB data and apply valid-range / rate-of-change cleaning only."""
         loader = cls.__new__(cls)
@@ -444,6 +447,7 @@ class HouseEnergyParamsComputer:
         loader.start_time = start_time
         loader.end_time = end_time
         loader.timezone = timezone
+        loader.use_solar = use_solar
         loader._load_data()
         loader.df = loader._remove_erroneous_data(loader.df)
         return loader.df.copy(), list(loader.zones)
@@ -455,6 +459,7 @@ class HouseEnergyParamsComputer:
         start_time: datetime,
         end_time: datetime,
         timezone: ZoneInfo = ZoneInfo("America/New_York"),
+        use_solar: bool = True,
     ) -> tuple[pd.DataFrame, list[int]]:
         """Load hourly data and apply full training pipeline cleaning (no feature engineering)."""
         loader = cls.__new__(cls)
@@ -462,6 +467,7 @@ class HouseEnergyParamsComputer:
         loader.start_time = start_time
         loader.end_time = end_time
         loader.timezone = timezone
+        loader.use_solar = use_solar
         loader._load_data()
         loader._clean_data()
         return loader.df.copy(), list(loader.zones)
@@ -704,7 +710,9 @@ class HouseEnergyParamsComputer:
             if str(c).startswith("zone") and str(c).endswith("_avg_set")
         )
 
-        self.required = ["oat_f", "ws_mph", "solar_w_m2", "dist_kwh", "hp_kwh_th"]
+        self.required = ["oat_f", "ws_mph", "dist_kwh", "hp_kwh_th"]
+        if self.use_solar:
+            self.required.insert(2, "solar_w_m2")
         for z in self.zones:
             self.required.extend(
                 [
@@ -757,6 +765,12 @@ class HouseEnergyParamsComputer:
             self.feature_names = self._regression_feature_names()
         self.df = df
 
+    def _optional_data_columns(self) -> tuple[str, ...]:
+        """Columns that may stay missing without dropping the hour."""
+        if self.use_solar:
+            return self.NON_INTERPOLATED_OPTIONAL_COLUMNS
+        return self.NON_INTERPOLATED_OPTIONAL_COLUMNS + ("solar_w_m2",)
+
     def _regression_feature_names(self) -> tuple[str, ...]:
         if self.use_solar:
             return self.FEATURE_NAMES
@@ -773,6 +787,8 @@ class HouseEnergyParamsComputer:
 
         # Remove data that is outside the range of valid values
         range_of_valid_values_per_channel = dict(self.RANGE_OF_VALID_VALUES_PER_CHANNEL)
+        if not self.use_solar:
+            range_of_valid_values_per_channel.pop("solar_w_m2", None)
         for col in df.columns:
             if str(col).startswith("zone") and str(col).endswith(("_avg_set", "_avg_temp")):
                 if "zone_set_or_temp_f" in range_of_valid_values_per_channel:
@@ -836,8 +852,9 @@ class HouseEnergyParamsComputer:
         # Mark rows inside long missing-data gaps
         df = df.set_index("hour_start")
         drop_rows = pd.Series(False, index=df.index)
+        optional_columns = self._optional_data_columns()
         for channel in df.columns:
-            if channel == "day" or channel in self.NON_INTERPOLATED_OPTIONAL_COLUMNS:
+            if channel == "day" or channel in optional_columns:
                 continue
             is_nan = df[channel].isna()
             block_id = is_nan.ne(is_nan.shift()).cumsum()
@@ -849,7 +866,7 @@ class HouseEnergyParamsComputer:
         oat_f_interpolated = pd.Series(False, index=df.index)
         dist_kwh_interpolated = pd.Series(False, index=df.index)
         for channel in df.columns:
-            if channel == "day" or channel in self.NON_INTERPOLATED_OPTIONAL_COLUMNS:
+            if channel == "day" or channel in optional_columns:
                 continue
             before = df[channel].copy()
             df[channel] = df[channel].interpolate(method="time")
@@ -885,7 +902,7 @@ class HouseEnergyParamsComputer:
         self._log_info(f"Long missing-data gaps (>={self.MAX_DATA_GAP_HOURS}h): dropped {int(drop_rows.sum())} rows")
 
         # If any rows still have NaNs (except in NON_INTERPOLATED_OPTIONAL_COLUMNS), drop them
-        required_for_dropna = [c for c in df.columns if c not in self.NON_INTERPOLATED_OPTIONAL_COLUMNS]
+        required_for_dropna = [c for c in df.columns if c not in optional_columns]
         remaining_nans = int(df[required_for_dropna].isna().sum().sum())
         self._log_info(f"NaNs remaining (excl. dist SWT/RWT): {remaining_nans}")
         if remaining_nans > 0:
