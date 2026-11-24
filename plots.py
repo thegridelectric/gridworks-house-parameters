@@ -353,6 +353,7 @@ def plot_rswt_fit(
     house_alias: str,
     n_days: int,
     savepath: Path | None = None,
+    show: bool = False,
 ) -> None:
     import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize
@@ -366,7 +367,8 @@ def plot_rswt_fit(
     gray = np.linspace(0.78, 0.0, n_buckets) if n_buckets else np.array([])
     line_colors = [(float(g), float(g), float(g)) for g in gray]
 
-    fig, (ax_rwt, ax_water) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, ax_rwt = plt.subplots(1, 1, figsize=(8, 6))
+    # fig, (ax_rwt, ax_water) = plt.subplots(1, 2, figsize=(14, 6))
     sc = ax_rwt.scatter(
         swt,
         rwt,
@@ -392,44 +394,57 @@ def plot_rswt_fit(
             label=f"{label} (n={n_hours})",
         )
 
+    rwt_reference_intercept = 49.46
+    rwt_reference_slope = 0.427
+    ax_rwt.plot(
+        swt_line,
+        rwt_reference_intercept + rwt_reference_slope * swt_line,
+        color="tab:green",
+        linewidth=2,
+        zorder=5,
+        label=f"RWT = {rwt_reference_intercept} + {rwt_reference_slope}×SWT",
+    )
+
+    ax_rwt.set_xlim(0, 180)
+    ax_rwt.set_ylim(0, 180)
     ax_rwt.set_xlabel("Supply water temperature SWT (°F)")
     ax_rwt.set_ylabel("Return water temperature RWT (°F)")
-    ax_rwt.set_title("RWT vs SWT")
+    ax_rwt.set_title(f"{house_alias.capitalize()}: RWT vs SWT")
     ax_rwt.legend(loc="upper left", fontsize=8)
 
     cbar = fig.colorbar(sc, ax=ax_rwt)
     cbar.set_label("dist_kwh")
 
-    chc_reference_hcf = 0.9
-    ax_water.scatter(
-        [chc_reference_hcf],
-        [water_kg_hour_chc],
-        color="0.35",
-        s=90,
-        zorder=4,
-        label=f"water_kg_hour_chc (n={water_chc_n_hours})",
-    )
-
-    hcf_line = [0.0, chc_reference_hcf]
-    scaled_water = [
-        water_kg_hour_chc * (hcf / chc_reference_hcf) for hcf in hcf_line
-    ]
-    ax_water.plot(
-        hcf_line,
-        scaled_water,
-        color="0.35",
-        linestyle="--",
-        linewidth=1.5,
-        zorder=2,
-        label="water_kg_hour_chc × hcf / 0.9",
-    )
-
-    ax_water.set_xlabel("Max zone heat-call fraction")
-    ax_water.set_ylabel("Water flow (kg/h)")
-    ax_water.set_title("CHC water flow vs heat-call")
-    ax_water.set_xlim(-0.02, 1.02)
-    ax_water.legend(loc="best", fontsize=8)
-    ax_water.grid(True, alpha=0.3)
+    # chc_reference_hcf = 0.9
+    # ax_water.scatter(
+    #     [chc_reference_hcf],
+    #     [water_kg_hour_chc],
+    #     color="0.35",
+    #     s=90,
+    #     zorder=4,
+    #     label=f"water_kg_hour_chc (n={water_chc_n_hours})",
+    # )
+    #
+    # hcf_line = [0.0, chc_reference_hcf]
+    # scaled_water = [
+    #     water_kg_hour_chc * (hcf / chc_reference_hcf) for hcf in hcf_line
+    # ]
+    # ax_water.plot(
+    #     hcf_line,
+    #     scaled_water,
+    #     color="0.35",
+    #     linestyle="--",
+    #     linewidth=1.5,
+    #     zorder=2,
+    #     label="water_kg_hour_chc × hcf / 0.9",
+    # )
+    #
+    # ax_water.set_xlabel("Max zone heat-call fraction")
+    # ax_water.set_ylabel("Water flow (kg/h)")
+    # ax_water.set_title("CHC water flow vs heat-call")
+    # ax_water.set_xlim(-0.02, 1.02)
+    # ax_water.legend(loc="best", fontsize=8)
+    # ax_water.grid(True, alpha=0.3)
 
     fig.suptitle(
         f"{house_alias.capitalize()}: RSWT fit (last {n_days} day(s))",
@@ -440,7 +455,8 @@ def plot_rswt_fit(
     if savepath is not None:
         savepath.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(savepath, dpi=150, bbox_inches="tight")
-    # plt.show()
+    if show:
+        plt.show()
     plt.close(fig)
 
 

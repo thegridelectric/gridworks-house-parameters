@@ -1349,6 +1349,7 @@ class HouseEnergyParamsComputer:
         n: int | None = None,
         *,
         energy_params: HouseEnergyParams | None = None,
+        show_rswt_fit: bool = False,
     ) -> HouseRswtParams:
         """
         Fits return-side water temperature (RSWT) line parameters on the last ``n`` calendar
@@ -1426,6 +1427,7 @@ class HouseEnergyParamsComputer:
             house_alias=self.house_alias,
             n_days=n_days,
             savepath=self.rswt_params_dir / "rswt_fit.png",
+            show=show_rswt_fit,
         )
 
         params = HouseRswtParams(
