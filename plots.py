@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -28,6 +29,7 @@ class EnergyVsSwtPanelData:
     zone_avg_set_f: dict[int, float] | None = None
     coldest_hour_zone_set_f: dict[int, float] | None = None
     zone_set_f_by_hour: dict[int, np.ndarray] | None = None
+    zone_avg_temp_f_by_hour: dict[int, np.ndarray] | None = None
     zone_heatcall_fraction_by_hour: dict[int, np.ndarray] | None = None
     zone_names: dict[int, str] | None = None
     # Hours dropped for oil boiler or below setpoint (highlight grid figure).
@@ -37,6 +39,8 @@ class EnergyVsSwtPanelData:
     cleaning_excluded_below_setpoint_hour_start: np.ndarray | None = None
     cleaning_excluded_below_setpoint_zone_heatcall: dict[int, np.ndarray] | None = None
     cleaning_excluded_below_setpoint_zone_was_below: dict[int, np.ndarray] | None = None
+    cleaning_excluded_below_setpoint_zone_avg_set_f: dict[int, np.ndarray] | None = None
+    cleaning_excluded_below_setpoint_zone_avg_temp_f: dict[int, np.ndarray] | None = None
     cleaning_excluded_oil_boiler_estimated_kwh: np.ndarray | None = None
     cleaning_excluded_oil_boiler_swt_f: np.ndarray | None = None
     # Legend hour % from full zone set (e.g. Elm figure 1 keeps zone 3 in the math).
@@ -484,11 +488,11 @@ def _panel_show_design_day_below_setpoint(
     highlight_design_day_below_setpoint: bool,
     scatter_monochrome: bool,
 ) -> bool:
+    if highlight_design_day_below_setpoint:
+        return True
     if panel.house_alias != "maple_before":
         return False
-    return highlight_design_day_below_setpoint or _maple_monochrome_enhanced_panel(
-        panel, scatter_monochrome
-    )
+    return _maple_monochrome_enhanced_panel(panel, scatter_monochrome)
 
 
 def _zone_scatter_facecolor(
@@ -1435,6 +1439,488 @@ def _design_day_below_setpoint_hour_starts(
             & np.asarray(zbelow, dtype=bool)
         )
     return [pd.Timestamp(t) for t in hours_arr[keep]]
+
+
+def _cleaning_excluded_below_setpoint_row_index(
+    hour_starts: np.ndarray | None,
+    hour: pd.Timestamp,
+) -> int | None:
+    if hour_starts is None:
+        return None
+    target = pd.Timestamp(hour)
+    for i, h in enumerate(np.asarray(hour_starts)):
+        if pd.Timestamp(h) == target:
+            return i
+    return None
+
+
+PURPLE_HOURS_TABLE_MAX_ZONES = 4
+PURPLE_HOURS_TABLE_TEMP_DECIMALS = 1
+# Elm purple-hours table: display zone 3 ↔ physical zone 4 (and vice versa).
+_ELM_PURPLE_TABLE_ZONE_DATA_FOR_DISPLAY = {3: 4, 4: 3}
+
+
+def _purple_table_temp_c(fahrenheit: float) -> float:
+    return round(
+        float(_swt_f_to_c(np.array([fahrenheit], dtype=float))[0]),
+        PURPLE_HOURS_TABLE_TEMP_DECIMALS,
+    )
+
+
+def _purple_table_physical_zone(panel: EnergyVsSwtPanelData, display_zone: int) -> int:
+    if panel.house_alias == "elm":
+        return _ELM_PURPLE_TABLE_ZONE_DATA_FOR_DISPLAY.get(display_zone, display_zone)
+    return display_zone
+
+
+def _purple_hour_table_row(
+    panel: EnergyVsSwtPanelData,
+    hour: pd.Timestamp,
+    row_i: int,
+    *,
+    max_zones: int = PURPLE_HOURS_TABLE_MAX_ZONES,
+) -> dict[str, object]:
+    oats_f = panel.cleaning_excluded_below_setpoint_oat_f
+    swt_f = panel.cleaning_excluded_below_setpoint_swt_f
+    zone_sets = panel.cleaning_excluded_below_setpoint_zone_avg_set_f or {}
+    zone_temps = panel.cleaning_excluded_below_setpoint_zone_avg_temp_f or {}
+    row: dict[str, object] = {
+        "house": panel.house_alias,
+        "datetime": pd.Timestamp(hour),
+        "oat_c": np.nan,
+        "swt_c": np.nan,
+    }
+    for z in range(1, max_zones + 1):
+        row[f"zone{z}_temp"] = np.nan
+        row[f"zone{z}_set"] = np.nan
+    if oats_f is not None and row_i < len(oats_f) and np.isfinite(oats_f[row_i]):
+        row["oat_c"] = _purple_table_temp_c(float(oats_f[row_i]))
+    if swt_f is not None and row_i < len(swt_f) and np.isfinite(swt_f[row_i]):
+        row["swt_c"] = _purple_table_temp_c(float(swt_f[row_i]))
+    for display_z in range(1, max_zones + 1):
+        data_z = _purple_table_physical_zone(panel, display_z)
+        if data_z not in panel.zone_numbers:
+            continue
+        set_arr = zone_sets.get(data_z)
+        temp_arr = zone_temps.get(data_z)
+        if set_arr is not None and row_i < len(set_arr):
+            set_f = float(set_arr[row_i])
+            if np.isfinite(set_f):
+                row[f"zone{display_z}_set"] = _purple_table_temp_c(set_f)
+        if temp_arr is not None and row_i < len(temp_arr):
+            temp_f = float(temp_arr[row_i])
+            if np.isfinite(temp_f):
+                row[f"zone{display_z}_temp"] = _purple_table_temp_c(temp_f)
+    return row
+
+
+def _design_day_zone_hours_table_columns() -> list[str]:
+    base_columns = ["house", "datetime", "oat_c", "swt_c"]
+    zone_columns: list[str] = []
+    for z in range(1, PURPLE_HOURS_TABLE_MAX_ZONES + 1):
+        zone_columns.extend((f"zone{z}_temp", f"zone{z}_set"))
+    return base_columns + zone_columns
+
+
+def _sort_design_day_zone_hours_dataframe(
+    df: pd.DataFrame,
+    house_order: Sequence[str] | None,
+) -> pd.DataFrame:
+    if house_order:
+        rank = {alias: i for i, alias in enumerate(house_order)}
+        df = df.assign(
+            _house_sort=df["house"].map(lambda h: rank.get(str(h), len(rank)))
+        )
+        df = df.sort_values(
+            ["_house_sort", "datetime"],
+            kind="mergesort",
+        ).drop(columns="_house_sort")
+    else:
+        df = df.sort_values(["datetime", "house"], kind="mergesort")
+    return df.reset_index(drop=True)
+
+
+def _cold_oat_valid_hour_table_row(
+    panel: EnergyVsSwtPanelData,
+    row_i: int,
+    *,
+    max_zones: int = PURPLE_HOURS_TABLE_MAX_ZONES,
+) -> dict[str, object]:
+    """One cleaned-data hour highlighted red on monochrome cold-OAT scatter plots."""
+    hour_starts = panel.hour_start
+    oats_f = panel.oat_f
+    swt_f = panel.swt_f
+    zone_sets = panel.zone_set_f_by_hour or {}
+    zone_temps = panel.zone_avg_temp_f_by_hour or {}
+    if hour_starts is None:
+        raise ValueError(f"{panel.house_alias}: panel has no hour_start")
+    hour = pd.Timestamp(hour_starts[row_i])
+    row: dict[str, object] = {
+        "house": panel.house_alias,
+        "datetime": hour,
+        "oat_c": np.nan,
+        "swt_c": np.nan,
+    }
+    for z in range(1, max_zones + 1):
+        row[f"zone{z}_temp"] = np.nan
+        row[f"zone{z}_set"] = np.nan
+    if oats_f is not None and row_i < len(oats_f) and np.isfinite(oats_f[row_i]):
+        row["oat_c"] = _purple_table_temp_c(float(oats_f[row_i]))
+    if swt_f is not None and row_i < len(swt_f) and np.isfinite(swt_f[row_i]):
+        row["swt_c"] = _purple_table_temp_c(float(swt_f[row_i]))
+    for display_z in range(1, max_zones + 1):
+        data_z = _purple_table_physical_zone(panel, display_z)
+        if data_z not in panel.zone_numbers:
+            continue
+        set_arr = zone_sets.get(data_z)
+        temp_arr = zone_temps.get(data_z)
+        if set_arr is not None and row_i < len(set_arr):
+            set_f = float(set_arr[row_i])
+            if np.isfinite(set_f):
+                row[f"zone{display_z}_set"] = _purple_table_temp_c(set_f)
+        if temp_arr is not None and row_i < len(temp_arr):
+            temp_f = float(temp_arr[row_i])
+            if np.isfinite(temp_f):
+                row[f"zone{display_z}_temp"] = _purple_table_temp_c(temp_f)
+    return row
+
+
+def _valid_cold_oat_zone_scatter_row_indices(
+    panel: EnergyVsSwtPanelData,
+    *,
+    zone: int,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float,
+) -> np.ndarray:
+    if panel.hour_start is None or panel.oat_f is None:
+        return np.empty(0, dtype=int)
+    oats_f = np.asarray(panel.oat_f, dtype=float)
+    zhc = (panel.zone_heatcall_fraction_by_hour or {}).get(int(zone))
+    if zhc is None:
+        return np.empty(0, dtype=int)
+    zhc = np.asarray(zhc, dtype=float)
+    n = min(len(oats_f), len(zhc), len(panel.swt_f))
+    if n == 0:
+        return np.empty(0, dtype=int)
+    oat_c = _swt_f_to_c(oats_f[:n])
+    keep = (
+        np.isfinite(oat_c)
+        & (oat_c <= float(oat_at_or_below_c))
+        & np.isfinite(zhc[:n])
+        & (zhc[:n] >= float(heatcall_threshold))
+        & np.isfinite(np.asarray(panel.swt_f[:n], dtype=float))
+    )
+    return np.flatnonzero(keep)
+
+
+def design_day_zone_scatter_highlight_hours_dataframe(
+    panels: Sequence[EnergyVsSwtPanelData],
+    *,
+    zone: int,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float = 0.9,
+    house_order: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """Red (valid) and purple (excluded) cold-OAT hours for a zone-specific scatter plot."""
+    zone_cols = _design_day_zone_hours_table_columns()
+    columns = ["house", "marker", *[c for c in zone_cols if c != "house"]]
+    records: list[dict[str, object]] = []
+    for panel in panels:
+        purple_hours = _design_day_below_setpoint_hour_starts(
+            panel,
+            oat_at_or_below_c=oat_at_or_below_c,
+            heatcall_threshold=heatcall_threshold,
+            zone_scatter_only=int(zone),
+        )
+        hour_starts = panel.cleaning_excluded_below_setpoint_hour_start
+        if purple_hours and hour_starts is not None:
+            for hour in sorted(purple_hours):
+                row_i = _cleaning_excluded_below_setpoint_row_index(hour_starts, hour)
+                if row_i is None:
+                    continue
+                row = _purple_hour_table_row(panel, hour, row_i)
+                row["marker"] = "purple"
+                records.append(row)
+        for row_i in _valid_cold_oat_zone_scatter_row_indices(
+            panel,
+            zone=zone,
+            oat_at_or_below_c=oat_at_or_below_c,
+            heatcall_threshold=heatcall_threshold,
+        ):
+            row = _cold_oat_valid_hour_table_row(panel, int(row_i))
+            row["marker"] = "red"
+            records.append(row)
+    if not records:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame.from_records(records, columns=columns)
+    if house_order:
+        rank = {alias: i for i, alias in enumerate(house_order)}
+        df = df.assign(
+            _house_sort=df["house"].map(lambda h: rank.get(str(h), len(rank)))
+        )
+        df = df.sort_values(
+            ["_house_sort", "datetime", "marker"],
+            kind="mergesort",
+        ).drop(columns="_house_sort")
+    else:
+        df = df.sort_values(["house", "datetime", "marker"], kind="mergesort")
+    return df.reset_index(drop=True)
+
+
+def design_day_cold_oat_valid_hours_dataframe(
+    panels: Sequence[EnergyVsSwtPanelData],
+    *,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float = 0.9,
+    house_order: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """One row per red scatter hour (cleaned data, OAT ≤ threshold, max heat-call ≥ threshold)."""
+    columns = _design_day_zone_hours_table_columns()
+    records: list[dict[str, object]] = []
+    for panel in panels:
+        if panel.hour_start is None or panel.oat_f is None:
+            continue
+        hour_starts = np.asarray(panel.hour_start)
+        oats_f = np.asarray(panel.oat_f, dtype=float)
+        max_hc = np.asarray(panel.max_zone_heatcall, dtype=float)
+        swt_arr = np.asarray(panel.swt_f, dtype=float)
+        oat_c = _swt_f_to_c(oats_f)
+        keep = (
+            np.isfinite(oat_c)
+            & (oat_c <= float(oat_at_or_below_c))
+            & np.isfinite(max_hc)
+            & (max_hc >= float(heatcall_threshold))
+            & np.isfinite(swt_arr)
+        )
+        for row_i in np.flatnonzero(keep):
+            records.append(_cold_oat_valid_hour_table_row(panel, int(row_i)))
+    if not records:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame.from_records(records, columns=columns)
+    return _sort_design_day_zone_hours_dataframe(df, house_order)
+
+
+def design_day_below_setpoint_purple_hours_dataframe(
+    panels: Sequence[EnergyVsSwtPanelData],
+    *,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float = 0.9,
+    zone_scatter_filters: list[int] | None = None,
+    house_order: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """One row per purple hour (same criteria as monochrome cold-OAT scatter markers)."""
+    columns = _design_day_zone_hours_table_columns()
+    records: list[dict[str, object]] = []
+    for index, panel in enumerate(panels):
+        zone_scatter_only = (
+            zone_scatter_filters[index] if zone_scatter_filters is not None else None
+        )
+        purple_hours = _design_day_below_setpoint_hour_starts(
+            panel,
+            oat_at_or_below_c=oat_at_or_below_c,
+            heatcall_threshold=heatcall_threshold,
+            zone_scatter_only=zone_scatter_only,
+        )
+        hour_starts = panel.cleaning_excluded_below_setpoint_hour_start
+        if not purple_hours or hour_starts is None:
+            continue
+        for hour in sorted(purple_hours):
+            row_i = _cleaning_excluded_below_setpoint_row_index(hour_starts, hour)
+            if row_i is None:
+                continue
+            records.append(_purple_hour_table_row(panel, hour, row_i))
+    if not records:
+        return pd.DataFrame(columns=columns)
+    df = pd.DataFrame.from_records(records, columns=columns)
+    return _sort_design_day_zone_hours_dataframe(df, house_order)
+
+
+def _purple_house_display_name(house_alias: str) -> str:
+    parts = house_alias.split("_")
+    if len(parts) == 1:
+        return parts[0].capitalize()
+    return " ".join(parts[0].capitalize() if i == 0 else p for i, p in enumerate(parts))
+
+
+def _latex_table_num(value: object, *, decimals: int = 1) -> str:
+    if value is None:
+        return "---"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return "---"
+    if not np.isfinite(f):
+        return "---"
+    return f"{f:.{decimals}f}"
+
+
+DESIGN_DAY_BELOW_SETPOINT_PURPLE_TABLE_CAPTION = (
+    "Hight heat-call frequency hours that occurred near design-day conditions "
+    "that were excluded from the results as a zone dropped below setpoint below "
+    "(OAT $\\leq -20\\,^{\\circ}\\mathrm{C}$, max zone heat-call $\\geq 0.9$). "
+    "$T_x$ and $S_x$ and zone $x$'s average temperature and setpoint over the hour."
+)
+DESIGN_DAY_COLD_OAT_VALID_TABLE_CAPTION = (
+    "High heat-call frequency hours in the cleaned dataset that occurred near "
+    "design-day conditions and are shown as red points in the energy--SWT plots "
+    "(OAT $\\leq -20\\,^{\\circ}\\mathrm{C}$, max zone heat-call $\\geq 0.9$). "
+    "$T_x$ and $S_x$ are zone $x$'s average temperature and setpoint over the hour."
+)
+
+
+_LATEX_MARKER_COLUMN_HEADERS: dict[str, str] = {
+    "marker": "\\textbf{Color}",
+}
+
+
+def write_design_day_zone_hours_latex_table(
+    df: pd.DataFrame,
+    path: Path,
+    *,
+    caption: str,
+    label: str,
+    leading_columns: tuple[str, ...] = (),
+) -> None:
+    """Write a LaTeX table fragment from design-day zone-hours dataframes."""
+    nz = PURPLE_HOURS_TABLE_MAX_ZONES
+    header_cols = ["\\textbf{House}"]
+    for col in leading_columns:
+        header_cols.append(_LATEX_MARKER_COLUMN_HEADERS.get(col, f"\\textbf{{{col}}}"))
+    header_cols.extend(
+        [
+            "\\textbf{Date-time}",
+            "\\textbf{OAT ($^{\\circ}\\mathrm{C}$)}",
+            "\\textbf{SWT ($^{\\circ}\\mathrm{C}$)}",
+        ]
+    )
+    for z in range(1, nz + 1):
+        header_cols.extend(
+            (
+                f"\\textbf{{$T_{{{z}}}$ ($^{{\\circ}}$C)}}",
+                f"\\textbf{{$S_{{{z}}}$ ($^{{\\circ}}$C)}}",
+            )
+        )
+    lines: list[str] = [
+        "\\begin{table}[htbp]",
+        "  \\centering",
+        f"  \\caption{{{caption}}}",
+        f"  \\label{{{label}}}",
+        "  \\scriptsize",
+        "  \\resizebox{\\textwidth}{!}{%",
+        f"    \\begin{{tabular}}{{l {'l ' * len(leading_columns)}r r {'r ' * (2 * nz)}}}",
+        "      \\hline",
+        " & ".join(header_cols) + " \\\\",
+        "      \\hline",
+    ]
+    prev_display_house: str | None = None
+    for _, row in df.iterrows():
+        display_house = _purple_house_display_name(str(row["house"]))
+        if prev_display_house is not None and display_house != prev_display_house:
+            lines.append("      \\hline")
+        cells = [display_house]
+        for col in leading_columns:
+            val = row.get(col)
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                cells.append("---")
+            elif col == "marker":
+                cells.append(str(val).capitalize())
+            else:
+                cells.append(str(val))
+        cells.extend(
+            [
+                pd.Timestamp(row["datetime"]).strftime("%Y-%m-%d %H:%M"),
+                _latex_table_num(row["oat_c"]),
+                _latex_table_num(row["swt_c"]),
+            ]
+        )
+        for z in range(1, nz + 1):
+            cells.append(_latex_table_num(row.get(f"zone{z}_temp")))
+            cells.append(_latex_table_num(row.get(f"zone{z}_set")))
+        lines.append("      " + " & ".join(cells) + " \\\\")
+        prev_display_house = display_house
+    lines.extend(
+        [
+            "      \\hline",
+            "    \\end{tabular}%",
+            "  }",
+            "\\end{table}",
+            "",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_design_day_below_setpoint_purple_hours_latex(
+    df: pd.DataFrame,
+    path: Path,
+    *,
+    caption: str | None = None,
+    label: str = "tab:design_day_below_setpoint",
+) -> None:
+    write_design_day_zone_hours_latex_table(
+        df,
+        path,
+        caption=caption or DESIGN_DAY_BELOW_SETPOINT_PURPLE_TABLE_CAPTION,
+        label=label,
+    )
+
+
+def log_design_day_below_setpoint_purple_hours(
+    panel: EnergyVsSwtPanelData,
+    *,
+    oat_at_or_below_c: float,
+    heatcall_threshold: float = 0.9,
+    zone_scatter_only: int | None = None,
+    log: logging.Logger | None = None,
+) -> None:
+    """Log each purple scatter/OAT hour (design day or colder, below-setpoint excluded)."""
+    log = log or logging.getLogger(__name__)
+    purple_hours = _design_day_below_setpoint_hour_starts(
+        panel,
+        oat_at_or_below_c=oat_at_or_below_c,
+        heatcall_threshold=heatcall_threshold,
+        zone_scatter_only=zone_scatter_only,
+    )
+    if not purple_hours:
+        log.info(
+            "%s: no purple (design day or colder, below setpoint) hours",
+            panel.house_alias,
+        )
+        return
+    hour_starts = panel.cleaning_excluded_below_setpoint_hour_start
+    if hour_starts is None:
+        log.warning(
+            "%s: missing excluded below-setpoint hours; rebuild cache with --refresh",
+            panel.house_alias,
+        )
+        return
+    log.info(
+        "%s: %d purple hour(s) at OAT ≤ %.1f°C",
+        panel.house_alias,
+        len(purple_hours),
+        float(oat_at_or_below_c),
+    )
+    for hour in sorted(purple_hours):
+        row_i = _cleaning_excluded_below_setpoint_row_index(hour_starts, hour)
+        if row_i is None:
+            log.warning("%s: purple hour %s not in excluded arrays", panel.house_alias, hour)
+            continue
+        row = _purple_hour_table_row(panel, hour, row_i)
+        when = pd.Timestamp(row["datetime"]).strftime("%Y-%m-%d %H:%M")
+        oat_c = row["oat_c"]
+        swt_c = row["swt_c"]
+        oat_part = f", OAT {float(oat_c):.1f}°C" if np.isfinite(oat_c) else ""
+        swt_f_arr = panel.cleaning_excluded_below_setpoint_swt_f
+        if swt_f_arr is not None and row_i < len(swt_f_arr) and np.isfinite(swt_f_arr[row_i]):
+            swt_part = (
+                f", SWT {float(swt_c):.1f}°C ({float(swt_f_arr[row_i]):.1f}°F)"
+                if np.isfinite(swt_c)
+                else f", SWT {float(swt_f_arr[row_i]):.1f}°F"
+            )
+        else:
+            swt_part = ", SWT —"
+        log.info("  %s%s%s", when, oat_part, swt_part)
 
 
 def _design_day_below_setpoint_hours_for_oat_strip(

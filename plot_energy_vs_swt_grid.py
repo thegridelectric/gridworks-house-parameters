@@ -40,6 +40,9 @@ from plots import (
     plot_estimated_energy_vs_swt_grid,
     plot_houses_oat_cleaning_removals,
     zone_legend_hour_percent_for_panel,
+    log_design_day_below_setpoint_purple_hours,
+    design_day_below_setpoint_purple_hours_dataframe,
+    write_design_day_below_setpoint_purple_hours_latex,
 )
 
 START_TIME = datetime(2025, 11, 1, tzinfo=ZoneInfo("America/New_York"))
@@ -79,6 +82,15 @@ DEFAULT_MAPLE_ZONE2_BEFORE_AFTER_SAVEPATH = (
     Path("results") / "maple_zone2_energy_vs_swt_before_after.pdf"
 )
 DEFAULT_REGRESSION_XLSX = Path("results") / "all_houses_energy_regression.xlsx"
+DEFAULT_PURPLE_HOURS_XLSX = (
+    Path("results") / "purple_design_day_below_setpoint_hours.xlsx"
+)
+DEFAULT_PURPLE_HOURS_CSV = (
+    Path("results") / "purple_design_day_below_setpoint_hours.csv"
+)
+DEFAULT_PURPLE_HOURS_TEX = (
+    Path("results") / "purple_design_day_below_setpoint_hours.tex"
+)
 DEFAULT_MAPLE_OPERATING_XLSX = (
     Path("results") / "maple_operating_characteristics_before_after.xlsx"
 )
@@ -86,7 +98,7 @@ DEFAULT_OAT_CLEANING_DIR = Path("results") / "oat_cleaning_removed"
 PLOT_CACHE_DIR = Path("results") / "plot_energy_vs_swt_grid_cache"
 PLOT_CACHE_META_PATH = PLOT_CACHE_DIR / "meta.json"
 PLOT_CACHE_BUNDLE_PATH = PLOT_CACHE_DIR / "bundle.pkl"
-PLOT_CACHE_VERSION = 14
+PLOT_CACHE_VERSION = 16
 
 # Per-site OAT cleaning PDFs under DEFAULT_OAT_CLEANING_DIR (not the 2×3 grid figures).
 MAKE_INDIVIDUAL_PLOTS = False
@@ -410,6 +422,7 @@ def _panel_excluding_zones(
         zone_avg_set_f=_drop_zone_keys(panel.zone_avg_set_f, excluded),
         coldest_hour_zone_set_f=_drop_zone_keys(panel.coldest_hour_zone_set_f, excluded),
         zone_set_f_by_hour=_drop_zone_keys(panel.zone_set_f_by_hour, excluded),
+        zone_avg_temp_f_by_hour=_drop_zone_keys(panel.zone_avg_temp_f_by_hour, excluded),
         zone_heatcall_fraction_by_hour=_drop_zone_keys(zone_heatcall, excluded),
         zone_legend_hour_percent_override=percent_override,
     )
@@ -453,6 +466,7 @@ def _panel_renumber_display_zones(
             panel.coldest_hour_zone_set_f, zone_map
         ),
         zone_set_f_by_hour=_remap_zone_keys(panel.zone_set_f_by_hour, zone_map),
+        zone_avg_temp_f_by_hour=_remap_zone_keys(panel.zone_avg_temp_f_by_hour, zone_map),
         zone_heatcall_fraction_by_hour=_remap_zone_keys(
             panel.zone_heatcall_fraction_by_hour, zone_map
         ),
@@ -461,6 +475,12 @@ def _panel_renumber_display_zones(
         ),
         cleaning_excluded_below_setpoint_zone_was_below=_remap_zone_keys(
             panel.cleaning_excluded_below_setpoint_zone_was_below, zone_map
+        ),
+        cleaning_excluded_below_setpoint_zone_avg_set_f=_remap_zone_keys(
+            panel.cleaning_excluded_below_setpoint_zone_avg_set_f, zone_map
+        ),
+        cleaning_excluded_below_setpoint_zone_avg_temp_f=_remap_zone_keys(
+            panel.cleaning_excluded_below_setpoint_zone_avg_temp_f, zone_map
         ),
         zone_legend_hour_percent_override=_remap_zone_keys(
             panel.zone_legend_hour_percent_override, zone_map
@@ -523,6 +543,34 @@ def render_all_outputs(
     *,
     grid_savepath: Path,
 ) -> None:
+    logger.info(
+        "Purple hours (design day or colder, below setpoint, max heat-call ≥ 0.9):"
+    )
+    for panel in bundle.panels:
+        log_design_day_below_setpoint_purple_hours(
+            panel,
+            oat_at_or_below_c=COLD_OAT_HIGHLIGHT_THRESHOLD_C,
+            log=logger,
+        )
+    purple_hours_df = design_day_below_setpoint_purple_hours_dataframe(
+        bundle.panels,
+        oat_at_or_below_c=COLD_OAT_HIGHLIGHT_THRESHOLD_C,
+        house_order=HOUSE_ALIASES,
+    )
+    DEFAULT_PURPLE_HOURS_XLSX.parent.mkdir(parents=True, exist_ok=True)
+    purple_hours_df.to_excel(DEFAULT_PURPLE_HOURS_XLSX, index=False)
+    purple_hours_df.to_csv(DEFAULT_PURPLE_HOURS_CSV, index=False)
+    write_design_day_below_setpoint_purple_hours_latex(
+        purple_hours_df,
+        DEFAULT_PURPLE_HOURS_TEX,
+    )
+    logger.info(
+        "Wrote %d purple hour row(s) to %s, %s, and %s",
+        len(purple_hours_df),
+        DEFAULT_PURPLE_HOURS_XLSX,
+        DEFAULT_PURPLE_HOURS_CSV,
+        DEFAULT_PURPLE_HOURS_TEX,
+    )
     _main_energy_grid_panels = _panels_for_main_energy_grid(bundle.panels)
     _figure1_kw = dict(
         maple_transition_vline=HouseEnergyParamsComputer.MAPLE_AFTER_FIRST_INCLUDED_HOUR,
@@ -545,6 +593,7 @@ def render_all_outputs(
     _monochrome_cold_oat_kw = dict(
         scatter_monochrome=True,
         highlight_oat_at_or_below_c=COLD_OAT_HIGHLIGHT_THRESHOLD_C,
+        highlight_design_day_below_setpoint=True,
     )
     plot_estimated_energy_vs_swt_grid(
         _monochrome_cold_oat_panels,

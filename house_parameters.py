@@ -552,6 +552,8 @@ class HouseEnergyParamsComputer:
         np.ndarray,
         dict[int, np.ndarray],
         dict[int, np.ndarray],
+        dict[int, np.ndarray],
+        dict[int, np.ndarray],
     ]:
         """
         Estimated energy and SWT for hours whose first clean-data drop reason is
@@ -568,13 +570,35 @@ class HouseEnergyParamsComputer:
         empty = np.empty(0, dtype=float)
         empty_zone: dict[int, np.ndarray] = {z: empty.copy() for z in self.zones}
         if not highlight_ts:
-            return empty, empty, empty, empty, empty, empty, empty_zone, empty_zone
+            return (
+                empty,
+                empty,
+                empty,
+                empty,
+                empty,
+                empty,
+                empty_zone,
+                empty_zone,
+                empty_zone,
+                empty_zone,
+            )
 
         df = self._engineered_df_before_known_bad_filter()
         hour_ts = pd.to_datetime(df["hour_start"])
         sub = df.loc[hour_ts.isin(highlight_ts)]
         if sub.empty:
-            return empty, empty, empty, empty, empty, empty, empty_zone, empty_zone
+            return (
+                empty,
+                empty,
+                empty,
+                empty,
+                empty,
+                empty,
+                empty_zone,
+                empty_zone,
+                empty_zone,
+                empty_zone,
+            )
 
         reason_by_hour = {
             pd.Timestamp(ts): reason for ts, reason in drop_reasons.items()
@@ -602,6 +626,8 @@ class HouseEnergyParamsComputer:
         min_gap = self.BELOW_SETPOINT_MIN_TEMP_SET_GAP_F
         zone_heatcall: dict[int, np.ndarray] = {}
         zone_was_below: dict[int, np.ndarray] = {}
+        zone_avg_set_f: dict[int, np.ndarray] = {}
+        zone_avg_temp_f: dict[int, np.ndarray] = {}
         for z in self.zones:
             set_col = f"zone{z}_avg_set"
             temp_col = f"zone{z}_avg_temp"
@@ -616,6 +642,8 @@ class HouseEnergyParamsComputer:
                 below
             ]
             zone_heatcall[z] = sub_valid[hc_col].to_numpy(dtype=float)[below]
+            zone_avg_set_f[z] = sub_valid[set_col].to_numpy(dtype=float)[below]
+            zone_avg_temp_f[z] = sub_valid[temp_col].to_numpy(dtype=float)[below]
         return (
             est[below],
             swt[below],
@@ -625,6 +653,8 @@ class HouseEnergyParamsComputer:
             ex_below_hour_start,
             zone_heatcall,
             zone_was_below,
+            zone_avg_set_f,
+            zone_avg_temp_f,
         )
 
     def _apply_maple_data_overrides(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -2046,12 +2076,15 @@ class HouseEnergyParamsComputer:
         zone_avg_set_f: dict[int, float] = {}
         coldest_hour_zone_set_f: dict[int, float] = {}
         zone_set_f_by_hour: dict[int, np.ndarray] = {}
+        zone_avg_temp_f_by_hour: dict[int, np.ndarray] = {}
         zone_heatcall_fraction_by_hour: dict[int, np.ndarray] = {}
         for z in self.zones:
             set_col = f"zone{z}_avg_set"
+            temp_col = f"zone{z}_avg_temp"
             heatcall_col = f"zone{z}_heatcall_fraction"
             sets_valid = df.loc[valid, set_col].to_numpy(dtype=float)
             zone_set_f_by_hour[z] = sets_valid
+            zone_avg_temp_f_by_hour[z] = df.loc[valid, temp_col].to_numpy(dtype=float)
             zone_heatcall_fraction_by_hour[z] = df.loc[
                 valid, heatcall_col
             ].to_numpy(dtype=float)
@@ -2068,6 +2101,8 @@ class HouseEnergyParamsComputer:
             ex_below_hour_start,
             ex_below_zone_hc,
             ex_below_zone_was_below,
+            ex_below_zone_set_f,
+            ex_below_zone_temp_f,
         ) = self.cleaning_excluded_oil_below_setpoint_energy_vs_swt(params)
 
         return EnergyVsSwtPanelData(
@@ -2088,6 +2123,7 @@ class HouseEnergyParamsComputer:
             zone_avg_set_f=zone_avg_set_f,
             coldest_hour_zone_set_f=coldest_hour_zone_set_f,
             zone_set_f_by_hour=zone_set_f_by_hour,
+            zone_avg_temp_f_by_hour=zone_avg_temp_f_by_hour,
             zone_heatcall_fraction_by_hour=zone_heatcall_fraction_by_hour,
             zone_names=self.zone_names,
             cleaning_excluded_below_setpoint_estimated_kwh=ex_below_est,
@@ -2096,6 +2132,8 @@ class HouseEnergyParamsComputer:
             cleaning_excluded_below_setpoint_hour_start=ex_below_hour_start,
             cleaning_excluded_below_setpoint_zone_heatcall=ex_below_zone_hc,
             cleaning_excluded_below_setpoint_zone_was_below=ex_below_zone_was_below,
+            cleaning_excluded_below_setpoint_zone_avg_set_f=ex_below_zone_set_f,
+            cleaning_excluded_below_setpoint_zone_avg_temp_f=ex_below_zone_temp_f,
             cleaning_excluded_oil_boiler_estimated_kwh=ex_oil_est,
             cleaning_excluded_oil_boiler_swt_f=ex_oil_swt,
         )
